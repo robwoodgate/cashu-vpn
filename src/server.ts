@@ -1,8 +1,9 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Config } from './config.js';
 import type { PeerAllocator, PeerLedger, PeerLease } from './peers.js';
+import type { ProofStore } from './wallet.js';
 import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, validatePublicKey } from './wireguard.js';
-import { receivePayment } from './cashu.js';
+import { buildPaymentRequest, verifyPayment, type VerifyResult } from './cashu.js';
 
 const MAX_BODY_BYTES = 16 * 1024;
 
@@ -10,10 +11,11 @@ export interface ServerDeps {
   config: Config;
   allocator: PeerAllocator;
   ledger: PeerLedger;
+  proofStore: ProofStore;
 }
 
 export function createServer(deps: ServerDeps): http.Server {
-  const { config, allocator, ledger } = deps;
+  const { config, allocator, ledger, proofStore } = deps;
 
   // Cleanup interval
   let cleanupTimer: NodeJS.Timeout | undefined;
@@ -28,7 +30,7 @@ export function createServer(deps: ServerDeps): http.Server {
   }
 
   const server = http.createServer((req, res) => {
-    void handleRequest(req, res, config, allocator, ledger);
+    void handleRequest(req, res, config, allocator, ledger, proofStore);
   });
 
   server.once('close', () => {
@@ -43,7 +45,8 @@ async function handleRequest(
   res: ServerResponse,
   config: Config,
   allocator: PeerAllocator,
-  ledger: PeerLedger
+  ledger: PeerLedger,
+  proofStore: ProofStore
 ): Promise<void> {
   const path = new URL(req.url ?? '/', 'http://localhost').pathname;
 
@@ -63,7 +66,7 @@ async function handleRequest(
     }
 
     if (req.method === 'POST' && path === '/purchase') {
-      return await handlePurchase(req, res, config, allocator, ledger);
+      return await handlePurchase(req, res, config, allocator, ledger, proofStore);
     }
 
     if (req.method === 'GET' && path === '/peers') {
@@ -87,7 +90,8 @@ async function handlePurchase(
   res: ServerResponse,
   config: Config,
   allocator: PeerAllocator,
-  ledger: PeerLedger
+  ledger: PeerLedger,
+  proofStore: ProofStore
 ): Promise<void> {
   const body = await readBody(req);
 
@@ -95,14 +99,21 @@ async function handlePurchase(
     return json(res, 400, { error: 'invalid_body', message: 'Request body must be a JSON object' });
   }
 
-  const { clientPublicKey, cashuToken } = body;
+  const { clientPublicKey } = body;
 
   if (typeof clientPublicKey !== 'string' || !clientPublicKey) {
     return json(res, 400, { error: 'missing_client_public_key' });
   }
 
-  // In dry-run mode, skip payment. In live mode, require and verify Cashu token.
+  // Live mode runs the NUT-24 (HTTP 402) payment handshake. Dry-run skips it.
+  let payment: VerifyResult | undefined;
   if (config.mode === 'live') {
+    if (!config.operatorPubkey) {
+      // Misconfiguration: we can't lock proofs to the operator. Fail loudly,
+      // never fall back to custodial behaviour.
+      return json(res, 503, { error: 'operator_pubkey_not_configured' });
+    }
+
     // The key is interpolated into a `wg set` command, so reject anything that
     // isn't a real base64 WireGuard public key before it reaches the host.
     try {
@@ -114,18 +125,52 @@ async function handlePurchase(
       });
     }
 
-    if (typeof cashuToken !== 'string' || !cashuToken) {
-      return json(res, 400, { error: 'missing_cashu_token', message: 'cashuToken is required in live mode' });
+    // No payment yet → answer with a 402 + PaymentRequest (creqA) in x-cashu.
+    // The request demands proofs P2PK-locked to the operator pubkey.
+    const token = firstHeader(req.headers['x-cashu']);
+    if (!token) {
+      const challengeId = newPurchaseId();
+      const creq = buildPaymentRequest({
+        paymentId: challengeId,
+        amountSats: config.priceSats,
+        mints: config.acceptedMints,
+        operatorPubkey: config.operatorPubkey,
+        unit: config.unit,
+        description: 'cashu-vpn access',
+      });
+      res.writeHead(402, { 'content-type': 'application/json; charset=utf-8', 'x-cashu': creq });
+      res.end(
+        JSON.stringify({
+          error: 'payment_required',
+          quotedSats: config.priceSats,
+          unit: config.unit,
+          acceptedMints: config.acceptedMints,
+          hint: 'Pay the request, then retry POST /purchase with an X-Cashu header.',
+        })
+      );
+      return;
     }
 
-    const payment = await receivePayment(cashuToken, config.acceptedMints, config.priceSats);
+    // Payment present → verify offline (DLEQ + P2PK-locked-to-operator) before
+    // provisioning anything. No swap, no per-sale mint call.
+    payment = await verifyPayment(token, {
+      acceptedMints: config.acceptedMints,
+      requiredSats: config.priceSats,
+      operatorPubkey: config.operatorPubkey,
+      unit: config.unit,
+    });
     if (!payment.valid) {
       return json(res, 402, { error: 'payment_failed', detail: payment.error });
+    }
+
+    // Reject replays of an already-redeemed token.
+    if (payment.secrets && (await proofStore.hasAnyOf(payment.secrets))) {
+      return json(res, 402, { error: 'payment_failed', detail: 'already_redeemed' });
     }
   }
 
   // Allocate peer
-  const purchaseId = `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const purchaseId = newPurchaseId();
   const tunnelIp = allocator.allocateTunnelIp(purchaseId, clientPublicKey);
 
   // In live mode, actually add the WireGuard peer
@@ -146,6 +191,19 @@ async function handlePurchase(
   };
   await ledger.record(lease);
 
+  // Persist the operator-locked token so the operator can sweep it offline.
+  // Not spendable from the box — only the operator's offline key can claim it.
+  if (payment?.valid && payment.token && payment.mint) {
+    await proofStore.add({
+      purchaseId,
+      mint: payment.mint,
+      amountSats: payment.amountSats,
+      token: payment.token,
+      secrets: payment.secrets ?? [],
+      receivedAt: now.toISOString(),
+    });
+  }
+
   // Generate client config
   const clientConfig = generateClientConfig({
     tunnelIp,
@@ -159,9 +217,19 @@ async function handlePurchase(
     purchaseId,
     tunnelIp,
     mode: config.mode,
+    amountSats: payment?.amountSats,
     lease,
     clientConfig,
   });
+}
+
+function newPurchaseId(): string {
+  return `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function firstHeader(value: string | string[] | undefined): string {
+  const v = Array.isArray(value) ? value[0] : value;
+  return (v ?? '').trim();
 }
 
 // --- Body parsing ---

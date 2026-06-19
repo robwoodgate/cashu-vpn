@@ -5,8 +5,10 @@ import { join } from 'node:path';
 import test from 'node:test';
 import type { AddressInfo } from 'node:net';
 
+import { decodePaymentRequest } from '@cashu/cashu-ts';
 import { loadConfig } from '../src/config.js';
 import { createAllocator, createMemoryLedger, createFileLedger } from '../src/peers.js';
+import { createMemoryProofStore } from '../src/wallet.js';
 import {
   validateInterface,
   validatePublicKey,
@@ -15,6 +17,7 @@ import {
   executePlan,
   generateClientConfig,
 } from '../src/wireguard.js';
+import { buildPaymentRequest, normalizeMintUrl, verifyPayment } from '../src/cashu.js';
 import { createServer } from '../src/server.js';
 
 // --- Config ---
@@ -287,14 +290,149 @@ test('unknown route returns 404', async () => {
   });
 });
 
+// --- Cashu payment ---
+
+test('normalizeMintUrl strips trailing slashes', () => {
+  assert.equal(normalizeMintUrl('https://mint.example.com/'), 'https://mint.example.com');
+  assert.equal(normalizeMintUrl('  https://mint.example.com///  '), 'https://mint.example.com');
+});
+
+const OP_PUBKEY = '02' + 'a'.repeat(64);
+
+test('buildPaymentRequest produces a decodable creqA locked to the operator', () => {
+  const pr = buildPaymentRequest({
+    paymentId: 'pid-1',
+    amountSats: 250,
+    mints: ['https://mint.example.com'],
+    operatorPubkey: OP_PUBKEY,
+    unit: 'sat',
+    description: 'cashu-vpn access',
+  });
+  assert.match(pr, /^creqA/);
+
+  const decoded = decodePaymentRequest(pr);
+  assert.deepEqual(decoded.mints, ['https://mint.example.com']);
+  assert.equal(decoded.unit, 'sat');
+  assert.equal(decoded.amount?.toNumber(), 250);
+  assert.equal(decoded.nut10?.kind, 'P2PK');
+  assert.equal(decoded.nut10?.data, OP_PUBKEY);
+});
+
+// Build verifyPayment deps that succeed, so each test can override one field to
+// exercise a single failure branch. Proofs/keysets are faked; the real DLEQ /
+// P2PK crypto is exercised against a live mint at the deploy checkpoint.
+function okDeps(over: Record<string, unknown> = {}) {
+  return {
+    getMetadata: () => ({ mint: 'https://good.mint', amount: 300, unit: 'sat' }) as never,
+    loadMintContext: async () => ({
+      keysetIds: ['k1'],
+      getKeyset: () => ({ id: 'k1', keys: {} as never }),
+    }),
+    decode: () => [{ id: 'k1', secret: 's1', amount: 260 }] as never,
+    checkDleq: () => true,
+    witnessPubkeys: () => [OP_PUBKEY],
+    ...over,
+  };
+}
+
+const VERIFY_OPTS = { acceptedMints: ['https://good.mint'], requiredSats: 250, operatorPubkey: OP_PUBKEY, unit: 'sat' };
+
+test('verifyPayment rejects an unaccepted mint', async () => {
+  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
+    getMetadata: () => ({ mint: 'https://evil.mint', amount: 300, unit: 'sat' }) as never,
+  }));
+  assert.equal(r.valid, false);
+  assert.equal(r.error, 'mint_not_accepted');
+});
+
+test('verifyPayment rejects a proof that fails DLEQ', async () => {
+  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({ checkDleq: () => false }));
+  assert.equal(r.valid, false);
+  assert.equal(r.error, 'invalid_dleq');
+});
+
+test('verifyPayment rejects a proof not locked to the operator', async () => {
+  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
+    witnessPubkeys: () => ['02' + 'b'.repeat(64)],
+  }));
+  assert.equal(r.valid, false);
+  assert.equal(r.error, 'not_locked_to_operator');
+});
+
+test('verifyPayment rejects too-low amount', async () => {
+  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
+    decode: () => [{ id: 'k1', secret: 's1', amount: 100 }] as never,
+  }));
+  assert.equal(r.valid, false);
+  assert.equal(r.error, 'amount_too_low');
+});
+
+test('verifyPayment accepts a genuine, operator-locked token', async () => {
+  const r = await verifyPayment('tok-abc', VERIFY_OPTS, okDeps());
+  assert.equal(r.valid, true);
+  assert.equal(r.amountSats, 260);
+  assert.equal(r.mint, 'https://good.mint');
+  assert.equal(r.token, 'tok-abc');
+  assert.deepEqual(r.secrets, ['s1']);
+});
+
+// --- HTTP server: live-mode 402 flow ---
+
+const LIVE_ENV = {
+  MODE: 'live',
+  SERVER_PUBLIC_KEY: 'nKpu1TI56v6JqS+wxnhMd+hBQJ8X15y7075zpATtJWU=',
+  WG_ENDPOINT: '1.2.3.4:51820',
+  ACCEPTED_MINTS: 'https://mint.example.com',
+  OPERATOR_PUBKEY: '02' + 'a'.repeat(64),
+} satisfies NodeJS.ProcessEnv;
+
+const VALID_WG_KEY = 'nKpu1TI56v6JqS+wxnhMd+hBQJ8X15y7075zpATtJWU=';
+
+test('live POST /purchase without payment returns 402 + x-cashu challenge', async () => {
+  await withServer(async (url) => {
+    const res = await fetch(`${url}/purchase`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+    });
+    assert.equal(res.status, 402);
+    const creq = res.headers.get('x-cashu') ?? '';
+    assert.match(creq, /^creqA/);
+    const decoded = decodePaymentRequest(creq);
+    assert.equal(decoded.amount?.toNumber(), 250);
+    assert.deepEqual(decoded.mints, ['https://mint.example.com']);
+    assert.equal(decoded.nut10?.kind, 'P2PK');
+    assert.equal(decoded.nut10?.data, '02' + 'a'.repeat(64));
+    const body = await res.json();
+    assert.equal(body.error, 'payment_required');
+  }, LIVE_ENV);
+});
+
+test('live POST /purchase rejects a malformed client key with 400', async () => {
+  await withServer(async (url) => {
+    const res = await fetch(`${url}/purchase`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPublicKey: 'aa;reboot' }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error, 'invalid_client_public_key');
+  }, LIVE_ENV);
+});
+
 // --- Test helper ---
 
-async function withServer(fn: (url: string) => Promise<void>): Promise<void> {
-  const config = loadConfig({});
+async function withServer(
+  fn: (url: string) => Promise<void>,
+  env: NodeJS.ProcessEnv = {}
+): Promise<void> {
+  const config = loadConfig(env);
   const server = createServer({
     config,
     allocator: createAllocator(),
     ledger: createMemoryLedger(),
+    proofStore: createMemoryProofStore(),
   });
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));

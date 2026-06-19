@@ -10,6 +10,10 @@ export interface Config {
   cleanupIntervalMs?: number;
   acceptedMints: string[];
   priceSats: number;
+  unit: string;
+  /** Operator pubkey that received proofs must be P2PK-locked to (required in live mode). */
+  operatorPubkey: string;
+  proofStorePath?: string;
 }
 
 const DEFAULT_LEASE_MS = 3 * 60 * 60 * 1000; // 3 hours
@@ -43,5 +47,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     cleanupIntervalMs,
     acceptedMints,
     priceSats: Number(env.PRICE_SATS ?? DEFAULT_PRICE_SATS),
+    unit: env.MINT_UNIT ?? 'sat',
+    operatorPubkey: env.OPERATOR_PUBKEY ?? '',
+    proofStorePath: env.PROOFS_PATH,
   };
 }
