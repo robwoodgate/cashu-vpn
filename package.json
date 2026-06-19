@@ -1,0 +1,27 @@
+{
+  "name": "nostr-vpn",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cashu-paid WireGuard access daemon",
+  "type": "module",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "test": "npm run build --silent && node --test dist/test/**/*.test.js",
+    "lint": "eslint . --ext .ts",
+    "typecheck": "tsc --noEmit --project tsconfig.json",
+    "start": "node dist/src/main.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@cashu/cashu-ts": "^2.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "@typescript-eslint/eslint-plugin": "^8.33.1",
+    "@typescript-eslint/parser": "^8.33.1",
+    "eslint": "^8.57.1",
+    "typescript": "^5.8.3"
+  }
+}
