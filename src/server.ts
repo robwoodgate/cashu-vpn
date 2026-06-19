@@ -5,6 +5,7 @@ import type { Config } from './config.js';
 import type { PeerAllocator, PeerLedger, PeerLease } from './peers.js';
 import type { ProofStore } from './wallet.js';
 import type { LockBook } from './locks.js';
+import { createRateLimiter, type RateLimiter } from './ratelimit.js';
 import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, validatePublicKey } from './wireguard.js';
 import { buildPaymentRequest, verifyPayment, normalizePubkey, type VerifyResult } from './cashu.js';
 
@@ -22,6 +23,10 @@ export interface ServerDeps {
 export function createServer(deps: ServerDeps): http.Server {
   const { config, allocator, ledger, proofStore, lockBook } = deps;
 
+  const limiter = config.rateLimitMax > 0
+    ? createRateLimiter({ max: config.rateLimitMax, windowMs: config.rateLimitWindowMs })
+    : undefined;
+
   // Cleanup interval
   let cleanupTimer: NodeJS.Timeout | undefined;
   if (config.cleanupIntervalMs) {
@@ -35,7 +40,7 @@ export function createServer(deps: ServerDeps): http.Server {
   }
 
   const server = http.createServer((req, res) => {
-    void handleRequest(req, res, config, allocator, ledger, proofStore, lockBook);
+    void handleRequest(req, res, config, allocator, ledger, proofStore, lockBook, limiter);
   });
 
   server.once('close', () => {
@@ -52,7 +57,8 @@ async function handleRequest(
   allocator: PeerAllocator,
   ledger: PeerLedger,
   proofStore: ProofStore,
-  lockBook?: LockBook
+  lockBook?: LockBook,
+  limiter?: RateLimiter
 ): Promise<void> {
   const path = new URL(req.url ?? '/', 'http://localhost').pathname;
 
@@ -72,6 +78,17 @@ async function handleRequest(
     }
 
     if (req.method === 'POST' && path === '/purchase') {
+      if (limiter) {
+        const { allowed, retryAfterMs } = limiter.check(clientIp(req));
+        if (!allowed) {
+          res.writeHead(429, {
+            'content-type': 'application/json; charset=utf-8',
+            'retry-after': String(Math.ceil(retryAfterMs / 1000)),
+          });
+          res.end(JSON.stringify({ error: 'rate_limited', retryAfterMs }));
+          return;
+        }
+      }
       return await handlePurchase(req, res, config, allocator, ledger, proofStore, lockBook);
     }
 
@@ -255,6 +272,13 @@ function newPurchaseId(): string {
 function firstHeader(value: string | string[] | undefined): string {
   const v = Array.isArray(value) ? value[0] : value;
   return (v ?? '').trim();
+}
+
+// Real client IP: first X-Forwarded-For hop (set by Caddy) else the socket peer.
+function clientIp(req: IncomingMessage): string {
+  const xff = firstHeader(req.headers['x-forwarded-for']);
+  if (xff) return xff.split(',')[0]!.trim();
+  return req.socket.remoteAddress ?? 'unknown';
 }
 
 // --- Body parsing ---

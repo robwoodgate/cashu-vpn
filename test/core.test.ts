@@ -25,6 +25,7 @@ import { deriveChildPubkey, deriveChildKeypair, isPrivateExtendedKey } from '../
 import { createLockBook } from '../src/locks.js';
 import { planSweep, sweepAll } from '../src/sweep.js';
 import { decodeChallenge, waitForPaid } from '../src/buyer.js';
+import { createRateLimiter } from '../src/ratelimit.js';
 import type { ReceivedPayment } from '../src/wallet.js';
 import { createServer } from '../src/server.js';
 
@@ -548,6 +549,36 @@ test('LockBook persists its counter and rebuilds the map across instances', asyn
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// --- Rate limiting ---
+
+test('rate limiter allows up to max then blocks within the window', () => {
+  let t = 1000;
+  const rl = createRateLimiter({ max: 3, windowMs: 1000, now: () => t });
+  assert.equal(rl.check('a').allowed, true);
+  assert.equal(rl.check('a').allowed, true);
+  assert.equal(rl.check('a').allowed, true);
+  const blocked = rl.check('a');
+  assert.equal(blocked.allowed, false);
+  assert.ok(blocked.retryAfterMs > 0 && blocked.retryAfterMs <= 1000);
+  assert.equal(rl.check('b').allowed, true); // independent key
+  t += 1001; // window slides
+  assert.equal(rl.check('a').allowed, true);
+});
+
+test('POST /purchase is rate limited per IP', async () => {
+  await withServer(async (url) => {
+    const post = () => fetch(`${url}/purchase`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPublicKey: 'k' }),
+    });
+    assert.equal((await post()).status, 200);
+    assert.equal((await post()).status, 200);
+    const third = await post();
+    assert.equal(third.status, 429);
+    assert.ok(third.headers.get('retry-after'));
+  }, { RATE_LIMIT_MAX: '2', RATE_LIMIT_WINDOW_MS: '60000' });
 });
 
 // --- Buyer-side helpers (browser flow) ---

@@ -18,6 +18,9 @@ export interface Config {
   /** Where the LockBook persists its index counter (xpub mode). */
   lockCounterPath?: string;
   proofStorePath?: string;
+  /** Max /purchase requests per IP per window (0 disables). */
+  rateLimitMax: number;
+  rateLimitWindowMs: number;
 }
 
 const DEFAULT_LEASE_MS = 3 * 60 * 60 * 1000; // 3 hours
@@ -56,5 +59,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     operatorXpub: env.OPERATOR_XPUB || undefined,
     lockCounterPath: env.LOCK_COUNTER_PATH,
     proofStorePath: env.PROOFS_PATH,
+    rateLimitMax: Number(env.RATE_LIMIT_MAX ?? '30'),
+    rateLimitWindowMs: Number(env.RATE_LIMIT_WINDOW_MS ?? '60000'),
   };
 }
