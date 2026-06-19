@@ -381,6 +381,31 @@ test('verifyPayment rejects an unlocked proof', async () => {
   assert.equal(r.error, 'not_locked');
 });
 
+test('verifyPayment rejects a multisig lock (not sole operator)', async () => {
+  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
+    witnessPubkeys: () => [OP_PUBKEY, '02' + 'b'.repeat(64)],
+  }));
+  assert.equal(r.valid, false);
+  assert.equal(r.error, 'multisig_lock');
+});
+
+test('verifyPayment rejects a lock with a refund/locktime escape', async () => {
+  const secret = JSON.stringify(['P2PK', { nonce: 'n', data: OP_PUBKEY, tags: [['locktime', '1']] }]);
+  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
+    decode: () => [{ id: 'k1', secret, amount: 260 }] as never,
+  }));
+  assert.equal(r.valid, false);
+  assert.equal(r.error, 'refundable_lock');
+});
+
+test('verifyPayment rejects a wrong-unit token', async () => {
+  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
+    getMetadata: () => ({ mint: 'https://good.mint', amount: 300, unit: 'usd' }) as never,
+  }));
+  assert.equal(r.valid, false);
+  assert.equal(r.error, 'wrong_unit');
+});
+
 test('verifyPayment rejects inconsistent lock pubkeys across proofs', async () => {
   let n = 0;
   const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({

@@ -47,6 +47,22 @@ export function normalizePubkey(k: string): string {
 }
 
 /**
+ * True if a NUT-11 P2PK secret carries a locktime/refund escape — i.e. someone
+ * other than the lock holder could reclaim the proofs later. Reject those so the
+ * operator is the sole, permanent spender. Fails open (returns false) if the
+ * secret can't be parsed; the witness-pubkey check already confirmed it is P2PK.
+ */
+function hasEscapeClause(secret: string): boolean {
+  try {
+    const parsed = JSON.parse(secret) as [string, { tags?: string[][] }];
+    const tags = parsed?.[1]?.tags ?? [];
+    return tags.some((t) => Array.isArray(t) && (t[0] === 'locktime' || t[0] === 'refund'));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Build the NUT-18 PaymentRequest (creqA) used as the NUT-24 402 challenge.
  * `lockPubkey` is the P2PK pubkey the requested proofs must be locked to — a
  * fixed operator pubkey, or a fresh xpub-derived per-tx pubkey (see locks.ts).
@@ -167,6 +183,10 @@ export async function verifyPayment(
     return { valid: false, amountSats: 0, error: 'mint_not_accepted' };
   }
 
+  if (meta.unit && meta.unit !== unit) {
+    return { valid: false, amountSats: 0, error: 'wrong_unit' };
+  }
+
   let ctx: MintContext;
   try {
     ctx = await loadMintContext(mint, unit);
@@ -199,14 +219,22 @@ export async function verifyPayment(
     if (!checkDleq(proof, keyset)) {
       return { valid: false, amountSats: 0, error: 'invalid_dleq' };
     }
-    // NUT-11: proof must be P2PK-locked, so only the lock-key holder can spend it.
+    // NUT-11: require a SINGLE-signer P2PK lock with no refund/locktime escape,
+    // so the lock-key holder is the sole, permanent spender — a buyer can't lock
+    // with a multisig or a refund path and reclaim the proofs after getting access.
     const wits = witnessPubkeys(proof.secret).map(normalizePubkey).filter(Boolean);
-    if (!wits.length) {
+    if (wits.length === 0) {
       return { valid: false, amountSats: 0, error: 'not_locked' };
+    }
+    if (wits.length > 1) {
+      return { valid: false, amountSats: 0, error: 'multisig_lock' };
+    }
+    if (hasEscapeClause(proof.secret)) {
+      return { valid: false, amountSats: 0, error: 'refundable_lock' };
     }
     if (lockPubkey === undefined) {
       lockPubkey = wits[0];
-    } else if (!wits.includes(lockPubkey)) {
+    } else if (wits[0] !== lockPubkey) {
       return { valid: false, amountSats: 0, error: 'inconsistent_lock' };
     }
   }

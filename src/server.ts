@@ -72,9 +72,17 @@ async function handleRequest(
         version: '0.1.0',
         mode: config.mode,
         priceSats: config.priceSats,
+        unit: config.unit,
         leaseDuration: `${config.leaseDurationMs / 1000}s`,
         acceptedMints: config.acceptedMints,
+        lock: lockBook ? 'xpub-per-tx' : config.operatorPubkey ? 'fixed-pubkey' : 'none',
       });
+    }
+
+    if (req.method === 'GET' && path === '/favicon.ico') {
+      res.writeHead(204);
+      res.end();
+      return;
     }
 
     if (req.method === 'POST' && path === '/purchase') {
