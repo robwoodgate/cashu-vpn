@@ -334,15 +334,26 @@ function renderPage(config: Config): string {
 
   <div class="panel">
     <h2>Get connected</h2>
-    ${isDryRun ? '<p>Dry-run mode: no payment required, no real WireGuard peer created.</p>' : `<label>Paste Cashu token (${esc(String(config.priceSats))} sats minimum)</label>`}
-    <form id="f" style="margin-top:10px">
-      ${isDryRun ? '' : '<textarea id="token" placeholder="cashuB..." required></textarea>'}
-      <div class="row" style="margin-top:10px">
-        <button id="buy" type="submit">Get VPN config</button>
-        <button type="button" id="dl" disabled style="background:transparent;border:1px solid var(--line);color:var(--text)">Download .conf</button>
-      </div>
-    </form>
+    ${isDryRun
+      ? '<p>Dry-run mode: no payment required, no real WireGuard peer created. A keypair is still generated in your browser.</p>'
+      : '<p>Your WireGuard keypair is generated in your browser — the private key never leaves this page.</p>'}
+    <div class="row" style="margin-top:10px">
+      <button id="buy" type="button">Get VPN config</button>
+      <button type="button" id="dl" disabled style="background:transparent;border:1px solid var(--line);color:var(--text)">Download .conf</button>
+    </div>
     <p class="msg" id="msg"></p>
+  </div>
+
+  <div class="panel" id="pay" style="display:none">
+    <h2>Pay ${esc(price)}</h2>
+    <p>Pay this Cashu payment request with a wallet that supports NUT-18 requests (it locks the proofs to the operator), then paste the resulting token below.</p>
+    <pre id="creq" style="margin-top:8px"></pre>
+    <button type="button" id="copyreq" style="margin-top:8px;background:transparent;border:1px solid var(--line);color:var(--text)">Copy request</button>
+    <label style="display:block;margin-top:12px">Paste the token from your wallet</label>
+    <textarea id="token" placeholder="cashuB..." style="margin-top:6px"></textarea>
+    <div class="row" style="margin-top:10px">
+      <button id="complete" type="button">Complete &amp; get config</button>
+    </div>
   </div>
 
   <div class="panel">
@@ -357,52 +368,99 @@ function renderPage(config: Config): string {
 </main>
 <script>
 const $ = (s) => document.getElementById(s);
-let conf = '', pid = '';
+let conf = '', pid = '', priv = '', pubKey = '';
+
+// base64url (JWK) -> standard base64 (WireGuard key format)
+function b64urlToB64(s){ const t = s.replace(/-/g,'+').replace(/_/g,'/'); return t + '='.repeat((4 - t.length % 4) % 4); }
+
+async function genWgKeys() {
+  const kp = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
+  const pub = await crypto.subtle.exportKey('jwk', kp.publicKey);
+  const prv = await crypto.subtle.exportKey('jwk', kp.privateKey);
+  return { pub: b64urlToB64(pub.x), priv: b64urlToB64(prv.d) };
+}
+
+async function ensureKeys() {
+  if (pubKey) return;
+  try { const k = await genWgKeys(); pubKey = k.pub; priv = k.priv; }
+  catch (e) { throw new Error('This browser cannot generate WireGuard keys (needs WebCrypto X25519).'); }
+}
+
+function buildConfig(serverConf) {
+  // Inject the locally-generated private key into the returned template.
+  return (serverConf || '').replace('# PrivateKey = <generate locally>', 'PrivateKey = ' + priv);
+}
+
+function showConfig(d) {
+  conf = buildConfig(d.clientConfig);
+  pid = d.purchaseId || '';
+  $('cfg').textContent = conf + '\\n\\nLease: ' + d.tunnelIp + ' until ' + new Date(d.lease?.expiresAt).toLocaleString();
+  $('msg').className = 'msg ok'; $('msg').textContent = 'Config ready.';
+  $('dl').disabled = false;
+  $('pay').style.display = 'none';
+  load();
+}
+
+async function purchase(token) {
+  const headers = { 'content-type': 'application/json' };
+  if (token) headers['X-Cashu'] = token;
+  return fetch('/purchase', { method: 'POST', headers, body: JSON.stringify({ clientPublicKey: pubKey }) });
+}
+
+$('buy').onclick = async () => {
+  $('buy').disabled = true;
+  $('msg').className = 'msg'; $('msg').textContent = 'Generating keys...';
+  try {
+    await ensureKeys();
+    $('msg').textContent = 'Requesting access...';
+    const r = await purchase(null);
+    if (r.status === 402) {
+      $('creq').textContent = r.headers.get('x-cashu') || '';
+      $('pay').style.display = '';
+      $('msg').className = 'msg'; $('msg').textContent = 'Payment required — pay the request below.';
+    } else if (r.ok) {
+      showConfig(await r.json());
+    } else {
+      const d = await r.json(); $('msg').className = 'msg err'; $('msg').textContent = d.error || 'Failed';
+    }
+  } catch (e) {
+    $('msg').className = 'msg err'; $('msg').textContent = e.message || 'Failed';
+  }
+  $('buy').disabled = false;
+};
+
+$('complete').onclick = async () => {
+  const token = $('token').value.trim();
+  if (!token) { $('msg').className = 'msg err'; $('msg').textContent = 'Paste a token first.'; return; }
+  $('complete').disabled = true;
+  $('msg').className = 'msg'; $('msg').textContent = 'Verifying payment...';
+  try {
+    const r = await purchase(token);
+    if (r.ok) showConfig(await r.json());
+    else { const d = await r.json(); $('msg').className = 'msg err'; $('msg').textContent = (d.detail || d.error || 'Payment failed'); }
+  } catch (e) { $('msg').className = 'msg err'; $('msg').textContent = e.message || 'Failed'; }
+  $('complete').disabled = false;
+};
+
+$('copyreq').onclick = () => navigator.clipboard?.writeText($('creq').textContent || '');
+
+$('dl').onclick = () => {
+  if (!conf) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([conf + '\\n'], { type: 'text/plain' }));
+  a.download = (pid || 'vpn') + '.conf';
+  a.click();
+};
 
 async function load() {
   try {
-    const r = await fetch('/peers');
-    const d = await r.json();
+    const r = await fetch('/peers'); const d = await r.json();
     if (!d.peers?.length) { $('leases').innerHTML = '<div class="empty">No leases.</div>'; return; }
     $('leases').innerHTML = d.peers.slice().reverse().map(p =>
       '<div class="lease"><strong>'+h(p.purchaseId)+'</strong> &middot; '+h(p.tunnelIp)+' &middot; <small>'+h(p.status)+' &middot; expires '+new Date(p.expiresAt).toLocaleTimeString()+'</small></div>'
     ).join('');
   } catch { $('leases').innerHTML = '<div class="empty">Could not load.</div>'; }
 }
-
-$('f').onsubmit = async (e) => {
-  e.preventDefault();
-  $('buy').disabled = true;
-  $('msg').className = 'msg'; $('msg').textContent = 'Creating...';
-
-  const key = 'browser-' + crypto.randomUUID().slice(0,12);
-  const body = { clientPublicKey: key };
-  ${isDryRun ? '' : "body.cashuToken = $('token').value.trim();"}
-
-  const r = await fetch('/purchase', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body) });
-  const d = await r.json();
-
-  if (r.ok) {
-    conf = d.clientConfig || '';
-    pid = d.purchaseId || '';
-    $('cfg').textContent = conf + '\\n\\nLease: ' + d.tunnelIp + ' until ' + new Date(d.lease?.expiresAt).toLocaleString();
-    $('msg').className = 'msg ok'; $('msg').textContent = 'Config ready.';
-    $('dl').disabled = false;
-  } else {
-    $('cfg').textContent = JSON.stringify(d, null, 2);
-    $('msg').className = 'msg err'; $('msg').textContent = d.error || 'Failed';
-  }
-  $('buy').disabled = false;
-  load();
-};
-
-$('dl').onclick = () => {
-  if (!conf) return;
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([conf+'\\n'],{type:'text/plain'}));
-  a.download = (pid||'vpn') + '.conf';
-  a.click();
-};
 
 function h(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 load();

@@ -273,6 +273,10 @@ test('GET /marketplace returns HTML page', async () => {
     const html = await res.text();
     assert.match(html, /Cashu VPN/);
     assert.match(html, /Get VPN config/);
+    // Browser keypair gen + 402 pay flow are wired in.
+    assert.match(html, /X25519/);
+    assert.match(html, /id="pay"/);
+    assert.match(html, /Complete &amp; get config/);
   });
 });
 
