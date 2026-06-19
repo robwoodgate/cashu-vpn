@@ -2,8 +2,9 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Config } from './config.js';
 import type { PeerAllocator, PeerLedger, PeerLease } from './peers.js';
 import type { ProofStore } from './wallet.js';
+import type { LockBook } from './locks.js';
 import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, validatePublicKey } from './wireguard.js';
-import { buildPaymentRequest, verifyPayment, type VerifyResult } from './cashu.js';
+import { buildPaymentRequest, verifyPayment, normalizePubkey, type VerifyResult } from './cashu.js';
 
 const MAX_BODY_BYTES = 16 * 1024;
 
@@ -12,10 +13,12 @@ export interface ServerDeps {
   allocator: PeerAllocator;
   ledger: PeerLedger;
   proofStore: ProofStore;
+  /** Present in xpub mode: issues per-transaction lock pubkeys. */
+  lockBook?: LockBook;
 }
 
 export function createServer(deps: ServerDeps): http.Server {
-  const { config, allocator, ledger, proofStore } = deps;
+  const { config, allocator, ledger, proofStore, lockBook } = deps;
 
   // Cleanup interval
   let cleanupTimer: NodeJS.Timeout | undefined;
@@ -30,7 +33,7 @@ export function createServer(deps: ServerDeps): http.Server {
   }
 
   const server = http.createServer((req, res) => {
-    void handleRequest(req, res, config, allocator, ledger, proofStore);
+    void handleRequest(req, res, config, allocator, ledger, proofStore, lockBook);
   });
 
   server.once('close', () => {
@@ -46,7 +49,8 @@ async function handleRequest(
   config: Config,
   allocator: PeerAllocator,
   ledger: PeerLedger,
-  proofStore: ProofStore
+  proofStore: ProofStore,
+  lockBook?: LockBook
 ): Promise<void> {
   const path = new URL(req.url ?? '/', 'http://localhost').pathname;
 
@@ -66,7 +70,7 @@ async function handleRequest(
     }
 
     if (req.method === 'POST' && path === '/purchase') {
-      return await handlePurchase(req, res, config, allocator, ledger, proofStore);
+      return await handlePurchase(req, res, config, allocator, ledger, proofStore, lockBook);
     }
 
     if (req.method === 'GET' && path === '/peers') {
@@ -91,7 +95,8 @@ async function handlePurchase(
   config: Config,
   allocator: PeerAllocator,
   ledger: PeerLedger,
-  proofStore: ProofStore
+  proofStore: ProofStore,
+  lockBook?: LockBook
 ): Promise<void> {
   const body = await readBody(req);
 
@@ -107,11 +112,12 @@ async function handlePurchase(
 
   // Live mode runs the NUT-24 (HTTP 402) payment handshake. Dry-run skips it.
   let payment: VerifyResult | undefined;
+  let lockIndex: number | undefined;
   if (config.mode === 'live') {
-    if (!config.operatorPubkey) {
-      // Misconfiguration: we can't lock proofs to the operator. Fail loudly,
-      // never fall back to custodial behaviour.
-      return json(res, 503, { error: 'operator_pubkey_not_configured' });
+    if (!lockBook && !config.operatorPubkey) {
+      // Misconfiguration: nothing to lock proofs to. Fail loudly, never fall
+      // back to custodial behaviour.
+      return json(res, 503, { error: 'operator_lock_not_configured' });
     }
 
     // The key is interpolated into a `wg set` command, so reject anything that
@@ -126,15 +132,16 @@ async function handlePurchase(
     }
 
     // No payment yet → answer with a 402 + PaymentRequest (creqA) in x-cashu.
-    // The request demands proofs P2PK-locked to the operator pubkey.
+    // The request demands proofs P2PK-locked to a per-tx pubkey (xpub mode) or
+    // the fixed operator pubkey.
     const token = firstHeader(req.headers['x-cashu']);
     if (!token) {
-      const challengeId = newPurchaseId();
+      const lockPubkey = lockBook ? (await lockBook.issue()).pubkey : config.operatorPubkey;
       const creq = buildPaymentRequest({
-        paymentId: challengeId,
+        paymentId: newPurchaseId(),
         amountSats: config.priceSats,
         mints: config.acceptedMints,
-        operatorPubkey: config.operatorPubkey,
+        lockPubkey,
         unit: config.unit,
         description: 'cashu-vpn access',
       });
@@ -151,16 +158,26 @@ async function handlePurchase(
       return;
     }
 
-    // Payment present → verify offline (DLEQ + P2PK-locked-to-operator) before
-    // provisioning anything. No swap, no per-sale mint call.
+    // Payment present → verify offline (DLEQ + P2PK lock) before provisioning
+    // anything. No swap, no per-sale mint call.
     payment = await verifyPayment(token, {
       acceptedMints: config.acceptedMints,
       requiredSats: config.priceSats,
-      operatorPubkey: config.operatorPubkey,
       unit: config.unit,
     });
-    if (!payment.valid) {
-      return json(res, 402, { error: 'payment_failed', detail: payment.error });
+    if (!payment.valid || !payment.lockPubkey) {
+      return json(res, 402, { error: 'payment_failed', detail: payment.error ?? 'unverified' });
+    }
+
+    // Authorize the lock: must be a pubkey WE control, or the operator can't
+    // sweep it. xpub mode → it must be one we issued; fixed mode → the operator key.
+    if (lockBook) {
+      lockIndex = lockBook.resolve(payment.lockPubkey);
+      if (lockIndex === undefined) {
+        return json(res, 402, { error: 'payment_failed', detail: 'lock_not_recognized' });
+      }
+    } else if (payment.lockPubkey !== normalizePubkey(config.operatorPubkey)) {
+      return json(res, 402, { error: 'payment_failed', detail: 'not_locked_to_operator' });
     }
 
     // Reject replays of an already-redeemed token.
@@ -200,6 +217,8 @@ async function handlePurchase(
       amountSats: payment.amountSats,
       token: payment.token,
       secrets: payment.secrets ?? [],
+      lockPubkey: payment.lockPubkey ?? '',
+      index: lockIndex,
       receivedAt: now.toISOString(),
     });
   }

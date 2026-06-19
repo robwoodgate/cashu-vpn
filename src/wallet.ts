@@ -20,6 +20,10 @@ export interface ReceivedPayment {
   token: string;
   /** Proof secrets, used for replay/double-spend dedupe. */
   secrets: string[];
+  /** Normalized P2PK pubkey the proofs are locked to. */
+  lockPubkey: string;
+  /** xpub child index this lock was derived at (xpub mode); absent for fixed-pubkey mode. */
+  index?: number;
   receivedAt: string;
 }
 

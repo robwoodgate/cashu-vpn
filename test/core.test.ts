@@ -22,6 +22,7 @@ import { createP2PKsecret, getP2PKExpectedWitnessPubkeys } from '@cashu/cashu-ts
 import { buildPaymentRequest, normalizeMintUrl, verifyPayment } from '../src/cashu.js';
 import { discover, parseRouteSrcIp } from '../src/discover.js';
 import { deriveChildPubkey, deriveChildKeypair, isPrivateExtendedKey } from '../src/hdkeys.js';
+import { createLockBook } from '../src/locks.js';
 import { createServer } from '../src/server.js';
 
 // --- Config ---
@@ -307,12 +308,12 @@ test('normalizeMintUrl strips trailing slashes', () => {
 
 const OP_PUBKEY = '02' + 'a'.repeat(64);
 
-test('buildPaymentRequest produces a decodable creqA locked to the operator', () => {
+test('buildPaymentRequest produces a decodable creqA locked to the pubkey', () => {
   const pr = buildPaymentRequest({
     paymentId: 'pid-1',
     amountSats: 250,
     mints: ['https://mint.example.com'],
-    operatorPubkey: OP_PUBKEY,
+    lockPubkey: OP_PUBKEY,
     unit: 'sat',
     description: 'cashu-vpn access',
   });
@@ -343,7 +344,7 @@ function okDeps(over: Record<string, unknown> = {}) {
   };
 }
 
-const VERIFY_OPTS = { acceptedMints: ['https://good.mint'], requiredSats: 250, operatorPubkey: OP_PUBKEY, unit: 'sat' };
+const VERIFY_OPTS = { acceptedMints: ['https://good.mint'], requiredSats: 250, unit: 'sat' };
 
 test('verifyPayment rejects an unaccepted mint', async () => {
   const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
@@ -359,12 +360,20 @@ test('verifyPayment rejects a proof that fails DLEQ', async () => {
   assert.equal(r.error, 'invalid_dleq');
 });
 
-test('verifyPayment rejects a proof not locked to the operator', async () => {
+test('verifyPayment rejects an unlocked proof', async () => {
+  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({ witnessPubkeys: () => [] }));
+  assert.equal(r.valid, false);
+  assert.equal(r.error, 'not_locked');
+});
+
+test('verifyPayment rejects inconsistent lock pubkeys across proofs', async () => {
+  let n = 0;
   const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
-    witnessPubkeys: () => ['02' + 'b'.repeat(64)],
+    decode: () => [{ id: 'k1', secret: 's1', amount: 130 }, { id: 'k1', secret: 's2', amount: 130 }] as never,
+    witnessPubkeys: () => [n++ === 0 ? OP_PUBKEY : '02' + 'b'.repeat(64)],
   }));
   assert.equal(r.valid, false);
-  assert.equal(r.error, 'not_locked_to_operator');
+  assert.equal(r.error, 'inconsistent_lock');
 });
 
 test('verifyPayment rejects too-low amount', async () => {
@@ -375,13 +384,14 @@ test('verifyPayment rejects too-low amount', async () => {
   assert.equal(r.error, 'amount_too_low');
 });
 
-test('verifyPayment accepts a genuine, operator-locked token', async () => {
+test('verifyPayment accepts a genuine, locked token and returns the lock pubkey', async () => {
   const r = await verifyPayment('tok-abc', VERIFY_OPTS, okDeps());
   assert.equal(r.valid, true);
   assert.equal(r.amountSats, 260);
   assert.equal(r.mint, 'https://good.mint');
   assert.equal(r.token, 'tok-abc');
   assert.deepEqual(r.secrets, ['s1']);
+  assert.equal(r.lockPubkey, 'a'.repeat(64)); // normalized (02 stripped)
 });
 
 // --- HTTP server: live-mode 402 flow ---
@@ -429,6 +439,33 @@ test('live POST /purchase rejects a malformed client key with 400', async () => 
   }, LIVE_ENV);
 });
 
+test('live xpub mode issues a fresh per-tx lock pubkey on each 402', async () => {
+  const xpub = HDKey.fromMasterSeed(new Uint8Array(64).fill(21)).derive("m/1597'/0'").publicExtendedKey;
+  const lockBook = await createLockBook(xpub);
+  const env = {
+    MODE: 'live',
+    SERVER_PUBLIC_KEY: VALID_WG_KEY,
+    WG_ENDPOINT: '1.2.3.4:51820',
+    ACCEPTED_MINTS: 'https://mint.example.com',
+  } satisfies NodeJS.ProcessEnv; // no OPERATOR_PUBKEY — lockBook provides the lock
+  await withServer(async (url) => {
+    const get402Lock = async () => {
+      const res = await fetch(`${url}/purchase`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+      });
+      assert.equal(res.status, 402);
+      return decodePaymentRequest(res.headers.get('x-cashu') ?? '').nut10?.data ?? '';
+    };
+    const d1 = await get402Lock();
+    const d2 = await get402Lock();
+    assert.notEqual(d1, d2); // per-tx unlinkable locks
+    assert.equal(lockBook.resolve(d1), 0);
+    assert.equal(lockBook.resolve(d2), 1);
+  }, env, { lockBook });
+});
+
 // --- HD key derivation (xpub per-tx privacy) ---
 
 const pkNorm = (k: string) => k.toLowerCase().replace(/^0[23]/, '');
@@ -462,6 +499,41 @@ test('deriveChildKeypair refuses an xpub, and indices are bounded', () => {
   assert.throws(() => deriveChildKeypair(xpub, 0));
   assert.throws(() => deriveChildPubkey(xpub, -1));
   assert.throws(() => deriveChildPubkey(xpub, 2 ** 31));
+});
+
+// --- LockBook (xpub per-tx issuance) ---
+
+test('LockBook issues distinct per-tx pubkeys and resolves them to indices', async () => {
+  const xpub = HDKey.fromMasterSeed(new Uint8Array(64).fill(11)).derive("m/1597'/0'").publicExtendedKey;
+  const book = await createLockBook(xpub); // memory mode (no counter path)
+  const a = await book.issue();
+  const b = await book.issue();
+  assert.equal(a.index, 0);
+  assert.equal(b.index, 1);
+  assert.notEqual(a.pubkey, b.pubkey);
+  assert.equal(book.resolve(a.pubkey), 0);
+  assert.equal(book.resolve(b.pubkey), 1);
+  // normalized lookups work too (02/03-stripped, lowercase)
+  assert.equal(book.resolve(a.pubkey.toLowerCase().replace(/^0[23]/, '')), 0);
+  assert.equal(book.resolve('02' + 'f'.repeat(64)), undefined);
+});
+
+test('LockBook persists its counter and rebuilds the map across instances', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cvpn-locks-'));
+  const counterPath = join(dir, 'counter.json');
+  try {
+    const xpub = HDKey.fromMasterSeed(new Uint8Array(64).fill(13)).derive("m/1597'/0'").publicExtendedKey;
+    const b1 = await createLockBook(xpub, counterPath);
+    const first = await b1.issue(); // index 0
+    await b1.issue(); // index 1
+
+    const b2 = await createLockBook(xpub, counterPath);
+    const third = await b2.issue();
+    assert.equal(third.index, 2); // continued from persisted counter
+    assert.equal(b2.resolve(first.pubkey), 0); // map rebuilt from xpub
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 // --- Operator discovery ---
@@ -511,7 +583,8 @@ test('discover honours an explicit host hint over autodetect', async () => {
 
 async function withServer(
   fn: (url: string) => Promise<void>,
-  env: NodeJS.ProcessEnv = {}
+  env: NodeJS.ProcessEnv = {},
+  extra: Partial<Parameters<typeof createServer>[0]> = {}
 ): Promise<void> {
   const config = loadConfig(env);
   const server = createServer({
@@ -519,6 +592,7 @@ async function withServer(
     allocator: createAllocator(),
     ledger: createMemoryLedger(),
     proofStore: createMemoryProofStore(),
+    ...extra,
   });
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));

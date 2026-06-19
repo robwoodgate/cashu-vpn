@@ -11,8 +11,12 @@ export interface Config {
   acceptedMints: string[];
   priceSats: number;
   unit: string;
-  /** Operator pubkey that received proofs must be P2PK-locked to (required in live mode). */
+  /** Fixed operator P2PK pubkey to lock proofs to (live mode needs this OR operatorXpub). */
   operatorPubkey: string;
+  /** Operator xpub for per-transaction lock pubkeys (private; preferred over operatorPubkey). */
+  operatorXpub?: string;
+  /** Where the LockBook persists its index counter (xpub mode). */
+  lockCounterPath?: string;
   proofStorePath?: string;
 }
 
@@ -49,6 +53,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     priceSats: Number(env.PRICE_SATS ?? DEFAULT_PRICE_SATS),
     unit: env.MINT_UNIT ?? 'sat',
     operatorPubkey: env.OPERATOR_PUBKEY ?? '',
+    operatorXpub: env.OPERATOR_XPUB || undefined,
+    lockCounterPath: env.LOCK_COUNTER_PATH,
     proofStorePath: env.PROOFS_PATH,
   };
 }
