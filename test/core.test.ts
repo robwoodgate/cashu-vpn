@@ -9,8 +9,10 @@ import { loadConfig } from '../src/config.js';
 import { createAllocator, createMemoryLedger, createFileLedger } from '../src/peers.js';
 import {
   validateInterface,
+  validatePublicKey,
   planAddPeer,
   planRemovePeer,
+  executePlan,
   generateClientConfig,
 } from '../src/wireguard.js';
 import { createServer } from '../src/server.js';
@@ -133,18 +135,40 @@ test('validateInterface rejects unsafe names', () => {
   assert.doesNotThrow(() => validateInterface('wg-test0'));
 });
 
-test('planAddPeer and planRemovePeer produce correct commands', () => {
+test('planAddPeer and planRemovePeer produce correct argv steps', () => {
   const add = planAddPeer('wg0', 'PUBKEY', '10.77.0.42');
-  assert.deepEqual(add.commands, [
-    'wg set wg0 peer PUBKEY allowed-ips 10.77.0.42/32',
-    'ip route replace 10.77.0.42/32 dev wg0',
+  assert.deepEqual(add.steps.map((s) => s.argv), [
+    ['wg', 'set', 'wg0', 'peer', 'PUBKEY', 'allowed-ips', '10.77.0.42/32'],
+    ['ip', 'route', 'replace', '10.77.0.42/32', 'dev', 'wg0'],
   ]);
 
   const rm = planRemovePeer('wg0', 'PUBKEY', '10.77.0.42');
-  assert.deepEqual(rm.commands, [
-    'wg set wg0 peer PUBKEY remove',
-    'ip route del 10.77.0.42/32 dev wg0',
+  assert.deepEqual(rm.steps.map((s) => s.argv), [
+    ['wg', 'set', 'wg0', 'peer', 'PUBKEY', 'remove'],
+    ['ip', 'route', 'del', '10.77.0.42/32', 'dev', 'wg0'],
   ]);
+});
+
+test('validatePublicKey accepts WG keys and rejects injection attempts', () => {
+  // Real key from the Hetzner smoke-test note.
+  const good = 'nKpu1TI56v6JqS+wxnhMd+hBQJ8X15y7075zpATtJWU=';
+  assert.equal(validatePublicKey(good), good);
+  assert.throws(() => validatePublicKey('aa;reboot'));
+  assert.throws(() => validatePublicKey('$(reboot)'));
+  assert.throws(() => validatePublicKey('short='));
+  assert.throws(() => validatePublicKey(good.slice(0, -1))); // missing '=' pad
+});
+
+test('executePlan rejects unsafe steps before running anything', async () => {
+  // A key with no whitespace passed the old regex guard and reached the shell.
+  // It must now be rejected at the execution boundary (no wg/ip ever runs).
+  await assert.rejects(
+    executePlan({
+      iface: 'wg0',
+      steps: [{ argv: ['wg', 'set', 'wg0', 'peer', 'aa;reboot', 'allowed-ips', '10.77.0.5/32'] }],
+    }),
+    /Unsafe WireGuard command/
+  );
 });
 
 test('generateClientConfig dry-run vs live', () => {

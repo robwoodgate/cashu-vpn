@@ -1,18 +1,23 @@
-import { exec } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { PeerLedger, PeerLease } from './peers.js';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // --- Types ---
 
+/** A single command, expressed as an argv array — never a shell string. */
+export interface CommandStep {
+  argv: string[];
+}
+
 export interface CommandPlan {
   iface: string;
-  commands: string[];
+  steps: CommandStep[];
 }
 
 export interface CommandResult {
-  command: string;
+  argv: string[];
   exitCode: number;
   stdout: string;
   stderr: string;
@@ -33,67 +38,104 @@ export function validateInterface(name: string): string {
   return name;
 }
 
+// WireGuard public keys are base64-encoded 32-byte Curve25519 keys: 43 base64
+// chars followed by a single '=' pad. The charset has no shell metacharacters,
+// which (together with execFile) is what closes the command-injection vector.
+const PUBKEY_RE = /^[A-Za-z0-9+/]{43}=$/;
+const TUNNEL_IP_RE = /^10\.77\.0\.(?:[2-9]|[1-9]\d|1\d\d|2[0-4]\d|25[0-4])$/;
+
+export function validatePublicKey(key: string): string {
+  if (!PUBKEY_RE.test(key)) {
+    throw new Error('Invalid WireGuard public key');
+  }
+  return key;
+}
+
+function isTunnelCidr(value: string): boolean {
+  return value.endsWith('/32') && TUNNEL_IP_RE.test(value.slice(0, -3));
+}
+
 // --- Command planning ---
 
 export function planAddPeer(iface: string, clientPubKey: string, tunnelIp: string): CommandPlan {
   return {
     iface,
-    commands: [
-      `wg set ${iface} peer ${clientPubKey} allowed-ips ${tunnelIp}/32`,
-      `ip route replace ${tunnelIp}/32 dev ${iface}`
-    ]
+    steps: [
+      { argv: ['wg', 'set', iface, 'peer', clientPubKey, 'allowed-ips', `${tunnelIp}/32`] },
+      { argv: ['ip', 'route', 'replace', `${tunnelIp}/32`, 'dev', iface] },
+    ],
   };
 }
 
 export function planRemovePeer(iface: string, clientPubKey: string, tunnelIp: string): CommandPlan {
   return {
     iface,
-    commands: [
-      `wg set ${iface} peer ${clientPubKey} remove`,
-      `ip route del ${tunnelIp}/32 dev ${iface}`
-    ]
+    steps: [
+      { argv: ['wg', 'set', iface, 'peer', clientPubKey, 'remove'] },
+      { argv: ['ip', 'route', 'del', `${tunnelIp}/32`, 'dev', iface] },
+    ],
   };
 }
 
 // --- Command execution ---
 
-function validateCommand(iface: string, command: string): void {
-  const esc = iface.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const ip = '10\\.77\\.0\\.(?:[2-9]|[1-9]\\d|1\\d\\d|2[0-4]\\d|25[0-4])';
-  const patterns = [
-    new RegExp(`^wg set ${esc} peer [^\\s]+ allowed-ips ${ip}/32$`),
-    new RegExp(`^ip route replace ${ip}/32 dev ${esc}$`),
-    new RegExp(`^wg set ${esc} peer [^\\s]+ remove$`),
-    new RegExp(`^ip route del ${ip}/32 dev ${esc}$`),
-  ];
-  if (!patterns.some((p) => p.test(command))) {
-    throw new Error(`Unsafe WireGuard command: ${command}`);
-  }
+// Whitelist the exact argv shapes we ever run. Every field is checked against a
+// strict pattern, so a hostile clientPublicKey cannot smuggle extra args, flags,
+// or shell metacharacters. Combined with execFile (no shell), there is no
+// injection surface even before this check.
+function validateStep(iface: string, argv: string[]): void {
+  // wg set <iface> peer <pubkey> allowed-ips <ip>/32
+  if (
+    argv.length === 7 &&
+    argv[0] === 'wg' && argv[1] === 'set' && argv[2] === iface &&
+    argv[3] === 'peer' && PUBKEY_RE.test(argv[4]!) &&
+    argv[5] === 'allowed-ips' && isTunnelCidr(argv[6]!)
+  ) return;
+
+  // wg set <iface> peer <pubkey> remove
+  if (
+    argv.length === 6 &&
+    argv[0] === 'wg' && argv[1] === 'set' && argv[2] === iface &&
+    argv[3] === 'peer' && PUBKEY_RE.test(argv[4]!) && argv[5] === 'remove'
+  ) return;
+
+  // ip route replace|del <ip>/32 dev <iface>
+  if (
+    argv.length === 6 &&
+    argv[0] === 'ip' && argv[1] === 'route' &&
+    (argv[2] === 'replace' || argv[2] === 'del') &&
+    isTunnelCidr(argv[3]!) && argv[4] === 'dev' && argv[5] === iface
+  ) return;
+
+  throw new Error(`Unsafe WireGuard command: ${argv.join(' ')}`);
 }
 
 export async function executePlan(plan: CommandPlan): Promise<CommandResult[]> {
   validateInterface(plan.iface);
-  for (const cmd of plan.commands) validateCommand(plan.iface, cmd);
+  for (const step of plan.steps) validateStep(plan.iface, step.argv);
 
   const results: CommandResult[] = [];
-  for (const cmd of plan.commands) {
-    const result = await runCommand(cmd);
+  for (const step of plan.steps) {
+    const result = await runStep(step.argv);
     results.push(result);
     if (result.exitCode !== 0) {
-      throw new Error(`WireGuard command failed (exit ${result.exitCode}): ${cmd}\n${result.stderr}`);
+      throw new Error(
+        `WireGuard command failed (exit ${result.exitCode}): ${step.argv.join(' ')}\n${result.stderr}`
+      );
     }
   }
   return results;
 }
 
-async function runCommand(command: string): Promise<CommandResult> {
+async function runStep(argv: string[]): Promise<CommandResult> {
+  const [program, ...args] = argv;
   try {
-    const { stdout, stderr } = await execAsync(command);
-    return { command, exitCode: 0, stdout, stderr };
+    const { stdout, stderr } = await execFileAsync(program!, args);
+    return { argv, exitCode: 0, stdout, stderr };
   } catch (e: unknown) {
     const err = e as { code?: number; stdout?: string; stderr?: string };
     return {
-      command,
+      argv,
       exitCode: typeof err.code === 'number' ? err.code : 1,
       stdout: err.stdout ?? '',
       stderr: err.stderr ?? '',

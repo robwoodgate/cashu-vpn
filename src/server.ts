@@ -1,7 +1,7 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Config } from './config.js';
 import type { PeerAllocator, PeerLedger, PeerLease } from './peers.js';
-import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers } from './wireguard.js';
+import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, validatePublicKey } from './wireguard.js';
 import { receivePayment } from './cashu.js';
 
 const MAX_BODY_BYTES = 16 * 1024;
@@ -103,6 +103,17 @@ async function handlePurchase(
 
   // In dry-run mode, skip payment. In live mode, require and verify Cashu token.
   if (config.mode === 'live') {
+    // The key is interpolated into a `wg set` command, so reject anything that
+    // isn't a real base64 WireGuard public key before it reaches the host.
+    try {
+      validatePublicKey(clientPublicKey);
+    } catch {
+      return json(res, 400, {
+        error: 'invalid_client_public_key',
+        message: 'clientPublicKey must be a base64 WireGuard public key',
+      });
+    }
+
     if (typeof cashuToken !== 'string' || !cashuToken) {
       return json(res, 400, { error: 'missing_cashu_token', message: 'cashuToken is required in live mode' });
     }
