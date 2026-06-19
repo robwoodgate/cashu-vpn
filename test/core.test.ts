@@ -18,6 +18,7 @@ import {
   generateClientConfig,
 } from '../src/wireguard.js';
 import { buildPaymentRequest, normalizeMintUrl, verifyPayment } from '../src/cashu.js';
+import { discover, parseRouteSrcIp } from '../src/discover.js';
 import { createServer } from '../src/server.js';
 
 // --- Config ---
@@ -419,6 +420,49 @@ test('live POST /purchase rejects a malformed client key with 400', async () => 
     const body = await res.json();
     assert.equal(body.error, 'invalid_client_public_key');
   }, LIVE_ENV);
+});
+
+// --- Operator discovery ---
+
+test('parseRouteSrcIp extracts the src IPv4', () => {
+  assert.equal(
+    parseRouteSrcIp('1.1.1.1 via 157.180.114.1 dev eth0 src 157.180.114.119 uid 0'),
+    '157.180.114.119'
+  );
+  assert.equal(parseRouteSrcIp('no src here'), '');
+});
+
+test('discover reads key/port and builds endpoint (non-mutating)', async () => {
+  const calls: string[][] = [];
+  const run = async (cmd: string, args: string[]) => {
+    calls.push([cmd, ...args]);
+    if (args.join(' ') === 'show wg0 public-key') return 'nKpu1TI56v6JqS+wxnhMd+hBQJ8X15y7075zpATtJWU=';
+    if (args.join(' ') === 'show wg0 listen-port') return '51820';
+    if (cmd === 'ip') return '1.1.1.1 dev eth0 src 157.180.114.119 uid 0';
+    return '';
+  };
+
+  const d = await discover('wg0', {}, run);
+  assert.equal(d.interfaceName, 'wg0');
+  assert.equal(d.serverPublicKey, 'nKpu1TI56v6JqS+wxnhMd+hBQJ8X15y7075zpATtJWU=');
+  assert.equal(d.listenPort, '51820');
+  assert.equal(d.endpoint, '157.180.114.119:51820');
+  assert.equal(d.hostMutationPerformed, false);
+  // Only read-only commands were ever issued.
+  for (const c of calls) {
+    assert.ok(c[0] === 'wg' || c[0] === 'ip', `unexpected command: ${c.join(' ')}`);
+    if (c[0] === 'wg') assert.equal(c[1], 'show');
+  }
+});
+
+test('discover honours an explicit host hint over autodetect', async () => {
+  const run = async (cmd: string, args: string[]) => {
+    if (args.join(' ') === 'show wg0 public-key') return 'PUBKEY';
+    if (args.join(' ') === 'show wg0 listen-port') return '51820';
+    throw new Error('should not autodetect when hint is given');
+  };
+  const d = await discover('wg0', { hostHint: '203.0.113.7' }, run);
+  assert.equal(d.endpoint, '203.0.113.7:51820');
 });
 
 // --- Test helper ---
