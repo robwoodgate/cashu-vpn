@@ -17,8 +17,11 @@ import {
   executePlan,
   generateClientConfig,
 } from '../src/wireguard.js';
+import { HDKey } from '@scure/bip32';
+import { createP2PKsecret, getP2PKExpectedWitnessPubkeys } from '@cashu/cashu-ts';
 import { buildPaymentRequest, normalizeMintUrl, verifyPayment } from '../src/cashu.js';
 import { discover, parseRouteSrcIp } from '../src/discover.js';
+import { deriveChildPubkey, deriveChildKeypair, isPrivateExtendedKey } from '../src/hdkeys.js';
 import { createServer } from '../src/server.js';
 
 // --- Config ---
@@ -424,6 +427,41 @@ test('live POST /purchase rejects a malformed client key with 400', async () => 
     const body = await res.json();
     assert.equal(body.error, 'invalid_client_public_key');
   }, LIVE_ENV);
+});
+
+// --- HD key derivation (xpub per-tx privacy) ---
+
+const pkNorm = (k: string) => k.toLowerCase().replace(/^0[23]/, '');
+
+test('HD derivation: xpub child pubkey == xprv child pubkey (no stranded funds)', () => {
+  const acct = HDKey.fromMasterSeed(new Uint8Array(64).fill(7)).derive("m/1597'/0'");
+  const xpub = acct.publicExtendedKey;
+  const xprv = acct.privateExtendedKey;
+  assert.equal(isPrivateExtendedKey(xpub), false);
+  assert.equal(isPrivateExtendedKey(xprv), true);
+
+  for (const i of [0, 1, 5, 42, 1000]) {
+    const pub = deriveChildPubkey(xpub, i);
+    const kp = deriveChildKeypair(xprv, i);
+    assert.equal(kp.pubkey, pub, `index ${i} pub mismatch — operator could not sweep`);
+  }
+  // per-transaction unlinkability: different index -> different lock pubkey
+  assert.notEqual(deriveChildPubkey(xpub, 0), deriveChildPubkey(xpub, 1));
+});
+
+test('HD-derived pubkey works as a P2PK lock and is recoverable', () => {
+  const acct = HDKey.fromMasterSeed(new Uint8Array(64).fill(9)).derive("m/1597'/0'");
+  const pub = deriveChildPubkey(acct.publicExtendedKey, 3);
+  const secret = createP2PKsecret(pub);
+  const expected = getP2PKExpectedWitnessPubkeys(secret);
+  assert.ok(expected.map(pkNorm).includes(pkNorm(pub)));
+});
+
+test('deriveChildKeypair refuses an xpub, and indices are bounded', () => {
+  const xpub = HDKey.fromMasterSeed(new Uint8Array(64).fill(3)).derive("m/0'").publicExtendedKey;
+  assert.throws(() => deriveChildKeypair(xpub, 0));
+  assert.throws(() => deriveChildPubkey(xpub, -1));
+  assert.throws(() => deriveChildPubkey(xpub, 2 ** 31));
 });
 
 // --- Operator discovery ---

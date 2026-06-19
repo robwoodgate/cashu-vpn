@@ -16,7 +16,8 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@cashu/cashu-ts": "^4.5.1"
+    "@cashu/cashu-ts": "^4.5.1",
+    "@scure/bip32": "^2.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.30",
