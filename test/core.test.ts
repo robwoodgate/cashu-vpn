@@ -23,6 +23,8 @@ import { buildPaymentRequest, normalizeMintUrl, verifyPayment } from '../src/cas
 import { discover, parseRouteSrcIp } from '../src/discover.js';
 import { deriveChildPubkey, deriveChildKeypair, isPrivateExtendedKey } from '../src/hdkeys.js';
 import { createLockBook } from '../src/locks.js';
+import { planSweep, sweepAll } from '../src/sweep.js';
+import type { ReceivedPayment } from '../src/wallet.js';
 import { createServer } from '../src/server.js';
 
 // --- Config ---
@@ -534,6 +536,68 @@ test('LockBook persists its counter and rebuilds the map across instances', asyn
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// --- Sweep (operator claims locked proofs offline) ---
+
+test('planSweep derives a matching claim key for each xpub receipt', () => {
+  const acct = HDKey.fromMasterSeed(new Uint8Array(64).fill(31)).derive("m/1597'/0'");
+  const xpub = acct.publicExtendedKey;
+  const xprv = acct.privateExtendedKey;
+  const mk = (i: number, over: Partial<ReceivedPayment> = {}): ReceivedPayment => ({
+    purchaseId: `p${i}`, mint: 'https://m', amountSats: 250, token: `tok${i}`, secrets: [`s${i}`],
+    lockPubkey: pkNorm(deriveChildPubkey(xpub, i)), index: i, receivedAt: 't', ...over,
+  });
+  const receipts = [mk(0), mk(1), mk(2, { index: undefined }), mk(3, { lockPubkey: 'ff'.repeat(32) })];
+  const plan = planSweep(receipts, xprv);
+
+  assert.equal(plan.sweepable.length, 2);
+  assert.equal(plan.manual.length, 1);
+  assert.equal(plan.mismatched.length, 1);
+  for (const e of plan.sweepable) {
+    assert.equal(pkNorm(deriveChildKeypair(xprv, e.index).pubkey), pkNorm(e.pubkey));
+  }
+});
+
+test('sweepAll groups per mint and aggregates claimed proofs', async () => {
+  const plan = {
+    sweepable: [
+      { index: 0, mint: 'https://m1', amountSats: 250, token: 't0', pubkey: 'p', privkey: 'k0' },
+      { index: 1, mint: 'https://m1', amountSats: 250, token: 't1', pubkey: 'p', privkey: 'k1' },
+      { index: 2, mint: 'https://m2', amountSats: 250, token: 't2', pubkey: 'p', privkey: 'k2' },
+    ],
+    manual: [],
+    mismatched: [],
+  };
+  const claim = async () => [{ amount: 100 }] as never;
+  const encode = (mint: string, proofs: unknown[]) => `cashuB-${mint}-${proofs.length}`;
+  const results = await sweepAll(plan, claim, encode);
+
+  const m1 = results.find((r) => r.mint === 'https://m1');
+  const m2 = results.find((r) => r.mint === 'https://m2');
+  assert.equal(m1?.claimedSats, 200);
+  assert.equal(m1?.token, 'cashuB-https://m1-2');
+  assert.equal(m2?.claimedSats, 100);
+  assert.deepEqual(m1?.errors, []);
+});
+
+test('sweepAll records per-entry claim errors without aborting', async () => {
+  const plan = {
+    sweepable: [
+      { index: 0, mint: 'https://m', amountSats: 250, token: 'good', pubkey: 'p', privkey: 'k0' },
+      { index: 1, mint: 'https://m', amountSats: 250, token: 'bad', pubkey: 'p', privkey: 'k1' },
+    ],
+    manual: [],
+    mismatched: [],
+  };
+  const claim = async (_mint: string, token: string) => {
+    if (token === 'bad') throw new Error('already spent');
+    return [{ amount: 130 }] as never;
+  };
+  const [res] = await sweepAll(plan, claim, () => 'tok');
+  assert.equal(res?.claimedSats, 130);
+  assert.equal(res?.errors.length, 1);
+  assert.match(res?.errors[0] ?? '', /already spent/);
 });
 
 // --- Operator discovery ---

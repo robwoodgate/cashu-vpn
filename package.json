@@ -10,7 +10,8 @@
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "start": "node dist/src/main.js",
-    "discover": "node dist/src/discover.js"
+    "discover": "node dist/src/discover.js",
+    "sweep": "node dist/src/sweep.js"
   },
   "engines": {
     "node": ">=20"
