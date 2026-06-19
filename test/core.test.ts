@@ -24,6 +24,7 @@ import { discover, parseRouteSrcIp } from '../src/discover.js';
 import { deriveChildPubkey, deriveChildKeypair, isPrivateExtendedKey } from '../src/hdkeys.js';
 import { createLockBook } from '../src/locks.js';
 import { planSweep, sweepAll } from '../src/sweep.js';
+import { decodeChallenge, waitForPaid } from '../src/buyer.js';
 import type { ReceivedPayment } from '../src/wallet.js';
 import { createServer } from '../src/server.js';
 
@@ -279,10 +280,21 @@ test('GET /marketplace returns HTML page', async () => {
     const html = await res.text();
     assert.match(html, /Cashu VPN/);
     assert.match(html, /Get VPN config/);
-    // Browser keypair gen + 402 pay flow are wired in.
-    assert.match(html, /X25519/);
+    // Pay panel (LN + Cashu) and the bundled client are wired in.
     assert.match(html, /id="pay"/);
+    assert.match(html, /Generate Lightning invoice/);
     assert.match(html, /Complete &amp; get config/);
+    assert.match(html, /<script src="\/client\.js">/);
+  });
+});
+
+test('GET /client.js serves the esbuild bundle', async () => {
+  await withServer(async (url) => {
+    const res = await fetch(`${url}/client.js`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') ?? '', /javascript/);
+    const js = await res.text();
+    assert.ok(js.length > 1000); // bundled cashu-ts etc.
   });
 });
 
@@ -536,6 +548,34 @@ test('LockBook persists its counter and rebuilds the map across instances', asyn
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// --- Buyer-side helpers (browser flow) ---
+
+test('decodeChallenge extracts amount/mint/unit/lock from a creqA', () => {
+  const creq = buildPaymentRequest({
+    paymentId: 'x', amountSats: 250, mints: ['https://mint.example.com'],
+    lockPubkey: OP_PUBKEY, unit: 'sat',
+  });
+  const c = decodeChallenge(creq);
+  assert.equal(c.amount, 250);
+  assert.equal(c.mintUrl, 'https://mint.example.com');
+  assert.equal(c.unit, 'sat');
+  assert.equal(c.lockPubkey, OP_PUBKEY);
+});
+
+test('waitForPaid resolves once the quote is PAID', async () => {
+  let n = 0;
+  const wallet = { checkMintQuoteBolt11: async () => ({ state: n++ < 2 ? 'UNPAID' : 'PAID' }) };
+  const ok = await waitForPaid(wallet as never, 'q', { tries: 5, sleep: async () => {} });
+  assert.equal(ok, true);
+  assert.equal(n, 3);
+});
+
+test('waitForPaid times out if never paid', async () => {
+  const wallet = { checkMintQuoteBolt11: async () => ({ state: 'UNPAID' }) };
+  const ok = await waitForPaid(wallet as never, 'q', { tries: 3, sleep: async () => {} });
+  assert.equal(ok, false);
 });
 
 // --- Sweep (operator claims locked proofs offline) ---

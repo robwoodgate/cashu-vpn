@@ -11,5 +11,7 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "comment": "client.ts is browser-only; esbuild bundles it (build:client), so it is not type-checked here.",
+  "exclude": ["src/client.ts"]
 }

@@ -1,4 +1,6 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import type { Config } from './config.js';
 import type { PeerAllocator, PeerLedger, PeerLease } from './peers.js';
 import type { ProofStore } from './wallet.js';
@@ -80,6 +82,10 @@ async function handleRequest(
 
     if (req.method === 'GET' && (path === '/' || path === '/marketplace')) {
       return html(res, 200, renderPage(config));
+    }
+
+    if (req.method === 'GET' && path === '/client.js') {
+      return await serveClientJs(res);
     }
 
     json(res, 404, { error: 'not_found' });
@@ -291,6 +297,20 @@ function html(res: ServerResponse, status: number, body: string): void {
   res.end(body);
 }
 
+// The esbuild-bundled browser client (dist/public/client.js), cached after first read.
+const CLIENT_JS_PATH = fileURLToPath(new URL('../public/client.js', import.meta.url));
+let clientJsCache: string | undefined;
+
+async function serveClientJs(res: ServerResponse): Promise<void> {
+  try {
+    if (clientJsCache === undefined) clientJsCache = await readFile(CLIENT_JS_PATH, 'utf8');
+    res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8' });
+    res.end(clientJsCache);
+  } catch {
+    json(res, 404, { error: 'client_bundle_not_built', message: 'run `npm run build:client`' });
+  }
+}
+
 function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -335,6 +355,10 @@ function renderPage(config: Config): string {
     .lease { background: #17202b; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-top: 6px; font-size: .9rem; }
     .lease small { color: var(--muted); }
     .empty { color: var(--muted); border: 1px dashed var(--line); border-radius: 8px; padding: 12px; margin-top: 8px; }
+    h3 { font-size: 1rem; margin: 18px 0 4px; color: var(--text); }
+    .ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
+    .qr { margin-top: 10px; }
+    .qr img { background: #fff; padding: 8px; border-radius: 8px; max-width: 240px; }
     @media (max-width: 600px) { .facts { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -364,15 +388,22 @@ function renderPage(config: Config): string {
   </div>
 
   <div class="panel" id="pay" style="display:none">
-    <h2>Pay ${esc(price)}</h2>
-    <p>Pay this Cashu payment request with a wallet that supports NUT-18 requests (it locks the proofs to the operator), then paste the resulting token below.</p>
-    <pre id="creq" style="margin-top:8px"></pre>
-    <button type="button" id="copyreq" style="margin-top:8px;background:transparent;border:1px solid var(--line);color:var(--text)">Copy request</button>
-    <label style="display:block;margin-top:12px">Paste the token from your wallet</label>
-    <textarea id="token" placeholder="cashuB..." style="margin-top:6px"></textarea>
-    <div class="row" style="margin-top:10px">
-      <button id="complete" type="button">Complete &amp; get config</button>
-    </div>
+    <h2>Pay <span id="payamt">${esc(price)}</span></h2>
+
+    <h3>⚡ Pay with Lightning</h3>
+    <p>No Cashu wallet needed — pay a Lightning invoice and we mint the ecash in your browser and deliver it.</p>
+    <div class="row" style="margin-top:10px"><button id="lnbtn" type="button">Generate Lightning invoice</button></div>
+    <div id="qrln" class="qr"></div>
+    <pre id="lninvoice"></pre>
+    <button type="button" id="copyln" class="ghost">Copy invoice</button>
+
+    <h3>Or pay with a Cashu wallet</h3>
+    <p>Scan or copy this payment request with a NUT-18 wallet, then paste the token it returns.</p>
+    <div id="qrcreq" class="qr"></div>
+    <pre id="creq"></pre>
+    <button type="button" id="copyreq" class="ghost">Copy request</button>
+    <textarea id="token" placeholder="cashuB..." style="margin-top:10px"></textarea>
+    <div class="row" style="margin-top:10px"><button id="complete" type="button">Complete &amp; get config</button></div>
   </div>
 
   <div class="panel">
@@ -385,104 +416,6 @@ function renderPage(config: Config): string {
     <div id="leases"><div class="empty">No leases.</div></div>
   </div>
 </main>
-<script>
-const $ = (s) => document.getElementById(s);
-let conf = '', pid = '', priv = '', pubKey = '';
-
-// base64url (JWK) -> standard base64 (WireGuard key format)
-function b64urlToB64(s){ const t = s.replace(/-/g,'+').replace(/_/g,'/'); return t + '='.repeat((4 - t.length % 4) % 4); }
-
-async function genWgKeys() {
-  const kp = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
-  const pub = await crypto.subtle.exportKey('jwk', kp.publicKey);
-  const prv = await crypto.subtle.exportKey('jwk', kp.privateKey);
-  return { pub: b64urlToB64(pub.x), priv: b64urlToB64(prv.d) };
-}
-
-async function ensureKeys() {
-  if (pubKey) return;
-  try { const k = await genWgKeys(); pubKey = k.pub; priv = k.priv; }
-  catch (e) { throw new Error('This browser cannot generate WireGuard keys (needs WebCrypto X25519).'); }
-}
-
-function buildConfig(serverConf) {
-  // Inject the locally-generated private key into the returned template.
-  return (serverConf || '').replace('# PrivateKey = <generate locally>', 'PrivateKey = ' + priv);
-}
-
-function showConfig(d) {
-  conf = buildConfig(d.clientConfig);
-  pid = d.purchaseId || '';
-  $('cfg').textContent = conf + '\\n\\nLease: ' + d.tunnelIp + ' until ' + new Date(d.lease?.expiresAt).toLocaleString();
-  $('msg').className = 'msg ok'; $('msg').textContent = 'Config ready.';
-  $('dl').disabled = false;
-  $('pay').style.display = 'none';
-  load();
-}
-
-async function purchase(token) {
-  const headers = { 'content-type': 'application/json' };
-  if (token) headers['X-Cashu'] = token;
-  return fetch('/purchase', { method: 'POST', headers, body: JSON.stringify({ clientPublicKey: pubKey }) });
-}
-
-$('buy').onclick = async () => {
-  $('buy').disabled = true;
-  $('msg').className = 'msg'; $('msg').textContent = 'Generating keys...';
-  try {
-    await ensureKeys();
-    $('msg').textContent = 'Requesting access...';
-    const r = await purchase(null);
-    if (r.status === 402) {
-      $('creq').textContent = r.headers.get('x-cashu') || '';
-      $('pay').style.display = '';
-      $('msg').className = 'msg'; $('msg').textContent = 'Payment required — pay the request below.';
-    } else if (r.ok) {
-      showConfig(await r.json());
-    } else {
-      const d = await r.json(); $('msg').className = 'msg err'; $('msg').textContent = d.error || 'Failed';
-    }
-  } catch (e) {
-    $('msg').className = 'msg err'; $('msg').textContent = e.message || 'Failed';
-  }
-  $('buy').disabled = false;
-};
-
-$('complete').onclick = async () => {
-  const token = $('token').value.trim();
-  if (!token) { $('msg').className = 'msg err'; $('msg').textContent = 'Paste a token first.'; return; }
-  $('complete').disabled = true;
-  $('msg').className = 'msg'; $('msg').textContent = 'Verifying payment...';
-  try {
-    const r = await purchase(token);
-    if (r.ok) showConfig(await r.json());
-    else { const d = await r.json(); $('msg').className = 'msg err'; $('msg').textContent = (d.detail || d.error || 'Payment failed'); }
-  } catch (e) { $('msg').className = 'msg err'; $('msg').textContent = e.message || 'Failed'; }
-  $('complete').disabled = false;
-};
-
-$('copyreq').onclick = () => navigator.clipboard?.writeText($('creq').textContent || '');
-
-$('dl').onclick = () => {
-  if (!conf) return;
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([conf + '\\n'], { type: 'text/plain' }));
-  a.download = (pid || 'vpn') + '.conf';
-  a.click();
-};
-
-async function load() {
-  try {
-    const r = await fetch('/peers'); const d = await r.json();
-    if (!d.peers?.length) { $('leases').innerHTML = '<div class="empty">No leases.</div>'; return; }
-    $('leases').innerHTML = d.peers.slice().reverse().map(p =>
-      '<div class="lease"><strong>'+h(p.purchaseId)+'</strong> &middot; '+h(p.tunnelIp)+' &middot; <small>'+h(p.status)+' &middot; expires '+new Date(p.expiresAt).toLocaleTimeString()+'</small></div>'
-    ).join('');
-  } catch { $('leases').innerHTML = '<div class="empty">Could not load.</div>'; }
-}
-
-function h(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-load();
-</script>
+<script src="/client.js"></script>
 </body></html>`;
 }

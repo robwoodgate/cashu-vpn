@@ -5,7 +5,8 @@
   "description": "Cashu-paid WireGuard access daemon",
   "type": "module",
   "scripts": {
-    "build": "tsc --project tsconfig.json",
+    "build": "tsc --project tsconfig.json && npm run build:client",
+    "build:client": "esbuild src/client.ts --bundle --minify --format=iife --platform=browser --outfile=dist/public/client.js",
     "test": "npm run build --silent && node --test dist/test/**/*.test.js",
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc --noEmit --project tsconfig.json",
@@ -18,12 +19,14 @@
   },
   "dependencies": {
     "@cashu/cashu-ts": "^4.5.1",
-    "@scure/bip32": "^2.2.0"
+    "@scure/bip32": "^2.2.0",
+    "qrcode-generator": "^2.0.4"
   },
   "devDependencies": {
     "@types/node": "^22.15.30",
     "@typescript-eslint/eslint-plugin": "^8.33.1",
     "@typescript-eslint/parser": "^8.33.1",
+    "esbuild": "^0.28.1",
     "eslint": "^8.57.1",
     "typescript": "^5.8.3"
   }
