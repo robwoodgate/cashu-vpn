@@ -11,5 +11,5 @@ const ledger = config.peerLedgerPath
 const server = createServer({ config, allocator, ledger });
 
 server.listen(config.port, config.host, () => {
-  console.log(`nostr-vpn listening on http://${config.host}:${config.port} (${config.mode})`);
+  console.log(`cashu-vpn listening on http://${config.host}:${config.port} (${config.mode})`);
 });

@@ -1,5 +1,5 @@
 {
-  "name": "nostr-vpn",
+  "name": "cashu-vpn",
   "version": "0.1.0",
   "private": true,
   "description": "Cashu-paid WireGuard access daemon",
