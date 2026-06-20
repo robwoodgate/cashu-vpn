@@ -1,6 +1,7 @@
 import { loadConfig } from './config.js';
 import { createAllocator, createMemoryLedger, createFileLedger } from './peers.js';
 import { createMemoryProofStore, createFileProofStore } from './wallet.js';
+import { createMemoryOrderStore, createFileOrderStore } from './orders.js';
 import { createLockBook, type LockBook } from './locks.js';
 import { createServer } from './server.js';
 
@@ -12,6 +13,9 @@ const ledger = config.peerLedgerPath
 const proofStore = config.proofStorePath
   ? createFileProofStore(config.proofStorePath)
   : createMemoryProofStore();
+const orderStore = config.orderStorePath
+  ? await createFileOrderStore(config.orderStorePath)
+  : createMemoryOrderStore();
 
 // xpub mode: issue a fresh per-transaction lock pubkey from the operator xpub so
 // the mint can't correlate payments. Without an xpub we fall back to the fixed
@@ -21,7 +25,7 @@ if (config.operatorXpub) {
   lockBook = await createLockBook(config.operatorXpub, config.lockCounterPath);
 }
 
-const server = createServer({ config, allocator, ledger, proofStore, lockBook });
+const server = createServer({ config, allocator, ledger, proofStore, orderStore, lockBook });
 
 server.listen(config.port, config.host, () => {
   console.log(`cashu-vpn listening on http://${config.host}:${config.port} (${config.mode})`);

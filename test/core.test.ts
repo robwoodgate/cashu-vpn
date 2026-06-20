@@ -9,6 +9,7 @@ import { decodePaymentRequest } from '@cashu/cashu-ts';
 import { loadConfig } from '../src/config.js';
 import { createAllocator, createMemoryLedger, createFileLedger } from '../src/peers.js';
 import { createMemoryProofStore } from '../src/wallet.js';
+import { createMemoryOrderStore, newOrderId } from '../src/orders.js';
 import {
   validateInterface,
   validatePublicKey,
@@ -19,7 +20,7 @@ import {
 } from '../src/wireguard.js';
 import { HDKey } from '@scure/bip32';
 import { createP2PKsecret, getP2PKExpectedWitnessPubkeys } from '@cashu/cashu-ts';
-import { buildPaymentRequest, normalizeMintUrl, verifyPayment } from '../src/cashu.js';
+import { buildPaymentRequest, normalizeMintUrl, verifyPayment, popcount } from '../src/cashu.js';
 import { discover, parseRouteSrcIp } from '../src/discover.js';
 import { deriveChildPubkey, deriveChildKeypair, isPrivateExtendedKey } from '../src/hdkeys.js';
 import { createLockBook } from '../src/locks.js';
@@ -255,21 +256,17 @@ test('POST /purchase rejects missing clientPublicKey', async () => {
   });
 });
 
-test('GET /peers shows recorded leases', async () => {
+test('GET /peers is removed (privacy: no global lease list)', async () => {
   await withServer(async (url) => {
-    // Purchase first
-    await fetch(`${url}/purchase`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ clientPublicKey: 'peer-test-key' }),
-    });
-
     const res = await fetch(`${url}/peers`);
-    assert.equal(res.status, 200);
-    const body = await res.json();
-    assert.equal(body.count, 1);
-    assert.equal(body.peers[0]?.clientPublicKey, 'peer-test-key');
-    assert.equal(body.peers[0]?.status, 'active');
+    assert.equal(res.status, 404);
+  });
+});
+
+test('GET /order/:id 404s for an unknown order id', async () => {
+  await withServer(async (url) => {
+    const res = await fetch(`${url}/order/${newOrderId()}`);
+    assert.equal(res.status, 404);
   });
 });
 
@@ -284,7 +281,10 @@ test('GET /marketplace returns HTML page', async () => {
     // Pay panel (LN + Cashu) and the bundled client are wired in.
     assert.match(html, /id="pay"/);
     assert.match(html, /Generate Lightning invoice/);
-    assert.match(html, /Complete &amp; get config/);
+    // The paste box is gone; the wallet delivers over the request transport.
+    assert.doesNotMatch(html, /Complete &amp; get config/);
+    assert.doesNotMatch(html, /id="token"/);
+    assert.match(html, /Your access/);
     assert.match(html, /<script src="\/client\.js">/);
   });
 });
@@ -340,6 +340,28 @@ test('buildPaymentRequest produces a decodable creqA locked to the pubkey', () =
   assert.equal(decoded.amount?.toNumber(), 250);
   assert.equal(decoded.nut10?.kind, 'P2PK');
   assert.equal(decoded.nut10?.data, OP_PUBKEY);
+});
+
+test('buildPaymentRequest embeds a NUT-18 POST transport when given a target', () => {
+  const pr = buildPaymentRequest({
+    paymentId: 'ord-123',
+    amountSats: 250,
+    mints: ['https://mint.example.com'],
+    lockPubkey: OP_PUBKEY,
+    transportTarget: 'https://host.example/pay/ord-123',
+  });
+  const decoded = decodePaymentRequest(pr);
+  const t = decoded.transport?.[0];
+  assert.equal(t?.type, 'post');
+  assert.equal(t?.target, 'https://host.example/pay/ord-123');
+});
+
+test('popcount returns the minimal power-of-two split size', () => {
+  assert.equal(popcount(0), 0);
+  assert.equal(popcount(1), 1);
+  assert.equal(popcount(255), 8);
+  assert.equal(popcount(256), 1);
+  assert.equal(popcount(260), 2); // 256 + 4
 });
 
 // Build verifyPayment deps that succeed, so each test can override one field to
@@ -424,6 +446,22 @@ test('verifyPayment rejects too-low amount', async () => {
   assert.equal(r.error, 'amount_too_low');
 });
 
+test('verifyPayment rejects dust-griefing (too many proofs for the amount)', async () => {
+  // 20 proofs summing to 260; popcount(260)=2, default margin 0 here → cap 2.
+  const proofs = Array.from({ length: 20 }, (_, i) => ({ id: 'k1', secret: `s${i}`, amount: 13 }));
+  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({ decode: () => proofs as never }));
+  assert.equal(r.valid, false);
+  assert.equal(r.error, 'too_many_proofs');
+});
+
+test('verifyPayment proofCountMargin tolerates non-minimal honest splits', async () => {
+  // 5 proofs summing to 260; popcount(260)=2, margin 4 → cap 6, so 5 is allowed.
+  const proofs = Array.from({ length: 5 }, (_, i) => ({ id: 'k1', secret: `s${i}`, amount: 52 }));
+  const r = await verifyPayment('tok', { ...VERIFY_OPTS, proofCountMargin: 4 }, okDeps({ decode: () => proofs as never }));
+  assert.equal(r.valid, true);
+  assert.equal(r.amountSats, 260);
+});
+
 test('verifyPayment accepts a genuine, locked token and returns the lock pubkey', async () => {
   const r = await verifyPayment('tok-abc', VERIFY_OPTS, okDeps());
   assert.equal(r.valid, true);
@@ -463,6 +501,56 @@ test('live POST /purchase without payment returns 402 + x-cashu challenge', asyn
     assert.equal(decoded.nut10?.data, '02' + 'a'.repeat(64));
     const body = await res.json();
     assert.equal(body.error, 'payment_required');
+    // Per-order: the creqA carries a NUT-18 POST transport to this order's sink.
+    assert.ok(body.orderId);
+    assert.equal(decoded.id, body.orderId); // paymentId == orderId
+    const transport = decoded.transport?.[0];
+    assert.equal(transport?.type, 'post');
+    assert.match(transport?.target ?? '', new RegExp(`/pay/${body.orderId}$`));
+  }, LIVE_ENV);
+});
+
+test('order lifecycle: pending order, poll, CORS preflight, and /pay validation', async () => {
+  await withServer(async (url) => {
+    const r = await fetch(`${url}/purchase`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+    });
+    assert.equal(r.status, 402);
+    const { orderId } = await r.json();
+    assert.ok(orderId);
+
+    // Browser poll: still pending (capability id required — unknown ids 404).
+    const poll = await fetch(`${url}/order/${orderId}`);
+    assert.equal(poll.status, 200);
+    assert.equal((await poll.json()).status, 'pending');
+
+    // CORS preflight for browser-based Cashu wallets POSTing to the transport.
+    const opt = await fetch(`${url}/pay/${orderId}`, { method: 'OPTIONS' });
+    assert.equal(opt.status, 204);
+    assert.equal(opt.headers.get('access-control-allow-origin'), '*');
+
+    // Garbage body → 400 invalid_payload (CORS header still set).
+    const bad = await fetch(`${url}/pay/${orderId}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ nope: 1 }),
+    });
+    assert.equal(bad.status, 400);
+    assert.equal((await bad.json()).error, 'invalid_payload');
+    assert.equal(bad.headers.get('access-control-allow-origin'), '*');
+
+    // Unverifiable token → 402 payment_failed (real DLEQ/P2PK tested live).
+    const badtok = await fetch(`${url}/pay/${orderId}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'cashuBnotreal' }),
+    });
+    assert.equal(badtok.status, 402);
+    assert.equal((await badtok.json()).error, 'payment_failed');
+
+    // Unknown order id → 404.
+    const unk = await fetch(`${url}/pay/${newOrderId()}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'x' }),
+    });
+    assert.equal(unk.status, 404);
   }, LIVE_ENV);
 });
 
@@ -634,6 +722,42 @@ test('waitForPaid times out if never paid', async () => {
   assert.equal(ok, false);
 });
 
+// --- Order store (per-order delivery) ---
+
+test('order store: create, poll, markReady once, and prune expired pending', async () => {
+  const store = createMemoryOrderStore();
+  const id = newOrderId();
+  const future = new Date(Date.now() + 60_000).toISOString();
+  await store.create({
+    id, status: 'pending', clientPublicKey: 'k', lockPubkey: OP_PUBKEY,
+    lockIndex: 3, createdAt: new Date().toISOString(), expiresAt: future,
+  });
+
+  assert.equal((await store.get(id))?.status, 'pending');
+
+  const lease = {
+    purchaseId: 'p1', clientPublicKey: 'k', tunnelIp: '10.77.0.9',
+    createdAt: 't', expiresAt: 't', status: 'active' as const,
+  };
+  const ready = await store.markReady(id, {
+    purchaseId: 'p1', tunnelIp: '10.77.0.9', amountSats: 250, clientConfig: 'CONF', lease,
+  });
+  assert.equal(ready?.status, 'ready');
+  assert.equal((await store.get(id))?.clientConfig, 'CONF');
+
+  // Second markReady is a no-op (no longer pending).
+  assert.equal(await store.markReady(id, { purchaseId: 'p2', tunnelIp: 'x', amountSats: 1, clientConfig: 'X', lease }), undefined);
+
+  // Expired pending orders read as gone.
+  const expiredId = newOrderId();
+  const past = new Date(Date.now() - 1000).toISOString();
+  await store.create({
+    id: expiredId, status: 'pending', clientPublicKey: 'k', lockPubkey: OP_PUBKEY,
+    createdAt: past, expiresAt: past,
+  });
+  assert.equal(await store.get(expiredId), undefined);
+});
+
 // --- Sweep (operator claims locked proofs offline) ---
 
 test('planSweep derives a matching claim key for each xpub receipt', () => {
@@ -752,6 +876,7 @@ async function withServer(
     allocator: createAllocator(),
     ledger: createMemoryLedger(),
     proofStore: createMemoryProofStore(),
+    orderStore: createMemoryOrderStore(),
     ...extra,
   });
 

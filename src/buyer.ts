@@ -3,13 +3,15 @@
  *
  * Mirrors the proven testclient flow: decode the daemon's 402 PaymentRequest,
  * create a Lightning mint quote, wait for payment, then mint proofs P2PK-locked
- * to the daemon's per-tx pubkey (with DLEQ) and encode them for the X-Cashu retry.
- * So the human just pays a Lightning invoice — no Cashu wallet needed.
+ * to the daemon's per-tx pubkey (with DLEQ). The result is a NUT-18 payment
+ * payload the browser POSTs to /pay/:orderId — the same shape a Cashu wallet
+ * delivers over the request's HTTP transport. So the human just pays a Lightning
+ * invoice — no Cashu wallet needed.
  *
  * cashu-ts calls here are identical to what was validated live against testnut.
  */
 
-import { OutputData, getEncodedToken, decodePaymentRequest, type Proof } from '@cashu/cashu-ts';
+import { OutputData, decodePaymentRequest, type Proof } from '@cashu/cashu-ts';
 
 export interface Challenge {
   amount: number;
@@ -60,17 +62,24 @@ export async function waitForPaid(
   return false;
 }
 
-/** Mint proofs P2PK-locked to lockPubkey and return them as an encoded cashu token. */
-export async function mintLockedToken(
+/** A NUT-18 payment payload: what a wallet POSTs to the request's transport target. */
+export interface PaymentPayload {
+  mint: string;
+  unit: string;
+  proofs: Proof[];
+}
+
+/** Mint proofs P2PK-locked to lockPubkey and return them as a NUT-18 payload. */
+export async function mintLockedPayload(
   wallet: MintWallet,
   challenge: Challenge,
   quote: MintQuote,
-): Promise<string> {
+): Promise<PaymentPayload> {
   const outputs = OutputData.createP2PKData(
     { pubkey: challenge.lockPubkey },
     challenge.amount,
     wallet.getKeyset() as Parameters<typeof OutputData.createP2PKData>[2],
   );
   const proofs = await wallet.ops.mintBolt11(challenge.amount, quote).asCustom(outputs).run();
-  return getEncodedToken({ mint: challenge.mintUrl, proofs, unit: challenge.unit });
+  return { mint: challenge.mintUrl, unit: challenge.unit, proofs };
 }

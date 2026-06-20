@@ -12,28 +12,35 @@ product — see the security model below for why that's safe to run.
 > TLS browser smoke against the [CDK test mint](https://testnut.cashudevkit.org)).
 > Before a real public launch see **Production checklist** below.
 
-## How payment works (NUT-24 over NUT-18, non-custodial)
+## How payment works (NUT-18 transport + per-order, non-custodial)
 
 ```
 buyer                              daemon                         mint
   │  POST /purchase (no payment)     │                             │
-  │ ───────────────────────────────►│  402 + x-cashu: creqA…       │
-  │ ◄───────────────────────────────│  (PaymentRequest, P2PK-lock) │
+  │ ───────────────────────────────►│  402 + creqA + orderId       │
+  │ ◄───────────────────────────────│  (PaymentRequest: P2PK-lock  │
+  │                                  │   + POST transport /pay/:id) │
   │  pay LN invoice / mint ecash ───────────────────────────────► mint
-  │  POST /purchase  X-Cashu: token  │                             │
-  │ ───────────────────────────────►│  verify OFFLINE, add peer    │
-  │ ◄───────────────────────────────│  200 + WireGuard .conf       │
+  │  POST /pay/:orderId  {proofs} ──►│  verify OFFLINE, add peer    │
+  │  GET /order/:orderId (poll) ────►│  ◄ ready + WireGuard .conf   │
 ```
 
-The daemon answers an unpaid `/purchase` with **HTTP 402** and a NUT-18
-`PaymentRequest` (`creqA…`) that demands proofs **NUT-11 P2PK-locked to the
-operator's pubkey**. On the paid retry it verifies the token **entirely offline**:
+The daemon answers an unpaid `/purchase` with **HTTP 402**, an unguessable
+**order id** (a capability token), and a NUT-18 `PaymentRequest` (`creqA…`) that
+demands proofs **NUT-11 P2PK-locked to the operator's pubkey** and carries a
+**NUT-18 HTTP POST transport** pointing at `/pay/:orderId`. A NUT-18 wallet pays
+and POSTs the proofs straight there — no copy/paste. The browser polls
+`GET /order/:orderId` and renders **only its own** config. (Agents can still use
+the NUT-24 same-client path: retry `POST /purchase` with an `X-Cashu` header.)
+
+The proofs are verified **entirely offline**:
 
 1. **NUT-12 DLEQ** — proves the mint genuinely signed the proofs, checked locally
    against the mint's public keyset (fetched once, cached). No swap.
 2. **NUT-11 P2PK** — proves the proofs are locked to a pubkey the operator
    controls, so only the operator can ever spend them.
-3. amount ≥ price, accepted mint, and replay dedupe.
+3. amount ≥ price, accepted mint, a **proof-count cap** (dust-griefing guard),
+   and replay dedupe — all *before* anything is stored.
 
 There is **no per-sale mint call** and **no swap** — the buyer's wallet does all
 the minting (so mint rate limits fan out across buyers). Received tokens are
@@ -55,11 +62,14 @@ generated **in your browser** (the private key never leaves the page). Then pay:
 
 - **⚡ Lightning** — no Cashu wallet needed. The page mints the ecash in your
   browser from a Lightning invoice and delivers it automatically.
-- **Cashu wallet** — scan/copy the payment request with a NUT-18 wallet and paste
-  the token back.
+- **Cashu wallet** — scan/copy the payment request with a NUT-18 wallet; it pays
+  and delivers the ecash automatically (the request carries the delivery address).
 
-You get a ready-to-use `.conf` to download. (The page needs a **secure context** —
-HTTPS or localhost — for in-browser key generation.)
+The page then updates itself and offers a ready-to-use `.conf` to download. Your
+orders are remembered in this browser under **Your access** (so you can
+re-download across reloads); the private key stays local and is never sent. (The
+page needs a **secure context** — HTTPS or localhost — for in-browser key
+generation.)
 
 ## Operator quickstart
 
@@ -118,16 +128,28 @@ net price minus a sat or two.)
 | `LEASE_DURATION_MS` | `10800000` (3h) | lease length |
 | `CLEANUP_INTERVAL_MS` | off | how often to remove expired peers |
 | `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | `30` / `60000` | per-IP `/purchase` limit (0 disables) |
+| `PUBLIC_BASE_URL` | request-derived | external base URL for the NUT-18 `/pay/:id` transport target (set this behind a proxy) |
+| `ORDER_TTL_MS` | `1800000` (30m) | how long an unpaid order's PaymentRequest stays valid |
+| `PROOF_COUNT_MARGIN` | `4` | dust guard: reject tokens with more than `popcount(amount) + margin` proofs |
 | `PROOFS_PATH` | memory | locked-proof vault file |
 | `PEER_LEDGER_PATH` | memory | lease ledger file |
+| `ORDERS_PATH` | memory | pending-order store file |
 | `LOCK_COUNTER_PATH` | memory | xpub lock index counter file |
 
 ## HTTP API
 
 - `GET /` · `GET /marketplace` — buyer page · `GET /client.js` — browser bundle
 - `GET /health` · `GET /info` — status / price / accepted mints
-- `POST /purchase` — `{clientPublicKey}`; 402 → pay → retry with `X-Cashu` header
-- `GET /peers` — active leases
+- `POST /purchase` — `{clientPublicKey}` → **402** with an `orderId` + `creqA`
+  (NUT-18 POST transport). Agents may instead retry with an `X-Cashu` header for
+  inline (NUT-24) delivery.
+- `POST /pay/:orderId` — NUT-18 transport sink: `{mint,unit,proofs}` (or `{token}`).
+  Verifies, provisions the peer, marks the order ready. (CORS-enabled.)
+- `GET /order/:orderId` — poll an order by its capability id; returns the `.conf`
+  once ready.
+
+> `GET /peers` was **removed** — it leaked every buyer's lease. Orders are private
+> by capability: only the holder of an order id can read it.
 
 ## Security model
 
@@ -139,6 +161,10 @@ net price minus a sat or two.)
 - **No shell injection:** WireGuard commands run via `execFile` with an argv
   allowlist and strict key/IP validation — never a shell string.
 - **Rate limited:** per-IP cap on `/purchase`.
+- **Capability orders:** order ids are crypto-random (~192-bit) and the only way
+  to read an order, so buyers' configs aren't enumerable.
+- **Dust-griefing guard:** tokens padded with many tiny proofs (each an input fee
+  to sweep) are rejected before storage, so the griefer's token stays locked to us.
 - **No anonymity/legal claims.** Operators run their own exits and carry that
   responsibility; this software does not route or proxy traffic itself.
 
@@ -147,8 +173,9 @@ net price minus a sat or two.)
 ```
 src/
   config.ts     env config
-  server.ts     HTTP server, 402 flow, buyer page
-  cashu.ts      PaymentRequest + offline verify (DLEQ + P2PK)
+  server.ts     HTTP server, per-order 402 flow, /pay + /order, buyer page
+  cashu.ts      PaymentRequest (+ NUT-18 transport) + offline verify (DLEQ + P2PK + proof cap)
+  orders.ts     file-backed atomic pending-order store (capability ids)
   locks.ts      xpub LockBook (per-tx pubkeys)
   hdkeys.ts     BIP32 watch-only derivation
   wallet.ts     locked-proof vault

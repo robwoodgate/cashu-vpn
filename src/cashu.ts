@@ -25,6 +25,7 @@
 
 import {
   PaymentRequest,
+  PaymentRequestTransportType,
   getTokenMetadata,
   getDecodedToken,
   hasValidDleq,
@@ -32,6 +33,7 @@ import {
   Wallet,
   sumProofs,
   type Proof,
+  type PaymentRequestTransport,
   type TokenMetadata,
   type HasKeysetKeys,
 } from '@cashu/cashu-ts';
@@ -66,6 +68,11 @@ function hasEscapeClause(secret: string): boolean {
  * Build the NUT-18 PaymentRequest (creqA) used as the NUT-24 402 challenge.
  * `lockPubkey` is the P2PK pubkey the requested proofs must be locked to — a
  * fixed operator pubkey, or a fresh xpub-derived per-tx pubkey (see locks.ts).
+ *
+ * When `transportTarget` is set the request carries a NUT-18 HTTP POST transport,
+ * so a NUT-18 wallet pays and POSTs the proofs straight to that URL (the
+ * per-order /pay/:orderId sink) — no copy/paste. A NUT-24 agent ignores the
+ * transport and delivers the same proofs via the `X-Cashu` retry header instead.
  */
 export function buildPaymentRequest(opts: {
   paymentId: string;
@@ -74,11 +81,15 @@ export function buildPaymentRequest(opts: {
   lockPubkey: string;
   unit?: string;
   description?: string;
+  transportTarget?: string;
 }): string {
   // NUT-10 spending condition: lock the requested proofs to lockPubkey.
   const nut10 = { kind: 'P2PK', data: opts.lockPubkey, tags: [] as string[][] };
+  const transports: PaymentRequestTransport[] | undefined = opts.transportTarget
+    ? [{ type: PaymentRequestTransportType.POST, target: opts.transportTarget, tags: [] }]
+    : undefined;
   return new PaymentRequest(
-    undefined, // no embedded transport: delivery is the HTTP X-Cashu retry
+    transports,
     opts.paymentId,
     opts.amountSats,
     opts.unit ?? 'sat',
@@ -87,6 +98,17 @@ export function buildPaymentRequest(opts: {
     undefined,
     nut10,
   ).toEncodedCreqA();
+}
+
+/** Number of set bits in a non-negative integer (minimal power-of-two split size). */
+export function popcount(n: number): number {
+  let count = 0;
+  let v = Math.max(0, Math.floor(n));
+  while (v > 0) {
+    v &= v - 1;
+    count++;
+  }
+  return count;
 }
 
 export interface VerifyResult {
@@ -161,7 +183,7 @@ const defaultLoadMintContext = async (mint: string, unit: string): Promise<MintC
  */
 export async function verifyPayment(
   encodedToken: string,
-  opts: { acceptedMints: string[]; requiredSats: number; unit?: string },
+  opts: { acceptedMints: string[]; requiredSats: number; unit?: string; proofCountMargin?: number },
   deps: VerifyDeps = {},
 ): Promise<VerifyResult> {
   const unit = opts.unit ?? 'sat';
@@ -242,6 +264,16 @@ export async function verifyPayment(
   const amountSats = amountToNumber(sumProofs(proofs));
   if (amountSats < opts.requiredSats) {
     return { valid: false, amountSats, error: 'amount_too_low' };
+  }
+
+  // Dust-griefing guard. A power-of-two split of `amountSats` needs exactly
+  // popcount(amountSats) proofs; honest wallets land at or near that. A griefer
+  // can instead pad the payment with many tiny proofs — each one an extra input
+  // fee the operator eats when sweeping. Cap the count and reject BEFORE storing,
+  // so the rejected token stays locked to us and is stranded for the griefer.
+  const margin = opts.proofCountMargin ?? 0;
+  if (proofs.length > popcount(amountSats) + margin) {
+    return { valid: false, amountSats, error: 'too_many_proofs' };
   }
 
   return {

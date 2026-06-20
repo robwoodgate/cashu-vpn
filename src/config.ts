@@ -11,6 +11,23 @@ export interface Config {
   acceptedMints: string[];
   priceSats: number;
   unit: string;
+  /**
+   * Externally reachable base URL (behind TLS), used to build the NUT-18 POST
+   * transport target a paying wallet hits (`<base>/pay/:orderId`). When unset it
+   * is derived per-request from the forwarded proto + host headers.
+   */
+  publicBaseUrl?: string;
+  /** Where the pending-order store persists (per-order delivery model). */
+  orderStorePath?: string;
+  /** How long an unpaid order's PaymentRequest stays valid. */
+  orderTtlMs: number;
+  /**
+   * Dust-griefing guard: reject tokens whose proof count exceeds
+   * popcount(amount) + this margin. Honest wallets pay near the popcount minimum;
+   * only a griefer pads a payment with many dust proofs (each costs us an input
+   * fee to sweep). See verifyPayment.
+   */
+  proofCountMargin: number;
   /** Fixed operator P2PK pubkey to lock proofs to (live mode needs this OR operatorXpub). */
   operatorPubkey: string;
   /** Operator xpub for per-transaction lock pubkeys (private; preferred over operatorPubkey). */
@@ -25,6 +42,8 @@ export interface Config {
 
 const DEFAULT_LEASE_MS = 3 * 60 * 60 * 1000; // 3 hours
 const DEFAULT_PRICE_SATS = 250;
+const DEFAULT_ORDER_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const DEFAULT_PROOF_COUNT_MARGIN = 4;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const mode = env.MODE === 'live' ? 'live' : 'dry-run';
@@ -55,6 +74,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     acceptedMints,
     priceSats: Number(env.PRICE_SATS ?? DEFAULT_PRICE_SATS),
     unit: env.MINT_UNIT ?? 'sat',
+    publicBaseUrl: env.PUBLIC_BASE_URL ? env.PUBLIC_BASE_URL.replace(/\/+$/, '') : undefined,
+    orderStorePath: env.ORDERS_PATH,
+    orderTtlMs: Number(env.ORDER_TTL_MS ?? DEFAULT_ORDER_TTL_MS),
+    proofCountMargin: Number(env.PROOF_COUNT_MARGIN ?? DEFAULT_PROOF_COUNT_MARGIN),
     operatorPubkey: env.OPERATOR_PUBKEY ?? '',
     operatorXpub: env.OPERATOR_XPUB || undefined,
     lockCounterPath: env.LOCK_COUNTER_PATH,

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Install cashu-vpn as a systemd service behind the existing Caddy TLS.
-# Minibits mint + intentionally HIGH price so the public instance isn't casually
-# usable (Rob flexes PRICE_SATS in cashu-vpn.env then `systemctl restart cashu-vpn`).
+# Minibits mint, 250 sats / 1h lease (sane test price). Flex PRICE_SATS /
+# LEASE_DURATION_MS in cashu-vpn.env then `systemctl restart cashu-vpn`.
 set -e
 export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"
 cd /root/cashu-vpn
 NODEBIN="$(nvm which 20)"
 XPUB=$(node -e "console.log(require('./state/test-key.json').xpub)")
 mkdir -p state
-rm -f state/proofs.json state/peers.json state/locks.json
+rm -f state/proofs.json state/peers.json state/locks.json state/orders.json
 
 cat > /root/cashu-vpn/cashu-vpn.env <<EOF
 MODE=live
@@ -17,9 +17,10 @@ SERVER_PUBLIC_KEY=nKpu1TI56v6JqS+wxnhMd+hBQJ8X15y7075zpATtJWU=
 WG_ENDPOINT=157.180.114.119:51820
 OPERATOR_XPUB=$XPUB
 ACCEPTED_MINTS=https://mint.minibits.cash/Bitcoin
-PRICE_SATS=1000000
+PRICE_SATS=250
+PUBLIC_BASE_URL=https://vpn-157-180-114-119.nip.io
 MINT_UNIT=sat
-LEASE_DURATION_MS=600000
+LEASE_DURATION_MS=3600000
 CLEANUP_INTERVAL_MS=60000
 RATE_LIMIT_MAX=20
 RATE_LIMIT_WINDOW_MS=60000
@@ -27,6 +28,7 @@ HOST=127.0.0.1
 PORT=3087
 PROOFS_PATH=/root/cashu-vpn/state/proofs.json
 PEER_LEDGER_PATH=/root/cashu-vpn/state/peers.json
+ORDERS_PATH=/root/cashu-vpn/state/orders.json
 LOCK_COUNTER_PATH=/root/cashu-vpn/state/locks.json
 EOF
 

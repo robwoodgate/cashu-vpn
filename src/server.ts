@@ -5,34 +5,47 @@ import type { Config } from './config.js';
 import type { PeerAllocator, PeerLedger, PeerLease } from './peers.js';
 import type { ProofStore } from './wallet.js';
 import type { LockBook } from './locks.js';
+import { newOrderId, type Order, type OrderStore } from './orders.js';
 import { createRateLimiter, type RateLimiter } from './ratelimit.js';
 import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, validatePublicKey } from './wireguard.js';
 import { buildPaymentRequest, verifyPayment, normalizePubkey, type VerifyResult } from './cashu.js';
+import { getEncodedToken, type Proof } from '@cashu/cashu-ts';
 
 const MAX_BODY_BYTES = 16 * 1024;
+const ORDER_ID_RE = /^[A-Za-z0-9_-]{16,}$/;
 
 export interface ServerDeps {
   config: Config;
   allocator: PeerAllocator;
   ledger: PeerLedger;
   proofStore: ProofStore;
+  orderStore: OrderStore;
   /** Present in xpub mode: issues per-transaction lock pubkeys. */
   lockBook?: LockBook;
 }
 
+// Everything a request handler needs, assembled once in createServer.
+interface Ctx extends ServerDeps {
+  limiter?: RateLimiter;
+  /** Order ids currently being provisioned, to serialize concurrent /pay hits. */
+  processing: Set<string>;
+}
+
 export function createServer(deps: ServerDeps): http.Server {
-  const { config, allocator, ledger, proofStore, lockBook } = deps;
+  const { config } = deps;
 
   const limiter = config.rateLimitMax > 0
     ? createRateLimiter({ max: config.rateLimitMax, windowMs: config.rateLimitWindowMs })
     : undefined;
+
+  const ctx: Ctx = { ...deps, limiter, processing: new Set() };
 
   // Cleanup interval
   let cleanupTimer: NodeJS.Timeout | undefined;
   if (config.cleanupIntervalMs) {
     const intervalMs = config.cleanupIntervalMs;
     cleanupTimer = setInterval(() => {
-      cleanupExpiredPeers(ledger, config.wgInterface, config.mode === 'dry-run').catch((e) => {
+      cleanupExpiredPeers(deps.ledger, config.wgInterface, config.mode === 'dry-run').catch((e) => {
         console.error('cleanup failed:', e instanceof Error ? e.message : e);
       });
     }, intervalMs);
@@ -40,7 +53,7 @@ export function createServer(deps: ServerDeps): http.Server {
   }
 
   const server = http.createServer((req, res) => {
-    void handleRequest(req, res, config, allocator, ledger, proofStore, lockBook, limiter);
+    void handleRequest(req, res, ctx);
   });
 
   server.once('close', () => {
@@ -50,16 +63,8 @@ export function createServer(deps: ServerDeps): http.Server {
   return server;
 }
 
-async function handleRequest(
-  req: IncomingMessage,
-  res: ServerResponse,
-  config: Config,
-  allocator: PeerAllocator,
-  ledger: PeerLedger,
-  proofStore: ProofStore,
-  lockBook?: LockBook,
-  limiter?: RateLimiter
-): Promise<void> {
+async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx): Promise<void> {
+  const { config } = ctx;
   const path = new URL(req.url ?? '/', 'http://localhost').pathname;
 
   try {
@@ -69,13 +74,13 @@ async function handleRequest(
 
     if (req.method === 'GET' && path === '/info') {
       return json(res, 200, {
-        version: '0.1.0',
+        version: '0.2.0',
         mode: config.mode,
         priceSats: config.priceSats,
         unit: config.unit,
         leaseDuration: `${config.leaseDurationMs / 1000}s`,
         acceptedMints: config.acceptedMints,
-        lock: lockBook ? 'xpub-per-tx' : config.operatorPubkey ? 'fixed-pubkey' : 'none',
+        lock: ctx.lockBook ? 'xpub-per-tx' : config.operatorPubkey ? 'fixed-pubkey' : 'none',
       });
     }
 
@@ -86,8 +91,8 @@ async function handleRequest(
     }
 
     if (req.method === 'POST' && path === '/purchase') {
-      if (limiter) {
-        const { allowed, retryAfterMs } = limiter.check(clientIp(req));
+      if (ctx.limiter) {
+        const { allowed, retryAfterMs } = ctx.limiter.check(clientIp(req));
         if (!allowed) {
           res.writeHead(429, {
             'content-type': 'application/json; charset=utf-8',
@@ -97,12 +102,20 @@ async function handleRequest(
           return;
         }
       }
-      return await handlePurchase(req, res, config, allocator, ledger, proofStore, lockBook);
+      return await handlePurchase(req, res, ctx);
     }
 
-    if (req.method === 'GET' && path === '/peers') {
-      const peers = await ledger.list();
-      return json(res, 200, { count: peers.length, peers });
+    // NUT-18 transport sink: a paying wallet POSTs proofs to /pay/:orderId.
+    const payId = matchPath(path, '/pay/');
+    if (payId !== undefined) {
+      if (req.method === 'OPTIONS') return preflight(res);
+      if (req.method === 'POST') return await handlePay(req, res, ctx, payId);
+    }
+
+    // Per-order poll: the browser fetches ONLY its own order by capability id.
+    const orderId = matchPath(path, '/order/');
+    if (orderId !== undefined && req.method === 'GET') {
+      return await handleOrderStatus(res, ctx, orderId);
     }
 
     if (req.method === 'GET' && (path === '/' || path === '/marketplace')) {
@@ -120,15 +133,10 @@ async function handleRequest(
   }
 }
 
-async function handlePurchase(
-  req: IncomingMessage,
-  res: ServerResponse,
-  config: Config,
-  allocator: PeerAllocator,
-  ledger: PeerLedger,
-  proofStore: ProofStore,
-  lockBook?: LockBook
-): Promise<void> {
+// --- POST /purchase ---
+
+async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ctx): Promise<void> {
+  const { config } = ctx;
   const body = await readBody(req);
 
   if (!isObj(body)) {
@@ -136,98 +144,228 @@ async function handlePurchase(
   }
 
   const { clientPublicKey } = body;
-
   if (typeof clientPublicKey !== 'string' || !clientPublicKey) {
     return json(res, 400, { error: 'missing_client_public_key' });
   }
 
-  // Live mode runs the NUT-24 (HTTP 402) payment handshake. Dry-run skips it.
-  let payment: VerifyResult | undefined;
-  let lockIndex: number | undefined;
-  if (config.mode === 'live') {
-    if (!lockBook && !config.operatorPubkey) {
-      // Misconfiguration: nothing to lock proofs to. Fail loudly, never fall
-      // back to custodial behaviour.
-      return json(res, 503, { error: 'operator_lock_not_configured' });
-    }
-
-    // The key is interpolated into a `wg set` command, so reject anything that
-    // isn't a real base64 WireGuard public key before it reaches the host.
-    try {
-      validatePublicKey(clientPublicKey);
-    } catch {
-      return json(res, 400, {
-        error: 'invalid_client_public_key',
-        message: 'clientPublicKey must be a base64 WireGuard public key',
-      });
-    }
-
-    // No payment yet → answer with a 402 + PaymentRequest (creqA) in x-cashu.
-    // The request demands proofs P2PK-locked to a per-tx pubkey (xpub mode) or
-    // the fixed operator pubkey.
-    const token = firstHeader(req.headers['x-cashu']);
-    if (!token) {
-      const lockPubkey = lockBook ? (await lockBook.issue()).pubkey : config.operatorPubkey;
-      const creq = buildPaymentRequest({
-        paymentId: newPurchaseId(),
-        amountSats: config.priceSats,
-        mints: config.acceptedMints,
-        lockPubkey,
-        unit: config.unit,
-        description: 'cashu-vpn access',
-      });
-      res.writeHead(402, { 'content-type': 'application/json; charset=utf-8', 'x-cashu': creq });
-      res.end(
-        JSON.stringify({
-          error: 'payment_required',
-          quotedSats: config.priceSats,
-          unit: config.unit,
-          acceptedMints: config.acceptedMints,
-          hint: 'Pay the request, then retry POST /purchase with an X-Cashu header.',
-        })
-      );
-      return;
-    }
-
-    // Payment present → verify offline (DLEQ + P2PK lock) before provisioning
-    // anything. No swap, no per-sale mint call.
-    payment = await verifyPayment(token, {
-      acceptedMints: config.acceptedMints,
-      requiredSats: config.priceSats,
-      unit: config.unit,
-    });
-    if (!payment.valid || !payment.lockPubkey) {
-      return json(res, 402, { error: 'payment_failed', detail: payment.error ?? 'unverified' });
-    }
-
-    // Authorize the lock: must be a pubkey WE control, or the operator can't
-    // sweep it. xpub mode → it must be one we issued; fixed mode → the operator key.
-    if (lockBook) {
-      lockIndex = lockBook.resolve(payment.lockPubkey);
-      if (lockIndex === undefined) {
-        return json(res, 402, { error: 'payment_failed', detail: 'lock_not_recognized' });
-      }
-    } else if (payment.lockPubkey !== normalizePubkey(config.operatorPubkey)) {
-      return json(res, 402, { error: 'payment_failed', detail: 'not_locked_to_operator' });
-    }
-
-    // Reject replays of an already-redeemed token.
-    if (payment.secrets && (await proofStore.hasAnyOf(payment.secrets))) {
-      return json(res, 402, { error: 'payment_failed', detail: 'already_redeemed' });
-    }
+  // Dry-run skips payment entirely and provisions immediately.
+  if (config.mode !== 'live') {
+    const bundle = await provisionPeer(ctx, clientPublicKey, undefined, undefined);
+    return json(res, 200, { ...bundle, mode: config.mode });
   }
 
-  // Allocate peer
+  if (!ctx.lockBook && !config.operatorPubkey) {
+    // Misconfiguration: nothing to lock proofs to. Fail loudly, never fall back
+    // to custodial behaviour.
+    return json(res, 503, { error: 'operator_lock_not_configured' });
+  }
+
+  // The key is interpolated into a `wg set` command, so reject anything that
+  // isn't a real base64 WireGuard public key before it reaches the host.
+  try {
+    validatePublicKey(clientPublicKey);
+  } catch {
+    return json(res, 400, {
+      error: 'invalid_client_public_key',
+      message: 'clientPublicKey must be a base64 WireGuard public key',
+    });
+  }
+
+  // NUT-24 same-client path (agents): proofs delivered inline via X-Cashu. Verify
+  // and provision in this same response — no order/poll round-trip needed.
+  const headerToken = firstHeader(req.headers['x-cashu']);
+  if (headerToken) {
+    const verified = await verifyAndAuthorize(ctx, headerToken);
+    if ('error' in verified) {
+      return json(res, 402, { error: 'payment_failed', detail: verified.error });
+    }
+    const bundle = await provisionPeer(ctx, clientPublicKey, verified.payment, verified.lockIndex);
+    return json(res, 200, { ...bundle, mode: config.mode });
+  }
+
+  // Otherwise create an order and answer with a 402 + PaymentRequest. The creqA
+  // carries a NUT-18 POST transport to /pay/:orderId, so a wallet pays and
+  // delivers automatically; the browser polls GET /order/:orderId.
+  const lock = ctx.lockBook ? await ctx.lockBook.issue() : undefined;
+  const lockPubkey = lock ? lock.pubkey : config.operatorPubkey;
+  const orderId = newOrderId();
+  const now = new Date();
+  const order: Order = {
+    id: orderId,
+    status: 'pending',
+    clientPublicKey,
+    lockPubkey,
+    lockIndex: lock?.index,
+    createdAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + config.orderTtlMs).toISOString(),
+  };
+  await ctx.orderStore.create(order);
+
+  const creq = buildPaymentRequest({
+    paymentId: orderId,
+    amountSats: config.priceSats,
+    mints: config.acceptedMints,
+    lockPubkey,
+    unit: config.unit,
+    description: 'cashu-vpn access',
+    transportTarget: `${baseUrl(req, config)}/pay/${orderId}`,
+  });
+
+  res.writeHead(402, { 'content-type': 'application/json; charset=utf-8', 'x-cashu': creq });
+  res.end(JSON.stringify({
+    error: 'payment_required',
+    orderId,
+    creq,
+    quotedSats: config.priceSats,
+    unit: config.unit,
+    acceptedMints: config.acceptedMints,
+    hint: 'Pay the request; a NUT-18 wallet delivers automatically, then poll GET /order/:orderId.',
+  }));
+}
+
+// --- POST /pay/:orderId (NUT-18 transport sink) ---
+
+async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, orderId: string): Promise<void> {
+  cors(res);
+
+  if (!ORDER_ID_RE.test(orderId)) {
+    return json(res, 404, { error: 'order_not_found' });
+  }
+
+  const order = await ctx.orderStore.get(orderId);
+  if (!order) {
+    return json(res, 404, { error: 'order_not_found' });
+  }
+  if (order.status === 'ready') {
+    // Idempotent: the order was already paid and provisioned.
+    return json(res, 200, { ok: true, status: 'ready' });
+  }
+
+  const body = await readBody(req);
+  let encodedToken: string;
+  try {
+    encodedToken = encodeFromPayload(body);
+  } catch {
+    return json(res, 400, { error: 'invalid_payload', message: 'Expected a NUT-18 payload {mint,unit,proofs} or {token}' });
+  }
+
+  // Serialize concurrent deliveries for the same order so we never double-provision.
+  if (ctx.processing.has(orderId)) {
+    return json(res, 409, { error: 'order_in_progress' });
+  }
+  ctx.processing.add(orderId);
+  try {
+    // Re-check after acquiring the guard (a racing request may have finished).
+    const fresh = await ctx.orderStore.get(orderId);
+    if (!fresh) return json(res, 404, { error: 'order_not_found' });
+    if (fresh.status === 'ready') return json(res, 200, { ok: true, status: 'ready' });
+
+    const verified = await verifyAndAuthorize(ctx, encodedToken);
+    if ('error' in verified) {
+      return json(res, 402, { error: 'payment_failed', detail: verified.error });
+    }
+
+    // Bind the payment to THIS order's challenge: the proofs must be locked to the
+    // exact pubkey we issued for it, not merely some key we control.
+    if (verified.payment.lockPubkey !== normalizePubkey(fresh.lockPubkey)) {
+      return json(res, 402, { error: 'payment_failed', detail: 'lock_mismatch' });
+    }
+
+    const bundle = await provisionPeer(ctx, fresh.clientPublicKey, verified.payment, fresh.lockIndex);
+    await ctx.orderStore.markReady(orderId, bundle);
+    return json(res, 200, { ok: true, status: 'ready' });
+  } finally {
+    ctx.processing.delete(orderId);
+  }
+}
+
+// --- GET /order/:orderId (browser poll) ---
+
+async function handleOrderStatus(res: ServerResponse, ctx: Ctx, orderId: string): Promise<void> {
+  if (!ORDER_ID_RE.test(orderId)) {
+    return json(res, 404, { error: 'order_not_found' });
+  }
+  const order = await ctx.orderStore.get(orderId);
+  if (!order) {
+    return json(res, 404, { error: 'order_not_found' });
+  }
+  if (order.status === 'ready') {
+    return json(res, 200, {
+      status: 'ready',
+      mode: ctx.config.mode,
+      purchaseId: order.purchaseId,
+      tunnelIp: order.tunnelIp,
+      amountSats: order.amountSats,
+      clientConfig: order.clientConfig,
+      lease: order.lease,
+    });
+  }
+  return json(res, 200, { status: 'pending', mode: ctx.config.mode });
+}
+
+// --- Payment verification + lock authorization ---
+
+interface Authorized { payment: VerifyResult; lockIndex?: number; }
+
+/**
+ * Verify a delivered token offline (DLEQ + P2PK + amount + proof cap + replay)
+ * and authorize its lock against a key the operator controls. Returns the
+ * verified payment plus the xpub child index to record for sweeping, or `{error}`.
+ */
+async function verifyAndAuthorize(ctx: Ctx, encodedToken: string): Promise<Authorized | { error: string }> {
+  const { config } = ctx;
+  const payment = await verifyPayment(encodedToken, {
+    acceptedMints: config.acceptedMints,
+    requiredSats: config.priceSats,
+    unit: config.unit,
+    proofCountMargin: config.proofCountMargin,
+  });
+  if (!payment.valid || !payment.lockPubkey) {
+    return { error: payment.error ?? 'unverified' };
+  }
+
+  // The lock must be a pubkey WE control, or the operator can't sweep it.
+  let lockIndex: number | undefined;
+  if (ctx.lockBook) {
+    lockIndex = ctx.lockBook.resolve(payment.lockPubkey);
+    if (lockIndex === undefined) return { error: 'lock_not_recognized' };
+  } else if (payment.lockPubkey !== normalizePubkey(config.operatorPubkey)) {
+    return { error: 'not_locked_to_operator' };
+  }
+
+  // Reject replays of an already-redeemed token.
+  if (payment.secrets && (await ctx.proofStore.hasAnyOf(payment.secrets))) {
+    return { error: 'already_redeemed' };
+  }
+
+  return { payment, lockIndex };
+}
+
+// --- Provisioning (shared by every delivery path) ---
+
+interface ProvisionBundle {
+  purchaseId: string;
+  tunnelIp: string;
+  amountSats?: number;
+  lease: PeerLease;
+  clientConfig: string;
+}
+
+async function provisionPeer(
+  ctx: Ctx,
+  clientPublicKey: string,
+  payment: VerifyResult | undefined,
+  lockIndex: number | undefined,
+): Promise<ProvisionBundle> {
+  const { config, allocator, ledger, proofStore } = ctx;
+
   const purchaseId = newPurchaseId();
   const tunnelIp = allocator.allocateTunnelIp(purchaseId, clientPublicKey);
 
-  // In live mode, actually add the WireGuard peer
   if (config.mode === 'live') {
-    const plan = planAddPeer(config.wgInterface, clientPublicKey, tunnelIp);
-    await executePlan(plan);
+    await executePlan(planAddPeer(config.wgInterface, clientPublicKey, tunnelIp));
   }
 
-  // Record lease
   const now = new Date();
   const lease: PeerLease = {
     purchaseId,
@@ -254,7 +392,6 @@ async function handlePurchase(
     });
   }
 
-  // Generate client config
   const clientConfig = generateClientConfig({
     tunnelIp,
     serverPublicKey: config.serverPublicKey,
@@ -263,18 +400,36 @@ async function handlePurchase(
     dryRun: config.mode === 'dry-run',
   });
 
-  json(res, 200, {
-    purchaseId,
-    tunnelIp,
-    mode: config.mode,
-    amountSats: payment?.amountSats,
-    lease,
-    clientConfig,
-  });
+  return { purchaseId, tunnelIp, amountSats: payment?.amountSats, lease, clientConfig };
 }
 
 function newPurchaseId(): string {
   return `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// --- NUT-18 payload handling ---
+
+/** Reconstruct an encoded cashu token from a /pay body: NUT-18 payload or {token}. */
+function encodeFromPayload(body: unknown): string {
+  if (!isObj(body)) throw new Error('not an object');
+  if (typeof body.token === 'string' && body.token) return body.token;
+
+  const { mint, proofs } = body;
+  const unit = typeof body.unit === 'string' ? body.unit : 'sat';
+  if (typeof mint !== 'string' || !mint || !Array.isArray(proofs) || proofs.length === 0) {
+    throw new Error('missing mint/proofs');
+  }
+  return getEncodedToken({ mint, proofs: proofs as Proof[], unit });
+}
+
+// --- HTTP helpers ---
+
+function matchPath(path: string, prefix: string): string | undefined {
+  if (!path.startsWith(prefix)) return undefined;
+  const rest = path.slice(prefix.length);
+  // Single path segment only (no nested slashes).
+  if (rest === '' || rest.includes('/')) return undefined;
+  return decodeURIComponent(rest);
 }
 
 function firstHeader(value: string | string[] | undefined): string {
@@ -282,11 +437,32 @@ function firstHeader(value: string | string[] | undefined): string {
   return (v ?? '').trim();
 }
 
+// External base URL for the NUT-18 transport target: explicit config, else the
+// forwarded proto/host (Caddy sets these in front of the daemon).
+function baseUrl(req: IncomingMessage, config: Config): string {
+  if (config.publicBaseUrl) return config.publicBaseUrl;
+  const proto = firstHeader(req.headers['x-forwarded-proto']).split(',')[0]!.trim() || 'https';
+  const host = firstHeader(req.headers['x-forwarded-host']) || firstHeader(req.headers.host);
+  return `${proto}://${host}`;
+}
+
 // Real client IP: first X-Forwarded-For hop (set by Caddy) else the socket peer.
 function clientIp(req: IncomingMessage): string {
   const xff = firstHeader(req.headers['x-forwarded-for']);
   if (xff) return xff.split(',')[0]!.trim();
   return req.socket.remoteAddress ?? 'unknown';
+}
+
+function cors(res: ServerResponse): void {
+  res.setHeader('access-control-allow-origin', '*');
+  res.setHeader('access-control-allow-methods', 'POST, OPTIONS');
+  res.setHeader('access-control-allow-headers', 'content-type');
+}
+
+function preflight(res: ServerResponse): void {
+  cors(res);
+  res.writeHead(204);
+  res.end();
 }
 
 // --- Body parsing ---
@@ -374,8 +550,6 @@ function renderPage(config: Config): string {
     .facts { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; margin: 12px 0; }
     .fact { background: #17202b; border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
     .fact span { color: var(--muted); font-size: .75rem; display: block; margin-bottom: 2px; }
-    textarea, input { background: #080b10; border: 1px solid var(--line); border-radius: 8px; color: var(--text); font: inherit; padding: 10px; width: 100%; resize: vertical; }
-    textarea { min-height: 80px; font-family: monospace; font-size: .85rem; }
     button { background: var(--accent); border: 0; border-radius: 8px; color: #03121f; cursor: pointer; font: inherit; font-weight: 700; padding: 12px 16px; }
     button:disabled { opacity: .5; cursor: wait; }
     .row { display: flex; gap: 10px; align-items: center; }
@@ -383,9 +557,9 @@ function renderPage(config: Config): string {
     .msg.ok { color: var(--good); }
     .msg.err { color: var(--warn); }
     .hdr { display: flex; justify-content: space-between; align-items: flex-start; }
-    .leases { margin-top: 8px; }
-    .lease { background: #17202b; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-top: 6px; font-size: .9rem; }
-    .lease small { color: var(--muted); }
+    .access { margin-top: 8px; }
+    .acc { background: #17202b; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-top: 6px; font-size: .9rem; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .acc small { color: var(--muted); }
     .empty { color: var(--muted); border: 1px dashed var(--line); border-radius: 8px; padding: 12px; margin-top: 8px; }
     h3 { font-size: 1rem; margin: 18px 0 4px; color: var(--text); }
     .ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
@@ -414,7 +588,7 @@ function renderPage(config: Config): string {
       : '<p>Your WireGuard keypair is generated in your browser — the private key never leaves this page.</p>'}
     <div class="row" style="margin-top:10px">
       <button id="buy" type="button">Get VPN config</button>
-      <button type="button" id="dl" disabled style="background:transparent;border:1px solid var(--line);color:var(--text)">Download .conf</button>
+      <button type="button" id="dl" disabled class="ghost">Download .conf</button>
     </div>
     <p class="msg" id="msg"></p>
   </div>
@@ -430,12 +604,10 @@ function renderPage(config: Config): string {
     <button type="button" id="copyln" class="ghost">Copy invoice</button>
 
     <h3>Or pay with a Cashu wallet</h3>
-    <p>Scan or copy this payment request with a NUT-18 wallet, then paste the token it returns.</p>
+    <p>Scan or copy this payment request with a NUT-18 wallet. It pays and delivers the ecash automatically — this page updates itself.</p>
     <div id="qrcreq" class="qr"></div>
     <pre id="creq"></pre>
     <button type="button" id="copyreq" class="ghost">Copy request</button>
-    <textarea id="token" placeholder="cashuB..." style="margin-top:10px"></textarea>
-    <div class="row" style="margin-top:10px"><button id="complete" type="button">Complete &amp; get config</button></div>
   </div>
 
   <div class="panel">
@@ -444,8 +616,8 @@ function renderPage(config: Config): string {
   </div>
 
   <div class="panel">
-    <h2>Active leases</h2>
-    <div id="leases"><div class="empty">No leases.</div></div>
+    <h2>Your access</h2>
+    <div id="access"><div class="empty">No access yet.</div></div>
   </div>
 </main>
 <script src="/client.js"></script>
