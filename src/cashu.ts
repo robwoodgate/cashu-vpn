@@ -244,7 +244,15 @@ export async function verifyPayment(
     // NUT-11: require a SINGLE-signer P2PK lock with no refund/locktime escape,
     // so the lock-key holder is the sole, permanent spender — a buyer can't lock
     // with a multisig or a refund path and reclaim the proofs after getting access.
-    const wits = witnessPubkeys(proof.secret).map(normalizePubkey).filter(Boolean);
+    // A plain (non-P2PK) secret isn't JSON, so getP2PKExpectedWitnessPubkeys
+    // throws — treat that as unlocked (many wallets ignore the PR's nut10 lock and
+    // send ordinary ecash; we reject it rather than custody spendable proofs).
+    let wits: string[];
+    try {
+      wits = witnessPubkeys(proof.secret).map(normalizePubkey).filter(Boolean);
+    } catch {
+      return { valid: false, amountSats: 0, error: 'not_locked' };
+    }
     if (wits.length === 0) {
       return { valid: false, amountSats: 0, error: 'not_locked' };
     }

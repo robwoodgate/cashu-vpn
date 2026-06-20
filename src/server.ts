@@ -227,6 +227,8 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
 
 async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, orderId: string): Promise<void> {
   cors(res);
+  const tag = orderId.slice(0, 8);
+  console.log(`[pay] hit order=${tag} origin=${firstHeader(req.headers.origin) || '-'} ct=${firstHeader(req.headers['content-type']) || '-'}`);
 
   if (!ORDER_ID_RE.test(orderId)) {
     return json(res, 404, { error: 'order_not_found' });
@@ -242,10 +244,12 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
   }
 
   const body = await readBody(req);
+  console.log(`[pay] order=${tag} payload=${describePayload(body)}`);
   let encodedToken: string;
   try {
     encodedToken = encodeFromPayload(body);
   } catch {
+    console.log(`[pay] order=${tag} rejected: invalid_payload`);
     return json(res, 400, { error: 'invalid_payload', message: 'Expected a NUT-18 payload {mint,unit,proofs} or {token}' });
   }
 
@@ -262,17 +266,20 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
 
     const verified = await verifyAndAuthorize(ctx, encodedToken);
     if ('error' in verified) {
+      console.log(`[pay] order=${tag} rejected: ${verified.error}`);
       return json(res, 402, { error: 'payment_failed', detail: verified.error });
     }
 
     // Bind the payment to THIS order's challenge: the proofs must be locked to the
     // exact pubkey we issued for it, not merely some key we control.
     if (verified.payment.lockPubkey !== normalizePubkey(fresh.lockPubkey)) {
+      console.log(`[pay] order=${tag} rejected: lock_mismatch`);
       return json(res, 402, { error: 'payment_failed', detail: 'lock_mismatch' });
     }
 
     const bundle = await provisionPeer(ctx, fresh.clientPublicKey, verified.payment, fresh.lockIndex);
     await ctx.orderStore.markReady(orderId, bundle);
+    console.log(`[pay] order=${tag} ready: ${verified.payment.amountSats} sat`);
     return json(res, 200, { ok: true, status: 'ready' });
   } finally {
     ctx.processing.delete(orderId);
@@ -408,6 +415,18 @@ function newPurchaseId(): string {
 }
 
 // --- NUT-18 payload handling ---
+
+/** One-line summary of a /pay body for diagnostics (no secrets logged). */
+function describePayload(body: unknown): string {
+  if (!isObj(body)) return typeof body;
+  const keys = Object.keys(body).join(',');
+  if (Array.isArray(body.proofs)) {
+    const proofs = body.proofs as Array<Record<string, unknown>>;
+    const withDleq = proofs.filter((p) => isObj(p) && p.dleq != null).length;
+    return `keys=[${keys}] mint=${typeof body.mint === 'string' ? body.mint : '?'} proofs=${proofs.length} dleq=${withDleq}/${proofs.length}`;
+  }
+  return `keys=[${keys}] token=${typeof body.token === 'string'}`;
+}
 
 /** Reconstruct an encoded cashu token from a /pay body: NUT-18 payload or {token}. */
 function encodeFromPayload(body: unknown): string {

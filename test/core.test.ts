@@ -403,6 +403,17 @@ test('verifyPayment rejects an unlocked proof', async () => {
   assert.equal(r.error, 'not_locked');
 });
 
+test('verifyPayment rejects a plain (non-P2PK) secret without throwing', async () => {
+  // Real wallets that ignore the PR's nut10 lock send ordinary ecash, whose
+  // secret is plain hex — getP2PKExpectedWitnessPubkeys throws on it. Must be a
+  // clean not_locked rejection, not a 500.
+  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
+    witnessPubkeys: () => { throw new Error('Can\'t parse secret'); },
+  }));
+  assert.equal(r.valid, false);
+  assert.equal(r.error, 'not_locked');
+});
+
 test('verifyPayment rejects a multisig lock (not sole operator)', async () => {
   const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
     witnessPubkeys: () => [OP_PUBKEY, '02' + 'b'.repeat(64)],
