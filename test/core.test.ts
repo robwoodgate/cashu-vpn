@@ -24,7 +24,7 @@ import { buildPaymentRequest, normalizeMintUrl, verifyPayment, popcount } from '
 import { discover, parseRouteSrcIp } from '../src/discover.js';
 import { deriveChildPubkey, deriveChildKeypair, isPrivateExtendedKey } from '../src/hdkeys.js';
 import { createLockBook } from '../src/locks.js';
-import { planSweep, sweepAll } from '../src/sweep.js';
+import { planSweep, sweepAll, filterUnswept, pruneSpent } from '../src/sweep.js';
 import { decodeChallenge, waitForPaid } from '../src/buyer.js';
 import { createRateLimiter } from '../src/ratelimit.js';
 import type { ReceivedPayment } from '../src/wallet.js';
@@ -842,6 +842,40 @@ test('sweepAll falls back to per-receipt claims when the batch swap fails', asyn
   assert.equal(res?.claimedSats, 130); // only the good receipt
   assert.equal(res?.batched, false);
   assert.ok(res?.errors.some((e) => /already spent/.test(e)));
+});
+
+test('filterUnswept skips receipts the mint reports as SPENT (idempotent re-runs)', async () => {
+  const plan = {
+    sweepable: [
+      { index: 0, mint: 'https://m', amountSats: 250, token: 'spent', pubkey: 'p', privkey: 'k0' },
+      { index: 1, mint: 'https://m', amountSats: 250, token: 'live', pubkey: 'p', privkey: 'k1' },
+    ],
+    manual: [],
+    mismatched: [],
+  };
+  const decode = (token: string) => [{ secret: token, id: '00' }] as never;
+  const check = async (_mint: string, proofs: Array<{ secret: string }>) =>
+    proofs.map((p) => (p.secret === 'spent' ? 'SPENT' : 'UNSPENT'));
+  const { sweepable, alreadySwept } = await filterUnswept(plan, decode, check);
+  assert.equal(sweepable.length, 1);
+  assert.equal(sweepable[0]?.index, 1);
+  assert.equal(alreadySwept.length, 1);
+  assert.equal(alreadySwept[0]?.index, 0);
+});
+
+test('pruneSpent keeps unspent receipts and drops fully-swept ones', async () => {
+  const mk = (id: string, token: string): ReceivedPayment => ({
+    purchaseId: id, mint: 'https://m', amountSats: 250, token, secrets: [token], lockPubkey: 'p', receivedAt: 't',
+  });
+  const receipts = [mk('p0', 'spent'), mk('p1', 'live')];
+  const decode = (token: string) => [{ secret: token, id: '00' }] as never;
+  const check = async (_mint: string, proofs: Array<{ secret: string }>) =>
+    proofs.map((p) => (p.secret === 'spent' ? 'SPENT' : 'UNSPENT'));
+  const { keep, dropped } = await pruneSpent(receipts, decode, check);
+  assert.equal(keep.length, 1);
+  assert.equal(keep[0]?.purchaseId, 'p1');
+  assert.equal(dropped.length, 1);
+  assert.equal(dropped[0]?.purchaseId, 'p0');
 });
 
 // --- Operator discovery ---

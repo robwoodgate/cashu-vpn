@@ -12,7 +12,9 @@
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "start": "node dist/src/main.js",
     "discover": "node dist/src/discover.js",
-    "sweep": "node dist/src/sweep.js"
+    "sweep": "node dist/src/sweep.js",
+    "sweep:remote": "bash notes/sweep-remote.sh",
+    "prune": "node dist/src/sweep.js --prune"
   },
   "engines": {
     "node": ">=20"

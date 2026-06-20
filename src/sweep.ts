@@ -13,6 +13,7 @@
  * the hdkeys roundtrip test; the online claim is validated at the deploy checkpoint.
  */
 
+import { writeFile } from 'node:fs/promises';
 import { Wallet, getDecodedToken, getEncodedToken, sumProofs, type Proof } from '@cashu/cashu-ts';
 import { pathToFileURL } from 'node:url';
 import { deriveChildKeypair } from './hdkeys.js';
@@ -152,20 +153,133 @@ export async function sweepAll(
   return results;
 }
 
-async function main(): Promise<void> {
-  const xprv = process.env.OPERATOR_XPRV;
-  const proofsPath = process.env.PROOFS_PATH ?? process.argv[2];
-  if (!xprv) throw new Error('set OPERATOR_XPRV (your offline xprv) to sweep');
-  if (!proofsPath) throw new Error('set PROOFS_PATH or pass the proof store path as the first arg');
+// --- NUT-07 proof-state checks (idempotent sweep + prune) ---
 
-  const receipts = await createFileProofStore(proofsPath).list();
+/**
+ * Ask the mint the spend state of a batch of proofs. The mint is the source of
+ * truth for what's already been swept, so we never rely on local bookkeeping.
+ * Returns states in the same order as the input.
+ *
+ * Note: checking proofs together lets the mint see they're related — but a
+ * batched receive already spends them together, so when batching this leaks
+ * nothing new. (Want maximum unlinkability? Sweep receipts one-by-one, unbatched,
+ * at higher fees.)
+ */
+export type StateChecker = (mint: string, proofs: Array<{ secret: string; id: string }>) => Promise<string[]>;
+
+const defaultStateChecker: StateChecker = async (mint, proofs) => {
+  const wallet = new Wallet(mint, { unit: 'sat' });
+  await wallet.loadMint();
+  const states = await wallet.checkProofsStates(proofs);
+  return states.map((s) => s.state);
+};
+
+/** A receipt is fully swept when every one of its proofs reads SPENT at the mint. */
+async function fullySpentByMint<T extends { mint: string; token: string }>(
+  items: T[],
+  decode: Decoder,
+  check: StateChecker,
+): Promise<Map<T, boolean>> {
+  const result = new Map<T, boolean>();
+  const byMint = new Map<string, T[]>();
+  for (const it of items) {
+    const list = byMint.get(it.mint);
+    if (list) list.push(it);
+    else byMint.set(it.mint, [it]);
+  }
+  for (const [mint, group] of byMint) {
+    // One state check per mint: flatten all proofs, remember each item's span.
+    const spans: Array<{ item: T; start: number; len: number }> = [];
+    const flat: Array<{ secret: string; id: string }> = [];
+    for (const item of group) {
+      const proofs = decode(item.token);
+      spans.push({ item, start: flat.length, len: proofs.length });
+      for (const p of proofs) flat.push({ secret: p.secret, id: p.id });
+    }
+    const states = await check(mint, flat);
+    for (const { item, start, len } of spans) {
+      const slice = states.slice(start, start + len);
+      result.set(item, len > 0 && slice.every((s) => s === 'SPENT'));
+    }
+  }
+  return result;
+}
+
+/** Split a plan's sweepable entries into those still claimable vs already swept. */
+export async function filterUnswept(
+  plan: SweepPlan,
+  decode: Decoder = defaultDecoder,
+  check: StateChecker = defaultStateChecker,
+): Promise<{ sweepable: SweepEntry[]; alreadySwept: SweepEntry[] }> {
+  const spent = await fullySpentByMint(plan.sweepable, decode, check);
+  const sweepable: SweepEntry[] = [];
+  const alreadySwept: SweepEntry[] = [];
+  for (const e of plan.sweepable) (spent.get(e) ? alreadySwept : sweepable).push(e);
+  return { sweepable, alreadySwept };
+}
+
+/** Partition raw receipts into keep (not fully spent) vs drop (swept) for prune. */
+export async function pruneSpent(
+  receipts: ReceivedPayment[],
+  decode: Decoder = defaultDecoder,
+  check: StateChecker = defaultStateChecker,
+): Promise<{ keep: ReceivedPayment[]; dropped: ReceivedPayment[] }> {
+  const spent = await fullySpentByMint(receipts, decode, check);
+  const keep: ReceivedPayment[] = [];
+  const dropped: ReceivedPayment[] = [];
+  for (const r of receipts) (spent.get(r) ? dropped : keep).push(r);
+  return { keep, dropped };
+}
+
+// --- CLI ---
+
+async function runSweep(proofsPath: string, xprv: string): Promise<void> {
+  const store = createFileProofStore(proofsPath);
+  const receipts = await store.list();
   const plan = planSweep(receipts, xprv);
+  // Skip receipts the mint already shows as spent (idempotent re-runs).
+  const { sweepable, alreadySwept } = await filterUnswept(plan);
   console.error(
-    `receipts: ${receipts.length} | sweepable: ${plan.sweepable.length} | ` +
+    `receipts: ${receipts.length} | claimable: ${sweepable.length} | already-swept: ${alreadySwept.length} | ` +
       `manual(fixed-key): ${plan.manual.length} | mismatched: ${plan.mismatched.length}`,
   );
-  const results = await sweepAll(plan);
+  const results = await sweepAll({ ...plan, sweepable });
+  const out = process.env.SWEEP_OUT;
+  if (out) {
+    await writeFile(out, JSON.stringify(results, null, 2) + '\n', 'utf8');
+    console.error(`wrote claimed tokens -> ${out}`);
+  }
   console.log(JSON.stringify(results, null, 2));
+}
+
+/** Keyless: drop receipts the mint shows as fully spent. Safe to run on the box. */
+async function runPrune(proofsPath: string): Promise<void> {
+  const store = createFileProofStore(proofsPath);
+  const before = await store.list();
+  const { keep, dropped } = await pruneSpent(before);
+  // Re-read just before writing and re-attach any receipts that arrived meanwhile,
+  // so a concurrent daemon append isn't lost to the prune.
+  const now = await store.list();
+  const keepIds = new Set(keep.map((r) => r.purchaseId));
+  const droppedIds = new Set(dropped.map((r) => r.purchaseId));
+  const merged = now.filter((r) => keepIds.has(r.purchaseId) || !droppedIds.has(r.purchaseId));
+  await store.replaceAll(merged);
+  console.error(`pruned ${dropped.length} swept receipt(s); kept ${merged.length}`);
+}
+
+async function main(): Promise<void> {
+  const prune = process.argv.includes('--prune');
+  const proofsPath = process.env.PROOFS_PATH ?? process.argv.find((a) => a !== '--prune' && a.endsWith('.json'));
+  if (!proofsPath) throw new Error('set PROOFS_PATH or pass the proof store path as an arg');
+
+  if (prune) {
+    await runPrune(proofsPath);
+    return;
+  }
+
+  const xprv = process.env.OPERATOR_XPRV;
+  if (!xprv) throw new Error('set OPERATOR_XPRV (your offline xprv) to sweep');
+  await runSweep(proofsPath, xprv);
 }
 
 const invokedDirectly = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]!).href;

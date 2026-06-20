@@ -32,6 +32,8 @@ export interface ProofStore {
   list(): Promise<ReceivedPayment[]>;
   /** True if any of the given proof secrets has already been recorded. */
   hasAnyOf(secrets: string[]): Promise<boolean>;
+  /** Atomically replace the whole store (used by prune to drop swept receipts). */
+  replaceAll(payments: ReceivedPayment[]): Promise<void>;
 }
 
 function anySeen(records: ReceivedPayment[], secrets: string[]): boolean {
@@ -52,6 +54,10 @@ export function createMemoryProofStore(initial: ReceivedPayment[] = []): ProofSt
     async hasAnyOf(secrets) {
       return anySeen(records, secrets);
     },
+    async replaceAll(payments) {
+      records.length = 0;
+      records.push(...payments);
+    },
   };
 }
 
@@ -67,6 +73,9 @@ export function createFileProofStore(path: string): ProofStore {
     },
     async hasAnyOf(secrets) {
       return anySeen(await readStoreFile(path), secrets);
+    },
+    async replaceAll(payments) {
+      await writeStoreFile(path, payments);
     },
   };
 }
