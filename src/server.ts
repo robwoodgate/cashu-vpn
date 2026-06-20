@@ -583,7 +583,7 @@ function renderPage(config: Config): string {
     h3 { font-size: 1rem; margin: 18px 0 4px; color: var(--text); }
     .ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
     .qr { margin-top: 10px; }
-    .qr img { background: #fff; padding: 8px; border-radius: 8px; max-width: 240px; }
+    .qr img { background: #fff; padding: 8px; border-radius: 8px; display: block; width: 240px; max-width: 100%; height: auto; image-rendering: pixelated; }
     @media (max-width: 600px) { .facts { grid-template-columns: 1fr; } }
   </style>
 </head>
