@@ -101,15 +101,36 @@ edits `/etc/wireguard/wg0.conf`.
 
 ### Claiming your earnings (sweep)
 
-Run this **off the box**, where your `xprv` lives:
+**The xprv never goes on the box** — that's the whole point of the design. The box
+holds only your **xpub** (watch-only) and a file of *locked* receipts
+(`proofs.json`). Sweeping is a separate, offline step on a machine you control
+(laptop, hardware-wallet host, etc.) where the **xprv** lives.
+
+The flow is just *copy the receipts off, run sweep locally*:
 
 ```bash
-OPERATOR_XPRV=<your xprv> PROOFS_PATH=./state/proofs.json npm run sweep
+# 1. On your own machine, grab the locked receipts from the box (read-only):
+scp root@your-box:/root/cashu-vpn/state/proofs.json ./proofs.json
+
+# 2. Sweep with your offline xprv (never SSH this onto the server):
+OPERATOR_XPRV=<your xprv> PROOFS_PATH=./proofs.json npm run sweep
 ```
 
-It derives the child key for each receipt and claims the locked tokens into fresh,
-unlocked ecash you own. (Mints charge a small input fee on the claim swap, so you
-net price minus a sat or two.)
+For each receipt it derives the matching BIP32 child key and **claims all of a
+mint's receipts in a single batched swap** — signing each proof with its own key
+in one call — then prints the fresh, unlocked `cashuB…` token (per mint) for you
+to import into any wallet. Output per mint includes `receipts`, `claimedSats`, and
+`batched` (false only if it had to fall back to per-receipt claims, e.g. a receipt
+was already swept).
+
+**Why batched:** a mint's input fee is rounded once per swap, so folding many
+small receipts into one swap costs far less than claiming them one-by-one. You net
+the total minus a single rounded input fee.
+
+> The demo deploy script keeps a throwaway `xprv` in `state/test-key.json` purely
+> for unattended test sweeps — **do not do that for real funds.** Generate your HD
+> key offline, put only the `publicExtendedKey` (xpub) in `OPERATOR_XPUB`, and keep
+> the xprv off the server entirely.
 
 ## Configuration (environment variables)
 

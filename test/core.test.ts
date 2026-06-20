@@ -790,7 +790,7 @@ test('planSweep derives a matching claim key for each xpub receipt', () => {
   }
 });
 
-test('sweepAll groups per mint and aggregates claimed proofs', async () => {
+test('sweepAll batches each mint into one swap and aggregates claimed proofs', async () => {
   const plan = {
     sweepable: [
       { index: 0, mint: 'https://m1', amountSats: 250, token: 't0', pubkey: 'p', privkey: 'k0' },
@@ -800,19 +800,31 @@ test('sweepAll groups per mint and aggregates claimed proofs', async () => {
     manual: [],
     mismatched: [],
   };
-  const claim = async () => [{ amount: 100 }] as never;
+  // decode: one proof per token; claim: one 100-sat output per input proof.
+  const decode = (token: string) => [{ amount: 250, secret: token }] as never;
+  const swaps: Array<{ mint: string; nProofs: number; nKeys: number }> = [];
+  const claim = async (mint: string, proofs: unknown[], keys: string[]) => {
+    swaps.push({ mint, nProofs: proofs.length, nKeys: keys.length });
+    return proofs.map(() => ({ amount: 100 })) as never;
+  };
   const encode = (mint: string, proofs: unknown[]) => `cashuB-${mint}-${proofs.length}`;
-  const results = await sweepAll(plan, claim, encode);
+  const results = await sweepAll(plan, claim, encode, decode);
 
   const m1 = results.find((r) => r.mint === 'https://m1');
   const m2 = results.find((r) => r.mint === 'https://m2');
   assert.equal(m1?.claimedSats, 200);
   assert.equal(m1?.token, 'cashuB-https://m1-2');
+  assert.equal(m1?.batched, true);
+  assert.equal(m1?.receipts, 2);
   assert.equal(m2?.claimedSats, 100);
   assert.deepEqual(m1?.errors, []);
+  // m1's two receipts were claimed in a SINGLE swap with both keys.
+  const m1swaps = swaps.filter((s) => s.mint === 'https://m1');
+  assert.equal(m1swaps.length, 1);
+  assert.deepEqual(m1swaps[0], { mint: 'https://m1', nProofs: 2, nKeys: 2 });
 });
 
-test('sweepAll records per-entry claim errors without aborting', async () => {
+test('sweepAll falls back to per-receipt claims when the batch swap fails', async () => {
   const plan = {
     sweepable: [
       { index: 0, mint: 'https://m', amountSats: 250, token: 'good', pubkey: 'p', privkey: 'k0' },
@@ -821,14 +833,15 @@ test('sweepAll records per-entry claim errors without aborting', async () => {
     manual: [],
     mismatched: [],
   };
-  const claim = async (_mint: string, token: string) => {
-    if (token === 'bad') throw new Error('already spent');
-    return [{ amount: 130 }] as never;
+  const decode = (token: string) => [{ amount: 130, secret: token }] as never;
+  const claim = async (_mint: string, proofs: Array<{ secret: string }>) => {
+    if (proofs.some((p) => p.secret === 'bad')) throw new Error('already spent');
+    return proofs.map(() => ({ amount: 130 })) as never;
   };
-  const [res] = await sweepAll(plan, claim, () => 'tok');
-  assert.equal(res?.claimedSats, 130);
-  assert.equal(res?.errors.length, 1);
-  assert.match(res?.errors[0] ?? '', /already spent/);
+  const [res] = await sweepAll(plan, claim as never, () => 'tok', decode);
+  assert.equal(res?.claimedSats, 130); // only the good receipt
+  assert.equal(res?.batched, false);
+  assert.ok(res?.errors.some((e) => /already spent/.test(e)));
 });
 
 // --- Operator discovery ---

@@ -13,7 +13,7 @@
  * the hdkeys roundtrip test; the online claim is validated at the deploy checkpoint.
  */
 
-import { Wallet, getEncodedToken, sumProofs, type Proof } from '@cashu/cashu-ts';
+import { Wallet, getDecodedToken, getEncodedToken, sumProofs, type Proof } from '@cashu/cashu-ts';
 import { pathToFileURL } from 'node:url';
 import { deriveChildKeypair } from './hdkeys.js';
 import { normalizePubkey } from './cashu.js';
@@ -68,26 +68,48 @@ export function planSweep(receipts: ReceivedPayment[], xprv: string): SweepPlan 
 export interface SweepResult {
   mint: string;
   claimedSats: number;
+  /** Number of locked receipts folded into this mint's swap(s). */
+  receipts: number;
+  /** True if all receipts were claimed in a single batched swap (cheapest). */
+  batched: boolean;
   /** Re-encoded unlocked token the operator now owns (import anywhere). */
   token?: string;
   errors: string[];
 }
 
-/** Claim one locked token with its private key, returning fresh unlocked proofs. */
-export type Claimer = (mint: string, token: string, privkey: string) => Promise<Proof[]>;
+/**
+ * Claim a batch of P2PK-locked proofs in ONE swap, signing each with whichever of
+ * `privkeys` matches it (cashu-ts picks per proof). One swap means the mint's
+ * per-input fee is rounded once for the whole batch instead of once per receipt,
+ * so sweeping many small receipts costs far less. Returns fresh unlocked proofs.
+ */
+export type Claimer = (mint: string, proofs: Proof[], privkeys: string[]) => Promise<Proof[]>;
 
-const defaultClaimer: Claimer = async (mint, token, privkey) => {
+const defaultClaimer: Claimer = async (mint, proofs, privkeys) => {
   const wallet = new Wallet(mint, { unit: 'sat' });
   await wallet.loadMint();
-  return wallet.receive(token, { privkey });
+  return wallet.receive(proofs, { privkey: privkeys });
 };
 
-/** Claim every sweepable entry, grouped per mint. Online (claimer hits the mint). */
+/** Decode a stored (locked) token into its proofs. */
+export type Decoder = (token: string) => Proof[];
+const defaultDecoder: Decoder = (token) => getDecodedToken(token, []).proofs;
+
+const sum = (proofs: Proof[]): number =>
+  proofs.length ? Number((sumProofs(proofs) as { toNumber: () => number }).toNumber()) : 0;
+
+/**
+ * Claim every sweepable entry, grouped per mint, batching each mint into a single
+ * swap to minimise input fees. If a batch fails (e.g. one receipt was already
+ * swept), fall back to claiming that mint's receipts individually so one bad
+ * proof can't strand the rest. Online (the claimer hits the mint).
+ */
 export async function sweepAll(
   plan: SweepPlan,
   claim: Claimer = defaultClaimer,
   encode: (mint: string, proofs: Proof[]) => string = (mint, proofs) =>
     getEncodedToken({ mint, proofs, unit: 'sat' }),
+  decode: Decoder = defaultDecoder,
 ): Promise<SweepResult[]> {
   const byMint = new Map<string, SweepEntry[]>();
   for (const e of plan.sweepable) {
@@ -98,21 +120,34 @@ export async function sweepAll(
 
   const results: SweepResult[] = [];
   for (const [mint, entries] of byMint) {
-    const proofs: Proof[] = [];
-    const errors: string[] = [];
-    for (const e of entries) {
-      try {
-        proofs.push(...(await claim(mint, e.token, e.privkey)));
-      } catch (err) {
-        errors.push(`index ${e.index}: ${err instanceof Error ? err.message : String(err)}`);
+    const keysOf = (es: SweepEntry[]) => [...new Set(es.map((e) => e.privkey))];
+    const proofsOf = (es: SweepEntry[]) => es.flatMap((e) => decode(e.token));
+
+    // Fast path: one swap for the whole mint.
+    try {
+      const claimed = await claim(mint, proofsOf(entries), keysOf(entries));
+      results.push({
+        mint, receipts: entries.length, batched: true,
+        claimedSats: sum(claimed), token: claimed.length ? encode(mint, claimed) : undefined, errors: [],
+      });
+      continue;
+    } catch (batchErr) {
+      // Fall back: isolate each receipt so a single spent/invalid one doesn't
+      // sink the others.
+      const claimed: Proof[] = [];
+      const errors: string[] = [`batch swap failed (${batchErr instanceof Error ? batchErr.message : String(batchErr)}); retried individually`];
+      for (const e of entries) {
+        try {
+          claimed.push(...(await claim(mint, decode(e.token), [e.privkey])));
+        } catch (err) {
+          errors.push(`index ${e.index}: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
+      results.push({
+        mint, receipts: entries.length, batched: false,
+        claimedSats: sum(claimed), token: claimed.length ? encode(mint, claimed) : undefined, errors,
+      });
     }
-    results.push({
-      mint,
-      claimedSats: proofs.length ? Number((sumProofs(proofs) as { toNumber: () => number }).toNumber()) : 0,
-      token: proofs.length ? encode(mint, proofs) : undefined,
-      errors,
-    });
   }
   return results;
 }
