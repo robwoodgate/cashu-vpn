@@ -11,6 +11,12 @@
 # This only touches FORWARD (routed buyer traffic). It never affects the box's
 # own SSH/HTTP/daemon (those are INPUT/OUTPUT), so it can't lock you out.
 #
+# Works on both legacy-iptables and nftables hosts: it calls `iptables`, which on
+# modern distros is the iptables-nft shim, so these become native nft rules and
+# coexist with an existing nft ruleset (a drop here is terminal, so it still wins
+# over a permissive `iifname wgX accept`). On a pure-nft host with no iptables
+# shim at all, translate these few rules to `nft` instead.
+#
 # Apply:   sudo scripts/egress-filter.sh
 # Remove:  sudo scripts/egress-filter.sh --remove
 #
@@ -19,6 +25,8 @@
 #   PostUp = /root/cashu-vpn/scripts/egress-filter.sh
 #   PostDown = /root/cashu-vpn/scripts/egress-filter.sh --remove
 set -euo pipefail
+
+command -v iptables >/dev/null || { echo "iptables not found — on a pure-nft host, translate these rules to nft directly"; exit 1; }
 
 SUBNET="${WG_SUBNET:-10.77.0.0/24}"   # buyer tunnel subnet (matches the daemon's allocator)
 CHAIN="CASHU_EGRESS"
