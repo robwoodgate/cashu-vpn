@@ -245,6 +245,15 @@ And the obvious thing: when you run an exit, the traffic leaving your server is 
 
 **Limiting exit abuse.** Because buyers exit from your IP, you'll want to bound what they can do. `scripts/egress-filter.sh` restricts buyer egress to DNS + HTTP/HTTPS + ICMP, which removes the abuse that gets host accounts suspended (outbound spam, port scanning, brute-forcing, most torrenting) while normal browsing keeps working. For stronger insulation, `scripts/upstream-egress.sh` routes the buyer subnet out through a separate upstream WireGuard VPN — abuse complaints then land on that upstream rather than your host, and a killswitch drops buyer traffic if the tunnel goes down so nothing leaks out your real IP. Use an upstream whose terms permit this (running your own second VPS avoids any question). The two stack. A `NOTICE` / `TERMS_URL` can also state your acceptable-use policy on the page.
 
+## Troubleshooting
+
+**Buyer connects but has no internet.** The tunnel hands shakes, but pages won't load. Almost always one of two things, in this order:
+
+- **No DNS in the config.** A full-tunnel config (`AllowedIPs = 0.0.0.0/0`) needs an explicit `DNS =` line, or the client keeps its LAN resolver — which is unreachable through the tunnel — and names silently stop resolving. The daemon writes this line for you from `WG_DNS` (default `1.1.1.1`); only older hand-made configs lack it. Tell-tale sign: on the box, the egress DNS counter stays at zero while 443 still moves — `iptables -L CASHU_EGRESS -v -n` shows `0 packets` on the `dpt:53` rules. Fix a stuck config by adding `DNS = 1.1.1.1` under `[Interface]` and reconnecting.
+- **No NAT / masquerade.** Buyer packets get forwarded out with their private `10.77.0.x` source and the replies never come back. Add the rule from setup: `iptables -t nat -A POSTROUTING -s 10.77.0.0/24 -o eth0 -j MASQUERADE`.
+
+  Gotcha: if WireGuard was brought up by `wg-quick`/`systemd-networkd`, the masquerade may already exist as a **native nftables** rule (`iifname "wg0" masquerade`) — which is invisible to `iptables -t nat -S`. Always check `nft list ruleset` before concluding NAT is missing, or you'll add a duplicate.
+
 ## License
 
 [MIT](LICENSE).
