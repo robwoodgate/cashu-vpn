@@ -9,7 +9,7 @@ import type { LockBook } from './locks.js';
 import { newOrderId, type Order, type OrderStore } from './orders.js';
 import { createRateLimiter, type RateLimiter } from './ratelimit.js';
 import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, enforceDataCaps, validatePublicKey } from './wireguard.js';
-import { buildPaymentRequest, verifyPayment, normalizePubkey, type VerifyResult } from './cashu.js';
+import { buildPaymentRequest, verifyPayment, normalizePubkey, type VerifyResult, type VerifyDeps } from './cashu.js';
 import { getEncodedToken, type Proof } from '@cashu/cashu-ts';
 
 const MAX_BODY_BYTES = 16 * 1024;
@@ -33,6 +33,10 @@ export interface ServerDeps {
   orderStore: OrderStore;
   /** Present in xpub mode: issues per-transaction lock pubkeys. */
   lockBook?: LockBook;
+  /** Test seam: override offline payment verification (defaults to the real mint/DLEQ/P2PK path). */
+  verifyDeps?: VerifyDeps;
+  /** Test seam: override the WireGuard executor so a provision can run without a live interface. */
+  execPlan?: typeof executePlan;
 }
 
 // Everything a request handler needs, assembled once in createServer.
@@ -383,7 +387,7 @@ async function verifyAndAuthorize(ctx: Ctx, encodedToken: string): Promise<Autho
     requiredSats: config.priceSats,
     unit: config.unit,
     proofCountMargin: config.proofCountMargin,
-  });
+  }, ctx.verifyDeps);
   if (!payment.valid || !payment.lockPubkey) {
     return { error: payment.error ?? 'unverified' };
   }
@@ -498,7 +502,7 @@ async function provisionPeer(
   }
 
   if (config.mode === 'live') {
-    await executePlan(planAddPeer(config.wgInterface, clientPublicKey, tunnelIp));
+    await (ctx.execPlan ?? executePlan)(planAddPeer(config.wgInterface, clientPublicKey, tunnelIp));
   }
 
   const lease: PeerLease = {

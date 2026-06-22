@@ -22,7 +22,7 @@ import {
 import type { PeerLease } from '../src/peers.js';
 import { HDKey } from '@scure/bip32';
 import { createP2PKsecret, getP2PKExpectedWitnessPubkeys } from '@cashu/cashu-ts';
-import { buildPaymentRequest, normalizeMintUrl, normalizePubkey, verifyPayment, popcount } from '../src/cashu.js';
+import { buildPaymentRequest, normalizeMintUrl, normalizePubkey, verifyPayment, popcount, type VerifyDeps } from '../src/cashu.js';
 import { discover, parseRouteSrcIp } from '../src/discover.js';
 import { deriveChildPubkey, deriveChildKeypair, isPrivateExtendedKey } from '../src/hdkeys.js';
 import { generateOperatorKeys } from '../src/keygen.js';
@@ -1330,4 +1330,117 @@ test('property: sweepAll conserves sats across batch and fallback paths', async 
   const fallback = await sweepAll(plan, fallbackClaim as never, encode, decode);
   assert.equal(fallback.reduce((a, r) => a + r.claimedSats, 0), expected, 'fallback path must conserve sats');
   assert.ok(fallback.every((r) => !r.batched), 'fallback path must report batched=false');
+});
+
+// --- Concurrency: the double-provision guards ---
+//
+// The inflightSecrets / processing guards are correct by construction (the
+// check-and-set is synchronous), so these don't hunt for a race — they pin the
+// invariant (one payment => exactly one peer + one receipt) so a future edit that
+// slips an await between the check and the add, or drops the guard, goes red. A
+// deliberately slow proof-store widens the commit window so such a regression
+// actually manifests instead of slipping through on timing.
+// Seam note: verifyDeps fakes the offline verify; execPlan no-ops WireGuard — this
+// is the only coverage of a *completed* live provision (every other live test
+// stops at a 402 before provisioning).
+
+const slept = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** A memory proof store whose add() lingers, widening the reserve->commit window. */
+function slowProofStore(delayMs: number) {
+  const inner = createMemoryProofStore();
+  return { ...inner, add: async (p: ReceivedPayment) => { await slept(delayMs); return inner.add(p); } };
+}
+
+// Offline verify that always passes, locked to LIVE_ENV's OPERATOR_PUBKEY, with a
+// FIXED secret so every concurrent delivery looks like the same token (the replay
+// the guards must collapse to one).
+const PASS_VERIFY: VerifyDeps = {
+  getMetadata: () => ({ mint: 'https://mint.example.com', amount: 1000, unit: 'sat' }) as never,
+  // The delay converges all concurrent requests at this await, so they resume and
+  // pile into the reservation together — that's what makes an await-between-check-
+  // and-add regression actually contend (and the test go red). Verified by control.
+  loadMintContext: async () => { await slept(20); return { keysetIds: ['k1'], getKeyset: () => ({ id: 'k1', keys: {} as never }) }; },
+  decode: () => [{ id: 'k1', secret: 'shared-secret', amount: 1000 }] as never,
+  checkDleq: () => true,
+  witnessPubkeys: () => ['02' + 'a'.repeat(64)],
+};
+
+test('concurrent /pay deliveries for one order provision exactly once', async () => {
+  const ledger = createMemoryLedger();
+  const proofStore = slowProofStore(40);
+  await withServer(async (url) => {
+    const r = await fetch(`${url}/purchase`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+    });
+    const { orderId } = await r.json();
+    const deliver = () => fetch(`${url}/pay/${orderId}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok' }),
+    });
+    const res = await Promise.all(Array.from({ length: 8 }, deliver));
+    const codes = res.map((x) => x.status);
+
+    // Invariant: one peer, one receipt — no double-provision regardless of interleaving.
+    assert.equal((await ledger.list()).length, 1, 'exactly one lease provisioned');
+    assert.equal((await proofStore.list()).length, 1, 'exactly one receipt stored');
+    assert.ok(codes.includes(200), 'at least one delivery succeeds');
+    // Losers are rejected cleanly: 409 in-progress, or 200 idempotent (order already ready).
+    assert.ok(codes.every((c) => c === 200 || c === 409), `unexpected status: ${codes}`);
+  }, LIVE_ENV, { ledger, proofStore, verifyDeps: PASS_VERIFY, execPlan: async () => [] });
+});
+
+test('concurrent inline X-Cashu deliveries provision exactly once', async () => {
+  const ledger = createMemoryLedger();
+  const proofStore = slowProofStore(40);
+  await withServer(async (url) => {
+    // Same token (same secret) delivered inline 8x at once. The inline path has no
+    // per-order guard — only inflightSecrets stands between it and a double-spend.
+    const deliver = () => fetch(`${url}/purchase`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-cashu': 'tok' },
+      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+    });
+    const codes = (await Promise.all(Array.from({ length: 8 }, deliver))).map((x) => x.status);
+
+    assert.equal(codes.filter((c) => c === 200).length, 1, 'exactly one inline delivery provisions');
+    assert.ok(codes.filter((c) => c === 402).length >= 1, 'the rest are rejected as already_redeemed');
+    assert.equal((await ledger.list()).length, 1, 'exactly one lease provisioned');
+    assert.equal((await proofStore.list()).length, 1, 'exactly one receipt stored');
+  }, LIVE_ENV, { ledger, proofStore, verifyDeps: PASS_VERIFY, execPlan: async () => [] });
+});
+
+// --- Real P2PK secret parsing through verifyPayment (offline, no mint) ---
+//
+// The witness-pubkey extraction is the half of verification that breaks silently
+// on a cashu-ts upgrade. Other verify tests fake witnessPubkeys; these drive the
+// REAL getP2PKExpectedWitnessPubkeys (and the real escape-clause parse) end-to-end
+// through verifyPayment, with only DLEQ + mint context faked. DLEQ itself needs a
+// mint-signed proof — covered by the live deploy check, not here.
+
+const REAL_P2PK_PUB = deriveChildPubkey(
+  HDKey.fromMasterSeed(new Uint8Array(64).fill(9)).derive("m/1597'/0'").publicExtendedKey, 3,
+);
+const REAL_P2PK_OPTS = { acceptedMints: ['https://good.mint'], requiredSats: 1000, unit: 'sat', proofCountMargin: 0 };
+const realP2PKDeps = (secret: string): VerifyDeps => ({
+  getMetadata: () => ({ mint: 'https://good.mint', amount: 1000, unit: 'sat' }) as never,
+  loadMintContext: async () => ({ keysetIds: ['k1'], getKeyset: () => ({ id: 'k1', keys: {} as never }) }),
+  decode: () => [{ id: 'k1', secret, amount: 1000 }] as never,
+  checkDleq: () => true,
+  // witnessPubkeys left to the real getP2PKExpectedWitnessPubkeys default.
+});
+
+test('verifyPayment accepts a REAL P2PK secret and recovers the lock pubkey', async () => {
+  const secret = createP2PKsecret(REAL_P2PK_PUB);
+  const r = await verifyPayment('tok', REAL_P2PK_OPTS, realP2PKDeps(secret));
+  assert.equal(r.valid, true);
+  assert.equal(r.lockPubkey, normalizePubkey(REAL_P2PK_PUB));
+});
+
+test('verifyPayment rejects a REAL P2PK secret carrying a locktime escape', async () => {
+  // Real secret, real witness extraction (passes), real escape-clause parse (trips).
+  const secret = createP2PKsecret(REAL_P2PK_PUB, [['locktime', '9999999999']]);
+  const r = await verifyPayment('tok', REAL_P2PK_OPTS, realP2PKDeps(secret));
+  assert.equal(r.valid, false);
+  assert.equal(r.error, 'refundable_lock');
 });
