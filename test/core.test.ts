@@ -91,6 +91,20 @@ test('LEASE_DATA_CAP_GB defaults to 50 GiB; 0 disables; invalid rejected', () =>
   assert.throws(() => loadConfig({ LEASE_DATA_CAP_GB: 'lots' }), /non-negative number/);
 });
 
+test('loadConfig rejects non-numeric price/lease/ttl/port (no silent NaN)', () => {
+  // A NaN priceSats would make `amount < requiredSats` always false → accept any
+  // payment; a NaN duration throws later on new Date(NaN).toISOString().
+  assert.throws(() => loadConfig({ PRICE_SATS: 'free' }), /PRICE_SATS/);
+  assert.throws(() => loadConfig({ PRICE_SATS: '0' }), /PRICE_SATS/); // must be >= 1
+  assert.throws(() => loadConfig({ LEASE_DURATION_MS: 'forever' }), /LEASE_DURATION_MS/);
+  assert.throws(() => loadConfig({ ORDER_TTL_MS: '-1' }), /ORDER_TTL_MS/);
+  assert.throws(() => loadConfig({ PORT: 'abc' }), /PORT/);
+  assert.throws(() => loadConfig({ RATE_LIMIT_MAX: '1.5' }), /RATE_LIMIT_MAX/);
+  // Empty string still falls back to the default.
+  assert.equal(loadConfig({ PRICE_SATS: '' }).priceSats, 1000);
+  assert.equal(loadConfig({ RATE_LIMIT_MAX: '0' }).rateLimitMax, 0); // 0 disables, allowed
+});
+
 // --- Allocator ---
 
 test('allocator produces deterministic IPs in valid range', () => {
@@ -457,6 +471,14 @@ test('unknown route returns 404', async () => {
   });
 });
 
+test('malformed percent-escape in /pay path 404s (not 500)', async () => {
+  await withServer(async (url) => {
+    // %zz is not a valid escape — decodeURIComponent would throw; must be a clean 404.
+    const res = await fetch(`${url}/pay/%zz`, { method: 'POST' });
+    assert.equal(res.status, 404);
+  });
+});
+
 // --- Cashu payment ---
 
 test('normalizeMintUrl strips trailing slashes', () => {
@@ -814,6 +836,20 @@ test('LockBook issues distinct per-tx pubkeys and resolves them to indices', asy
   assert.equal(book.resolve('02' + 'f'.repeat(64)), undefined);
 });
 
+test('LockBook resolves locks whose x-only coordinate starts 02/03 (normalize is idempotent)', async () => {
+  // Regression: resolve() re-normalizes the pubkey verifyPayment already
+  // normalized. A non-idempotent normalize over-strips keys whose x-only form
+  // begins 02/03 (~0.8% of indices), rejecting a paid buyer as lock_not_recognized.
+  const xpub = HDKey.fromMasterSeed(new Uint8Array(64).fill(7)).derive("m/1597'/0'").publicExtendedKey;
+  const book = await createLockBook(xpub);
+  let issued: { index: number; pubkey: string } | undefined;
+  // Index 18 is the first child here whose x-only coordinate starts 02/03.
+  for (let i = 0; i <= 18; i++) issued = await book.issue();
+  const xonly = issued!.pubkey.toLowerCase().replace(/^0[23]/, '');
+  assert.match(xonly, /^0[23]/); // precondition: this key actually triggers the trap
+  assert.equal(book.resolve(xonly), 18); // the already-normalized form must still resolve
+});
+
 test('LockBook persists its counter and rebuilds the map across instances', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'cvpn-locks-'));
   const counterPath = join(dir, 'counter.json');
@@ -924,6 +960,11 @@ test('order store: create, poll, markReady once, and prune expired pending', asy
     createdAt: past, expiresAt: past,
   });
   assert.equal(await store.get(expiredId), undefined);
+  // ...but a late /pay can still fetch + provision it (no stranded payment).
+  assert.equal((await store.get(expiredId, undefined, { includeExpired: true }))?.id, expiredId);
+  assert.equal((await store.markReady(expiredId, {
+    purchaseId: 'p9', tunnelIp: '10.77.0.9', amountSats: 1, clientConfig: 'C', lease,
+  }))?.status, 'ready');
 });
 
 test('order store pruneExpiredBefore forgets ready leases past cutoff, keeps live', async () => {

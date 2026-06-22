@@ -40,6 +40,14 @@ interface Ctx extends ServerDeps {
   limiter?: RateLimiter;
   /** Order ids currently being provisioned, to serialize concurrent /pay hits. */
   processing: Set<string>;
+  /**
+   * Proof secrets currently mid-provision. The persistent replay check
+   * (proofStore.hasAnyOf) only sees already-committed tokens, so two concurrent
+   * deliveries of the SAME token would both pass it and double-provision (in
+   * fixed-pubkey mode every order shares one lock; the inline X-Cashu path has no
+   * per-order guard at all). Reserving the secrets in-memory closes that window.
+   */
+  inflightSecrets: Set<string>;
 }
 
 export function createServer(deps: ServerDeps): http.Server {
@@ -49,7 +57,7 @@ export function createServer(deps: ServerDeps): http.Server {
     ? createRateLimiter({ max: config.rateLimitMax, windowMs: config.rateLimitWindowMs })
     : undefined;
 
-  const ctx: Ctx = { ...deps, limiter, processing: new Set() };
+  const ctx: Ctx = { ...deps, limiter, processing: new Set(), inflightSecrets: new Set() };
 
   // Housekeeping interval: remove expired WireGuard peers, then forget records
   // whose lease expired more than retainExpiredMs ago. Pruning keeps the lease
@@ -225,12 +233,11 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
   // and provision in this same response, no order/poll round-trip needed.
   const headerToken = firstHeader(req.headers['x-cashu']);
   if (headerToken) {
-    const verified = await verifyAndAuthorize(ctx, headerToken);
-    if ('error' in verified) {
-      return json(res, 402, { error: 'payment_failed', detail: verified.error });
+    const result = await authorizeAndProvision(ctx, clientPublicKey, headerToken);
+    if ('error' in result) {
+      return json(res, 402, { error: 'payment_failed', detail: result.error });
     }
-    const bundle = await provisionPeer(ctx, clientPublicKey, verified.payment, verified.lockIndex);
-    return json(res, 200, { ...bundle, mode: config.mode });
+    return json(res, 200, { ...result.bundle, mode: config.mode });
   }
 
   // Otherwise create an order and answer with a 402 + PaymentRequest. The creqA
@@ -284,7 +291,10 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
     return json(res, 404, { error: 'order_not_found' });
   }
 
-  const order = await ctx.orderStore.get(orderId);
+  // includeExpired: a wallet may deliver just after the order's TTL; honoring it
+  // still provisions the buyer (who already minted proofs to this lock) instead
+  // of stranding the payment with a 404.
+  const order = await ctx.orderStore.get(orderId, undefined, { includeExpired: true });
   if (!order) {
     return json(res, 404, { error: 'order_not_found' });
   }
@@ -310,26 +320,23 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
   ctx.processing.add(orderId);
   try {
     // Re-check after acquiring the guard (a racing request may have finished).
-    const fresh = await ctx.orderStore.get(orderId);
+    const fresh = await ctx.orderStore.get(orderId, undefined, { includeExpired: true });
     if (!fresh) return json(res, 404, { error: 'order_not_found' });
     if (fresh.status === 'ready') return json(res, 200, { ok: true, status: 'ready' });
 
-    const verified = await verifyAndAuthorize(ctx, encodedToken);
-    if ('error' in verified) {
-      console.log(`[pay] order=${tag} rejected: ${verified.error}`);
-      return json(res, 402, { error: 'payment_failed', detail: verified.error });
-    }
-
     // Bind the payment to THIS order's challenge: the proofs must be locked to the
     // exact pubkey we issued for it, not merely some key we control.
-    if (verified.payment.lockPubkey !== normalizePubkey(fresh.lockPubkey)) {
-      console.log(`[pay] order=${tag} rejected: lock_mismatch`);
-      return json(res, 402, { error: 'payment_failed', detail: 'lock_mismatch' });
+    const result = await authorizeAndProvision(ctx, fresh.clientPublicKey, encodedToken, {
+      expectedLockPubkey: fresh.lockPubkey,
+      lockIndex: fresh.lockIndex,
+    });
+    if ('error' in result) {
+      console.log(`[pay] order=${tag} rejected: ${result.error}`);
+      return json(res, 402, { error: 'payment_failed', detail: result.error });
     }
 
-    const bundle = await provisionPeer(ctx, fresh.clientPublicKey, verified.payment, fresh.lockIndex);
-    await ctx.orderStore.markReady(orderId, bundle);
-    console.log(`[pay] order=${tag} ready: ${verified.payment.amountSats} sat`);
+    await ctx.orderStore.markReady(orderId, result.bundle);
+    console.log(`[pay] order=${tag} ready: ${result.payment.amountSats} sat`);
     return json(res, 200, { ok: true, status: 'ready' });
   } finally {
     ctx.processing.delete(orderId);
@@ -396,6 +403,51 @@ async function verifyAndAuthorize(ctx: Ctx, encodedToken: string): Promise<Autho
   }
 
   return { payment, lockIndex };
+}
+
+/**
+ * Verify a delivered token, then provision under a per-token reservation so two
+ * concurrent deliveries of the same proofs can't both pass the replay check and
+ * double-provision. Shared by the per-order /pay sink and the inline X-Cashu path.
+ *
+ * `expectedLockPubkey` (per-order) binds the payment to that order's challenge.
+ * `lockIndex` overrides the swept index (the order records the index it issued).
+ */
+async function authorizeAndProvision(
+  ctx: Ctx,
+  clientPublicKey: string,
+  encodedToken: string,
+  opts: { expectedLockPubkey?: string; lockIndex?: number } = {},
+): Promise<{ bundle: ProvisionBundle; payment: VerifyResult } | { error: string }> {
+  const verified = await verifyAndAuthorize(ctx, encodedToken);
+  if ('error' in verified) return verified;
+
+  if (
+    opts.expectedLockPubkey !== undefined &&
+    verified.payment.lockPubkey !== normalizePubkey(opts.expectedLockPubkey)
+  ) {
+    return { error: 'lock_mismatch' };
+  }
+
+  const secrets = verified.payment.secrets ?? [];
+  // Reserve the secrets atomically (no await between the check and the adds), so a
+  // racing delivery of the same token is rejected here instead of double-spending.
+  if (secrets.some((s) => ctx.inflightSecrets.has(s))) {
+    return { error: 'already_redeemed' };
+  }
+  for (const s of secrets) ctx.inflightSecrets.add(s);
+  try {
+    // Re-check the persistent store now that we hold the reservation: a racer may
+    // have committed (and released its reservation) between our verify and here.
+    if (secrets.length && (await ctx.proofStore.hasAnyOf(secrets))) {
+      return { error: 'already_redeemed' };
+    }
+    const lockIndex = opts.lockIndex ?? verified.lockIndex;
+    const bundle = await provisionPeer(ctx, clientPublicKey, verified.payment, lockIndex);
+    return { bundle, payment: verified.payment };
+  } finally {
+    for (const s of secrets) ctx.inflightSecrets.delete(s);
+  }
 }
 
 // --- Provisioning (shared by every delivery path) ---
@@ -509,7 +561,13 @@ function matchPath(path: string, prefix: string): string | undefined {
   const rest = path.slice(prefix.length);
   // Single path segment only (no nested slashes).
   if (rest === '' || rest.includes('/')) return undefined;
-  return decodeURIComponent(rest);
+  // Malformed percent-escapes (e.g. /pay/%zz) make decodeURIComponent throw —
+  // treat as no match so it falls through to a clean 404, not a 500.
+  try {
+    return decodeURIComponent(rest);
+  } catch {
+    return undefined;
+  }
 }
 
 function firstHeader(value: string | string[] | undefined): string {
@@ -526,10 +584,18 @@ function baseUrl(req: IncomingMessage, config: Config): string {
   return `${proto}://${host}`;
 }
 
-// Real client IP: first X-Forwarded-For hop (set by Caddy) else the socket peer.
+// Real client IP for rate-limiting. Behind exactly one trusted proxy (Caddy),
+// the RIGHTMOST X-Forwarded-For hop is the one Caddy appended — the real peer.
+// The leftmost is client-supplied and spoofable, so keying the limiter on it
+// would let an attacker rotate the header to dodge the limit entirely.
+// ponytail: assumes a single trusted proxy; a multi-hop chain would need a
+// trusted-proxy count to know how many right-hand hops to skip.
 function clientIp(req: IncomingMessage): string {
   const xff = firstHeader(req.headers['x-forwarded-for']);
-  if (xff) return xff.split(',')[0]!.trim();
+  if (xff) {
+    const hops = xff.split(',').map((s) => s.trim()).filter(Boolean);
+    if (hops.length) return hops[hops.length - 1]!;
+  }
   return req.socket.remoteAddress ?? 'unknown';
 }
 

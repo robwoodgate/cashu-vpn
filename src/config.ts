@@ -72,6 +72,20 @@ const DEFAULT_PROOF_COUNT_MARGIN = 4;
 const DEFAULT_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute — on by default so expired peers always get removed
 const DEFAULT_RETAIN_EXPIRED_MS = 24 * 60 * 60 * 1000; // keep expired records 1 day, then forget (bounds file growth)
 
+// Parse a non-negative integer env var, falling back to `def` when unset/empty.
+// Throws on anything non-numeric so a fat-fingered value fails fast instead of
+// becoming NaN — a NaN priceSats makes `amount < requiredSats` always false and
+// accepts ANY payment; a NaN duration throws later on new Date(NaN).toISOString().
+function intEnv(env: NodeJS.ProcessEnv, key: string, def: number, min = 0): number {
+  const raw = env[key];
+  if (raw === undefined || raw === '') return def;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < min) {
+    throw new Error(`${key} must be an integer >= ${min}`);
+  }
+  return n;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const mode = env.MODE === 'live' ? 'live' : 'dry-run';
 
@@ -123,30 +137,30 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return {
     mode,
     host: env.HOST ?? '127.0.0.1',
-    port: Number(env.PORT ?? '3087'),
+    port: intEnv(env, 'PORT', 3087, 1),
     wgInterface: env.WG_INTERFACE ?? 'wg0',
     serverPublicKey: env.SERVER_PUBLIC_KEY ?? '',
     endpoint: env.WG_ENDPOINT ?? '',
     dns,
     peerLedgerPath: env.PEER_LEDGER_PATH,
-    leaseDurationMs: Number(env.LEASE_DURATION_MS ?? DEFAULT_LEASE_MS),
+    leaseDurationMs: intEnv(env, 'LEASE_DURATION_MS', DEFAULT_LEASE_MS, 1),
     leaseDataCapBytes,
     cleanupIntervalMs,
     retainExpiredMs,
     acceptedMints,
-    priceSats: Number(env.PRICE_SATS ?? DEFAULT_PRICE_SATS),
+    priceSats: intEnv(env, 'PRICE_SATS', DEFAULT_PRICE_SATS, 1),
     unit: env.MINT_UNIT ?? 'sat',
     notice: env.NOTICE || undefined,
     termsUrl: env.TERMS_URL || undefined,
     publicBaseUrl: env.PUBLIC_BASE_URL ? env.PUBLIC_BASE_URL.replace(/\/+$/, '') : undefined,
     orderStorePath: env.ORDERS_PATH,
-    orderTtlMs: Number(env.ORDER_TTL_MS ?? DEFAULT_ORDER_TTL_MS),
-    proofCountMargin: Number(env.PROOF_COUNT_MARGIN ?? DEFAULT_PROOF_COUNT_MARGIN),
+    orderTtlMs: intEnv(env, 'ORDER_TTL_MS', DEFAULT_ORDER_TTL_MS, 1),
+    proofCountMargin: intEnv(env, 'PROOF_COUNT_MARGIN', DEFAULT_PROOF_COUNT_MARGIN, 0),
     operatorPubkey: env.OPERATOR_PUBKEY ?? '',
     operatorXpub: env.OPERATOR_XPUB || undefined,
     lockCounterPath: env.LOCK_COUNTER_PATH,
     proofStorePath: env.PROOFS_PATH,
-    rateLimitMax: Number(env.RATE_LIMIT_MAX ?? '30'),
-    rateLimitWindowMs: Number(env.RATE_LIMIT_WINDOW_MS ?? '60000'),
+    rateLimitMax: intEnv(env, 'RATE_LIMIT_MAX', 30, 0),
+    rateLimitWindowMs: intEnv(env, 'RATE_LIMIT_WINDOW_MS', 60000, 1),
   };
 }

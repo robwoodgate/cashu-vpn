@@ -50,8 +50,13 @@ export type ReadyPatch = Pick<Order, 'purchaseId' | 'tunnelIp' | 'amountSats' | 
 
 export interface OrderStore {
   create(order: Order): Promise<void>;
-  /** The order, or undefined if unknown or an expired pending order. */
-  get(id: string, now?: Date): Promise<Order | undefined>;
+  /**
+   * The order, or undefined if unknown or an expired pending order. Pass
+   * `includeExpired` to get an expired pending order anyway — the /pay sink uses
+   * it so a payment that lands just after the TTL still provisions (the buyer
+   * already minted proofs to this order's lock; 404-ing would strand them).
+   */
+  get(id: string, now?: Date, opts?: { includeExpired?: boolean }): Promise<Order | undefined>;
   /** Atomically transition pending -> ready. Returns the updated order, or undefined if the id is unknown / not pending. */
   markReady(id: string, patch: ReadyPatch): Promise<Order | undefined>;
   /**
@@ -94,20 +99,13 @@ function makeStore(records: Map<string, Order>, persist: (recs: Order[]) => Prom
       });
     },
 
-    async get(id, now = new Date()) {
+    async get(id, now = new Date(), opts) {
       const order = records.get(id);
       if (!order) return undefined;
-      if (isExpiredPending(order, now)) {
-        // Prune lazily; best-effort persist (don't block the read on it).
-        void queue(async () => {
-          const cur = records.get(id);
-          if (cur && isExpiredPending(cur, new Date())) {
-            records.delete(id);
-            await persist([...records.values()]);
-          }
-        });
-        return undefined;
-      }
+      // Expired pending orders read as gone (so polls drop them), unless the
+      // caller opts in. Removal is left to pruneExpiredBefore on the cleanup tick
+      // so the record survives long enough for a late /pay to still find it.
+      if (!opts?.includeExpired && isExpiredPending(order, now)) return undefined;
       return { ...order };
     },
 
