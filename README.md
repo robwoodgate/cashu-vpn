@@ -164,7 +164,7 @@ There is deliberately no endpoint that lists everyone's leases. Each order is pr
 
 ```
 buyer                              daemon                         mint
-  │  POST /purchase (no payment)     │                             │
+  │  POST /purchase (no payment)     │                              │
   │ ───────────────────────────────► │  402 + orderId + request     │
   │ ◄─────────────────────────────── │  (locked to your key,        │
   │                                  │   deliver to /pay/:orderId)  │
