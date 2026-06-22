@@ -22,7 +22,7 @@ import {
 import type { PeerLease } from '../src/peers.js';
 import { HDKey } from '@scure/bip32';
 import { createP2PKsecret, getP2PKExpectedWitnessPubkeys } from '@cashu/cashu-ts';
-import { buildPaymentRequest, normalizeMintUrl, verifyPayment, popcount } from '../src/cashu.js';
+import { buildPaymentRequest, normalizeMintUrl, normalizePubkey, verifyPayment, popcount } from '../src/cashu.js';
 import { discover, parseRouteSrcIp } from '../src/discover.js';
 import { deriveChildPubkey, deriveChildKeypair, isPrivateExtendedKey } from '../src/hdkeys.js';
 import { generateOperatorKeys } from '../src/keygen.js';
@@ -1177,3 +1177,157 @@ async function withServer(
     });
   }
 }
+
+// --- Property tests ---
+//
+// These randomize over many inputs to catch the probabilistic bugs a fixed
+// fixture can't — the kind that ship because the happy path eats them (e.g. the
+// normalizePubkey double-strip that only bit keys whose x-coordinate starts
+// 02/03). Each pins an INVARIANT, not a specific output. Seeded so failures
+// reproduce: any assertion below names the input that broke it.
+
+/** Seeded PRNG (mulberry32) so a property failure reproduces from its seed. */
+function prng(seed: number): () => number {
+  return () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+test('property: normalizePubkey is idempotent, parity-blind, and case-insensitive', () => {
+  const rnd = prng(1);
+  const hex64 = () => Array.from({ length: 64 }, () => Math.floor(rnd() * 16).toString(16)).join('');
+  for (let i = 0; i < 1000; i++) {
+    const x = hex64(); // an x-only coordinate (may itself start 02/03 — the trap)
+    const n = normalizePubkey('02' + x);
+    assert.equal(n, x, `compressed key must reduce to its x-only coordinate (x=${x})`);
+    assert.equal(normalizePubkey('03' + x), n, `parity must not change the result (x=${x})`);
+    assert.equal(normalizePubkey(n), n, `must be idempotent on an already-x-only key (x=${x})`);
+    assert.equal(normalizePubkey(('02' + x).toUpperCase()), n, `must be case-insensitive (x=${x})`);
+  }
+});
+
+test('property: every issued xpub lock resolves via its raw AND normalized form', async () => {
+  // The form server.ts hands resolve() is the normalized (x-only) one from
+  // verifyPayment, so resolve MUST accept that form for every issued index —
+  // including keys whose x-coordinate starts 02/03 (the original bug). Find a few
+  // such trap indices first, then assert ALL issued locks up to there resolve.
+  const xpub = HDKey.fromMasterSeed(new Uint8Array(64).fill(7)).derive("m/1597'/0'").publicExtendedKey;
+  const traps: number[] = [];
+  let maxIdx = 0;
+  for (let i = 0; traps.length < 3 && i < 5000; i++) {
+    if (/^0[23]/.test(normalizePubkey(deriveChildPubkey(xpub, i)))) { traps.push(i); maxIdx = i; }
+  }
+  assert.ok(traps.length >= 1, 'expected at least one 02/03-coordinate key in range to make this meaningful');
+
+  const book = await createLockBook(xpub);
+  for (let i = 0; i <= maxIdx; i++) {
+    const { index, pubkey } = await book.issue();
+    assert.equal(book.resolve(pubkey), index, `raw compressed key must resolve (index ${index})`);
+    assert.equal(book.resolve(normalizePubkey(pubkey)), index, `normalized x-only key must resolve (index ${index})`);
+  }
+});
+
+test('property: proof store flags any token sharing a secret with a stored one (replay-once)', async () => {
+  const rnd = prng(9);
+  const store = createMemoryProofStore();
+  const stored: string[] = [];
+  for (let i = 0; i < 200; i++) {
+    // Fresh, disjoint secrets must read as unseen, then as seen once stored.
+    const secrets = Array.from({ length: 1 + Math.floor(rnd() * 4) }, (_, j) => `g${i}_${j}`);
+    assert.equal(await store.hasAnyOf(secrets), false, `fresh secrets must be unseen (i=${i})`);
+    await store.add({
+      purchaseId: `p${i}`, mint: 'https://m', amountSats: 1, token: `t${i}`,
+      secrets, lockPubkey: 'a'.repeat(64), receivedAt: new Date().toISOString(),
+    });
+    stored.push(...secrets);
+    // Any single stored secret, or a new token reusing just one, is a replay.
+    const reused = stored[Math.floor(rnd() * stored.length)]!;
+    assert.equal(await store.hasAnyOf(['brand-new', reused]), true, `one overlapping secret must flag replay (i=${i})`);
+  }
+});
+
+test('property: an honest power-of-two split never trips the dust guard', async () => {
+  // A griefer pads a payment with dust proofs (each an extra sweep input fee); the
+  // cap rejects them. But the minimal split of ANY amount is exactly popcount(n)
+  // proofs, so an honest wallet must always pass at margin 0. Pins that the guard
+  // never rejects a legitimate payment.
+  const rnd = prng(11);
+  for (let t = 0; t < 400; t++) {
+    const n = 1 + Math.floor(rnd() * 1_000_000);
+    const parts: number[] = [];
+    for (let b = 0; b < 31; b++) if (n & (1 << b)) parts.push(1 << b);
+    assert.equal(parts.length, popcount(n), `minimal split size must equal popcount (n=${n})`);
+    const proofs = parts.map((amount, i) => ({ id: 'k1', secret: `s${t}_${i}`, amount }));
+    const r = await verifyPayment(
+      'tok',
+      { acceptedMints: ['https://good.mint'], requiredSats: n, unit: 'sat', proofCountMargin: 0 },
+      okDeps({ decode: () => proofs as never }),
+    );
+    assert.equal(r.valid, true, `honest split must verify (n=${n})`);
+    assert.equal(r.amountSats, n, `verified amount must equal the split sum (n=${n})`);
+  }
+});
+
+test('property: planSweep partitions every receipt exactly once', () => {
+  const root = HDKey.fromMasterSeed(new Uint8Array(64).fill(3));
+  const xprv = root.privateExtendedKey;
+  const rnd = prng(7);
+  const receipts: ReceivedPayment[] = [];
+  for (let i = 0; i < 300; i++) {
+    const base = {
+      purchaseId: `p${i}`, mint: 'https://m', amountSats: 1 + Math.floor(rnd() * 1000),
+      token: `t${i}`, secrets: [`s${i}`], lockPubkey: '', receivedAt: '',
+    };
+    const r = rnd();
+    if (r < 1 / 3) receipts.push({ ...base }); // no index → manual (fixed-key)
+    else if (r < 2 / 3) {
+      const kp = deriveChildKeypair(xprv, i); // matching lock → sweepable
+      receipts.push({ ...base, index: i, lockPubkey: normalizePubkey(kp.pubkey) });
+    } else receipts.push({ ...base, index: i, lockPubkey: 'deadbeef' }); // wrong lock → mismatched
+  }
+  const plan = planSweep(receipts, xprv);
+
+  // Conservation: every receipt lands in exactly one bucket, none lost or duplicated.
+  const seen = new Set<string>();
+  for (const e of plan.sweepable) seen.add(e.token);
+  for (const r of [...plan.manual, ...plan.mismatched]) seen.add(r.token);
+  assert.equal(plan.sweepable.length + plan.manual.length + plan.mismatched.length, receipts.length);
+  assert.equal(seen.size, receipts.length, 'no receipt may be dropped or double-counted');
+  // Buckets match their defining condition.
+  assert.ok(plan.manual.every((r) => r.index === undefined), 'manual = receipts with no index');
+  assert.ok(plan.mismatched.every((r) => r.index !== undefined), 'mismatched = indexed but wrong lock');
+});
+
+test('property: sweepAll conserves sats across batch and fallback paths', async () => {
+  // Whatever the claimer does, claimedSats must equal the sats actually claimed —
+  // batching or per-receipt fallback must never drop or duplicate a proof.
+  const rnd = prng(5);
+  const amtByToken = new Map<string, number>();
+  const sweepable = Array.from({ length: 50 }, (_, i) => {
+    const token = `t${i}`;
+    const amt = 1 + Math.floor(rnd() * 1000);
+    amtByToken.set(token, amt);
+    return { index: i, mint: i % 2 ? 'https://a' : 'https://b', amountSats: amt, token, pubkey: 'p', privkey: 'k' };
+  });
+  const plan = { sweepable, manual: [], mismatched: [] };
+  const expected = sweepable.reduce((a, e) => a + e.amountSats, 0);
+
+  const decode = (token: string) => [{ id: 'k', secret: token, amount: amtByToken.get(token)! }] as never;
+  const encode = () => 'x';
+  // Identity claimer (batch path): claimed proofs == input proofs.
+  const idClaim = async (_m: string, proofs: never) => proofs;
+  const batch = await sweepAll(plan, idClaim as never, encode, decode);
+  assert.equal(batch.reduce((a, r) => a + r.claimedSats, 0), expected, 'batch path must conserve sats');
+
+  // Forced-fallback claimer: throws on a multi-proof batch, succeeds one at a time.
+  const fallbackClaim = async (_m: string, proofs: { length: number }) => {
+    if (proofs.length > 1) throw new Error('batch rejected');
+    return proofs as never;
+  };
+  const fallback = await sweepAll(plan, fallbackClaim as never, encode, decode);
+  assert.equal(fallback.reduce((a, r) => a + r.claimedSats, 0), expected, 'fallback path must conserve sats');
+  assert.ok(fallback.every((r) => !r.batched), 'fallback path must report batched=false');
+});
