@@ -8,7 +8,7 @@ import type { AddressInfo } from 'node:net';
 import { decodePaymentRequest } from '@cashu/cashu-ts';
 import { loadConfig } from '../src/config.js';
 import { createAllocator, createMemoryLedger, createFileLedger } from '../src/peers.js';
-import { createMemoryProofStore } from '../src/wallet.js';
+import { createMemoryProofStore, createFileProofStore } from '../src/wallet.js';
 import { createMemoryOrderStore, newOrderId } from '../src/orders.js';
 import {
   validateInterface,
@@ -110,6 +110,19 @@ test('allocator produces deterministic IPs in valid range', () => {
   }
 });
 
+test('allocator avoids IPs already in use', () => {
+  const alloc = createAllocator();
+  const first = alloc.allocateTunnelIp('p1', 'key1');
+  // Same inputs but that IP is taken → must hand back a different, valid one.
+  const second = alloc.allocateTunnelIp('p1', 'key1', new Set([first]));
+  assert.notEqual(second, first);
+  assert.match(second, /^10\.77\.0\.\d+$/);
+  // Subnet exhausted → throws rather than colliding.
+  const all = new Set<string>();
+  for (let h = 2; h <= 254; h++) all.add(`10.77.0.${h}`);
+  assert.throws(() => alloc.allocateTunnelIp('p1', 'key1', all), /exhausted/);
+});
+
 // --- Ledger ---
 
 test('memory ledger records and lists with expiry', async () => {
@@ -159,6 +172,44 @@ test('file-backed ledger persists across instances', async () => {
     // Verify file content
     const raw = JSON.parse(await readFile(path, 'utf8'));
     assert.equal(raw.length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('concurrent file-ledger records do not clobber each other', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'nvpn-test-'));
+  const path = join(dir, 'ledger.json');
+  try {
+    const ledger = createFileLedger(path);
+    // Fire 25 appends at once; without serialization the read-modify-write race
+    // would drop most of them (last writer wins).
+    await Promise.all(
+      Array.from({ length: 25 }, (_, i) =>
+        ledger.record({
+          purchaseId: `p${i}`, clientPublicKey: `k${i}`, tunnelIp: `10.77.0.${i + 2}`,
+          createdAt: '2026-01-01T00:00:00Z', expiresAt: '2999-01-01T00:00:00Z', status: 'active',
+        })
+      )
+    );
+    const list = await ledger.list();
+    assert.equal(list.length, 25);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('concurrent file proof-store adds do not lose receipts', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'nvpn-test-'));
+  const path = join(dir, 'proofs.json');
+  try {
+    const store = createFileProofStore(path);
+    const mk = (i: number): ReceivedPayment => ({
+      purchaseId: `p${i}`, mint: 'https://m', amountSats: 1, token: `t${i}`,
+      secrets: [`s${i}`], lockPubkey: 'k', receivedAt: '2026-01-01T00:00:00Z',
+    });
+    await Promise.all(Array.from({ length: 25 }, (_, i) => store.add(mk(i))));
+    assert.equal((await store.list()).length, 25);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

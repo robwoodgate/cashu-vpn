@@ -417,25 +417,21 @@ async function provisionPeer(
   const { config, allocator, ledger, proofStore } = ctx;
 
   const purchaseId = newPurchaseId();
-  const tunnelIp = allocator.allocateTunnelIp(purchaseId, clientPublicKey);
-
-  if (config.mode === 'live') {
-    await executePlan(planAddPeer(config.wgInterface, clientPublicKey, tunnelIp));
-  }
-
   const now = new Date();
-  const lease: PeerLease = {
-    purchaseId,
-    clientPublicKey,
-    tunnelIp,
-    createdAt: now.toISOString(),
-    expiresAt: new Date(now.getTime() + config.leaseDurationMs).toISOString(),
-    status: 'active',
-  };
-  await ledger.record(lease);
 
-  // Persist the operator-locked token so the operator can sweep it offline.
-  // Not spendable from the box, only the operator's offline key can claim it.
+  // Allocate around the IPs currently in use so two active leases never collide.
+  // ponytail: tiny residual race (two provisions reading the same `taken` set and
+  // picking the same free host); fold allocation into the ledger's serialized
+  // record() if concurrent throughput ever makes that worth closing.
+  const taken = new Set(
+    (await ledger.list(now)).filter((l) => l.status === 'active').map((l) => l.tunnelIp)
+  );
+  const tunnelIp = allocator.allocateTunnelIp(purchaseId, clientPublicKey, taken);
+
+  // Persist the operator-locked token BEFORE touching WireGuard. The buyer already
+  // minted these proofs to our lock, so if the `wg set` below fails we must keep
+  // them (sweepable offline) rather than drop them and strand the payment.
+  // Not spendable from the box; only the operator's offline key can claim it.
   if (payment?.valid && payment.token && payment.mint) {
     await proofStore.add({
       purchaseId,
@@ -448,6 +444,20 @@ async function provisionPeer(
       receivedAt: now.toISOString(),
     });
   }
+
+  if (config.mode === 'live') {
+    await executePlan(planAddPeer(config.wgInterface, clientPublicKey, tunnelIp));
+  }
+
+  const lease: PeerLease = {
+    purchaseId,
+    clientPublicKey,
+    tunnelIp,
+    createdAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + config.leaseDurationMs).toISOString(),
+    status: 'active',
+  };
+  await ledger.record(lease);
 
   const clientConfig = generateClientConfig({
     tunnelIp,

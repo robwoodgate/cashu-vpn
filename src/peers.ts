@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { serialize } from './serialize.js';
 
 // --- Types ---
 
@@ -16,7 +17,8 @@ export interface PeerLease {
 }
 
 export interface PeerAllocator {
-  allocateTunnelIp(purchaseId: string, clientPublicKey: string): string;
+  /** `taken` is the set of tunnel IPs currently in use; the result avoids them. */
+  allocateTunnelIp(purchaseId: string, clientPublicKey: string, taken?: Set<string>): string;
 }
 
 export interface PeerLedger {
@@ -31,20 +33,25 @@ export interface PeerLedger {
 // --- Allocator ---
 
 const SUBNET = '10.77.0';
-const RESERVED = new Set([0, 1, 255]);
+const HOST_COUNT = 253; // usable hosts 2..254 (.0/.1/.255 reserved)
 
 export function createAllocator(): PeerAllocator {
   return {
-    allocateTunnelIp(purchaseId: string, clientPublicKey: string): string {
+    allocateTunnelIp(purchaseId: string, clientPublicKey: string, taken = new Set<string>()): string {
+      // Deterministic starting host from the hash (stable per purchase), then
+      // linear-probe forward to the first free one. Two live leases must never
+      // share a /32: WireGuard would reassign the allowed-ip to the newest peer
+      // and silently break the earlier buyer's tunnel.
       const digest = createHash('sha256')
         .update(`${purchaseId}:${clientPublicKey}`)
         .digest();
-
-      for (const byte of digest) {
-        const host = 2 + (byte % 253);
-        if (!RESERVED.has(host)) return `${SUBNET}.${host}`;
+      const start = digest[0]! % HOST_COUNT;
+      for (let i = 0; i < HOST_COUNT; i++) {
+        const host = 2 + ((start + i) % HOST_COUNT); // 2..254
+        const ip = `${SUBNET}.${host}`;
+        if (!taken.has(ip)) return ip;
       }
-      return `${SUBNET}.2`;
+      throw new Error(`tunnel subnet exhausted (${HOST_COUNT} active leases)`);
     }
   };
 }
@@ -91,11 +98,16 @@ export function createMemoryLedger(initial: PeerLease[] = []): PeerLedger {
 // --- File-backed ledger ---
 
 export function createFileLedger(path: string): PeerLedger {
+  // Serialize every read-modify-write so concurrent provisions can't clobber each
+  // other's appends (last-writer-wins would silently drop a lease record).
+  const mutate = serialize();
   return {
-    async record(lease) {
-      const records = await readLedgerFile(path);
-      records.push(lease);
-      await writeLedgerFile(path, records);
+    record(lease) {
+      return mutate(async () => {
+        const records = await readLedgerFile(path);
+        records.push(lease);
+        await writeLedgerFile(path, records);
+      });
     },
 
     async list(now = new Date()) {
@@ -111,18 +123,22 @@ export function createFileLedger(path: string): PeerLedger {
         .map((r) => ({ ...r }));
     },
 
-    async markExpired(purchaseId) {
-      const records = await readLedgerFile(path);
-      await writeLedgerFile(path, records.map((r) =>
-        r.purchaseId === purchaseId ? { ...r, status: 'expired' as const } : r
-      ));
+    markExpired(purchaseId) {
+      return mutate(async () => {
+        const records = await readLedgerFile(path);
+        await writeLedgerFile(path, records.map((r) =>
+          r.purchaseId === purchaseId ? { ...r, status: 'expired' as const } : r
+        ));
+      });
     },
 
-    async pruneExpiredBefore(cutoff) {
-      const records = await readLedgerFile(path);
-      const kept = records.filter((r) => new Date(r.expiresAt).getTime() > cutoff.getTime());
-      if (kept.length !== records.length) await writeLedgerFile(path, kept);
-      return records.length - kept.length;
+    pruneExpiredBefore(cutoff) {
+      return mutate(async () => {
+        const records = await readLedgerFile(path);
+        const kept = records.filter((r) => new Date(r.expiresAt).getTime() > cutoff.getTime());
+        if (kept.length !== records.length) await writeLedgerFile(path, kept);
+        return records.length - kept.length;
+      });
     }
   };
 }

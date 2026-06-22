@@ -11,6 +11,7 @@
 
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { serialize } from './serialize.js';
 
 export interface ReceivedPayment {
   purchaseId: string;
@@ -62,11 +63,16 @@ export function createMemoryProofStore(initial: ReceivedPayment[] = []): ProofSt
 }
 
 export function createFileProofStore(path: string): ProofStore {
+  // Serialize mutations so two concurrent payments can't both read-then-write and
+  // drop a receipt — a lost locked token is an unsweepable (lost) payment.
+  const mutate = serialize();
   return {
-    async add(payment) {
-      const records = await readStoreFile(path);
-      records.push(payment);
-      await writeStoreFile(path, records);
+    add(payment) {
+      return mutate(async () => {
+        const records = await readStoreFile(path);
+        records.push(payment);
+        await writeStoreFile(path, records);
+      });
     },
     async list() {
       return readStoreFile(path);
@@ -74,8 +80,10 @@ export function createFileProofStore(path: string): ProofStore {
     async hasAnyOf(secrets) {
       return anySeen(await readStoreFile(path), secrets);
     },
-    async replaceAll(payments) {
-      await writeStoreFile(path, payments);
+    replaceAll(payments) {
+      return mutate(async () => {
+        await writeStoreFile(path, payments);
+      });
     },
   };
 }
