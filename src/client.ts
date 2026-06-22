@@ -30,6 +30,7 @@ interface OrderRec {
   priv: string;
   pub: string;
   status: 'pending' | 'ready';
+  creq?: string; // the payment request, kept so a pending order can be resumed after a reload
   conf?: string;
   tunnelIp?: string;
   expiresAt?: string;
@@ -99,6 +100,32 @@ function download(conf: string, name: string): void {
   a.click();
 }
 
+// Show the pay panel for an order (its creqA, QR, and amount), and arm the
+// Lightning + Cashu-wallet paths by setting the active order/challenge.
+function openPayPanel(orderId: string, creq: string): void {
+  currentOrderId = orderId;
+  challenge = decodeChallenge(creq);
+  $('creq').textContent = creq;
+  renderQR('qrcreq', creq);
+  $('payamt').textContent = challenge.amount + ' ' + challenge.unit;
+  $('pay').style.display = '';
+}
+
+// Reopen a still-pending order after a reload, so it can be paid.
+function resumeOrder(id: string): void {
+  const rec = loadOrders().find((o) => o.id === id);
+  if (!rec?.creq) return;
+  try {
+    openPayPanel(id, rec.creq);
+  } catch (e) {
+    setMsg(errText(e), 'err');
+    return;
+  }
+  setMsg('Finish paying for this order below.');
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  void poll(id);
+}
+
 async function purchase(): Promise<Response> {
   return fetch('/purchase', {
     method: 'POST',
@@ -121,16 +148,12 @@ btn('buy').onclick = async () => {
     if (r.status === 402) {
       const d = await r.json();
       const creq = r.headers.get('x-cashu') ?? d.creq ?? '';
-      currentOrderId = String(d.orderId ?? '');
-      challenge = decodeChallenge(creq);
-      upsertOrder({ id: currentOrderId, priv, pub: pubKey, status: 'pending' });
-      $('creq').textContent = creq;
-      renderQR('qrcreq', creq);
-      $('payamt').textContent = challenge.amount + ' ' + challenge.unit;
-      $('pay').style.display = '';
+      const orderId = String(d.orderId ?? '');
+      upsertOrder({ id: orderId, priv, pub: pubKey, status: 'pending', creq });
+      openPayPanel(orderId, creq);
       setMsg('Payment required — pay below.');
       renderAccess();
-      void poll(currentOrderId);
+      void poll(orderId);
     } else if (r.ok) {
       // Dry-run: provisioned immediately, no payment.
       const d = await r.json();
@@ -238,6 +261,7 @@ function renderAccess(): void {
     let status: string, action = '';
     if (o.status !== 'ready') {
       status = '<small>waiting for payment…</small>';
+      if (o.creq) action = '<button class="payacc" data-id="' + esc(o.id) + '" type="button">Pay</button>';
     } else if (when && when.getTime() <= now) {
       // Expired: the peer is gone server-side, so the old config is dead. Offer a
       // fresh purchase rather than a download that can't connect.
@@ -255,6 +279,10 @@ function renderAccess(): void {
       const rec = loadOrders().find((o) => o.id === id);
       if (rec?.conf) { showConfig(rec.conf, id, rec.tunnelIp, rec.expiresAt); download(rec.conf, id); }
     });
+  });
+  // "Pay" reopens a still-pending order so it can be paid after a reload.
+  el.querySelectorAll('.payacc').forEach((b) => {
+    b.addEventListener('click', () => resumeOrder((b as HTMLElement).dataset.id ?? ''));
   });
   // "Buy again" starts a brand-new purchase (fresh key + lease), not a renewal.
   el.querySelectorAll('.buyagain').forEach((b) => {
