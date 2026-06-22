@@ -1,14 +1,16 @@
 # cashu-vpn
 
-cashu-vpn lets you sell short-lived WireGuard VPN access for Cashu ecash. There are no accounts, no subscriptions, and no ecash sitting on your server waiting to be stolen. A buyer opens your page, pays with Lightning or a Cashu wallet, and their browser hands them a ready-to-use WireGuard config. You collect the ecash and claim it later with a key that never touches the server.
+cashu-vpn lets you sell short-lived WireGuard VPN access for Cashu ecash. There are no accounts, no subscriptions, and no ecash sitting on your server waiting to be stolen.
+
+A buyer opens your page, pays with Lightning or a Cashu wallet, and their browser hands them a ready-to-use WireGuard config. You collect the ecash and claim it later with a key that never touches the server.
 
 It is freedom tech rather than a product. The whole idea is that anyone can run one, so this guide assumes no special knowledge beyond being comfortable in a terminal.
 
-> **Status:** the full buyer-pays-and-connects loop runs on a live host behind HTTPS and is ready to try today. If you want to run one for real, read [Before you run one for real](#before-you-run-one-for-real) at the end.
+## How it works
 
-## How it works, briefly
+When someone wants access, their browser asks your daemon for a config. The daemon replies that payment is due and hands back a Cashu payment request locked to a public key that you control (P2PK).
 
-When someone wants access, their browser asks your daemon for a config. The daemon replies that payment is due and hands back a Cashu payment request locked to a key only you control. The buyer pays, their wallet (or the built-in Lightning option) delivers the ecash straight back to the daemon, and the daemon checks the payment, adds them as a WireGuard peer, and returns the config. The page then shows the finished `.conf` to download.
+The buyer pays, their wallet (or the built-in Lightning option) delivers the ecash straight back to the daemon, and the daemon checks the payment, adds them as a WireGuard peer, and returns the config. The page then shows the finished `.conf` to download.
 
 The money you receive is locked to your key, so even if someone steals the whole server they cannot spend a single sat. You claim your earnings separately, on your own computer, with a private key that never goes near the box. More detail is in [Under the hood](#under-the-hood).
 
@@ -35,12 +37,15 @@ git clone https://github.com/robwoodgate/cashu-vpn.git && cd cashu-vpn
 npm install && npm run build
 ```
 
-**2. Set up WireGuard.** If you do not already have a WireGuard interface, create a minimal one. Generate a server key pair, then write `/etc/wireguard/wg0.conf` with a private address range, a listen port, and that private key:
+**2. Set up WireGuard.** If you do not already have a WireGuard interface, create a minimal one:
 
 ```bash
 umask 077
+
+# Generate the server key pair
 wg genkey | tee /etc/wireguard/server.key | wg pubkey > /etc/wireguard/server.pub
 
+# Write a minimal interface config
 cat > /etc/wireguard/wg0.conf <<EOF
 [Interface]
 Address = 10.77.0.1/24
@@ -48,11 +53,19 @@ ListenPort = 51820
 PrivateKey = $(cat /etc/wireguard/server.key)
 EOF
 
+# Bring it up now and on boot
 wg-quick up wg0
 systemctl enable wg-quick@wg0
+
+# Open the listen port in your firewall (example: UFW)
+ufw allow 51820/udp
+
+# Optional: let buyers reach the internet through the box
+sysctl -w net.ipv4.ip_forward=1
+iptables -t nat -A POSTROUTING -s 10.77.0.0/24 -o eth0 -j MASQUERADE   # eth0 = your public interface
 ```
 
-Open the listen port in your firewall (`ufw allow 51820/udp`, or your provider's equivalent) and enable IP forwarding if you want buyers to reach the internet through the box (`sysctl -w net.ipv4.ip_forward=1`, plus a `MASQUERADE` rule on your public interface). cashu-vpn adds and removes buyer peers on this interface at runtime and never edits `wg0.conf`.
+Whether you create `wg0` here or already had one, cashu-vpn attaches and removes buyer peers on it at runtime with `wg set` and `ip route`, and never edits `wg0.conf`.
 
 **3. Read your WireGuard details.** This reads your server's public key, port, and public address off the live interface without changing anything. Note them down.
 
@@ -82,8 +95,6 @@ sudo scripts/install-systemd.sh
 ```
 
 That is it. If you would rather wire up TLS yourself, leave `DOMAIN` blank: the daemon listens on `127.0.0.1:3087`, so point any reverse proxy at it over HTTPS. Browsers need HTTPS for the in-page key generation, and `PUBLIC_BASE_URL` must be your public address so paying wallets know where to deliver.
-
-The daemon attaches and removes peers on your existing `wg0` using `wg set` and `ip route`. It never edits your `wg0.conf`, so it sits alongside whatever you already run.
 
 ## Getting paid
 
