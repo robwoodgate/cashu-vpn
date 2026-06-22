@@ -179,9 +179,7 @@ Payments are verified entirely offline, with no swap and no per-sale call to the
 
 Privacy comes from the xpub. With `OPERATOR_XPUB` set, every sale is locked to a fresh derived key, so the mint cannot tie your sales together, and you sweep them all with the matching offline key. A single fixed `OPERATOR_PUBKEY` also works but lets the mint correlate your income.
 
-Mint fees never get in the way of a sale. Minting ecash from a paid Lightning invoice has no mint-side fee — the buyer's wallet pays the Lightning routing fee separately, and the mint issues the full amount — so the in-browser Lightning option always mints exactly the price, in the smallest number of proofs, and clears both the amount and proof-count checks on any mint, feeless or not. Cashu input fees only apply when proofs are later spent, which for you means the small fee to claim them at sweep time: nothing on a feeless mint like Minibits, a sat or two on a fee-driven one.
-
-A proof-count guard keeps that sweep fee bounded and blocks griefing at the same time. Someone could try to pay in hundreds of tiny proofs that would each cost you a fee to claim, so the daemon rejects any payment with more proofs than a normal split needs — the number of set bits in the amount, plus `PROOF_COUNT_MARGIN`. The rejected payment just stays locked to you and useless to the sender.
+A dust guard protects you from griefing. Someone could try to pay in hundreds of tiny proofs that would each cost you a fee to claim, so the daemon rejects any payment with more proofs than a normal split needs, which is the number of set bits in the amount plus `PROOF_COUNT_MARGIN`. The rejected payment simply stays locked to you and useless to the sender.
 
 Finally, there is no shell anywhere near WireGuard. Commands run as argument arrays through `execFile` with a strict allow-list and key and address validation, so a malicious public key cannot smuggle in a command.
 
