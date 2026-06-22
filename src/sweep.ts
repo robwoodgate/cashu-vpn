@@ -255,16 +255,15 @@ async function runSweep(proofsPath: string, xprv: string): Promise<void> {
 /** Keyless: drop receipts the mint shows as fully spent. Safe to run on the box. */
 async function runPrune(proofsPath: string): Promise<void> {
   const store = createFileProofStore(proofsPath);
-  const before = await store.list();
-  const { keep, dropped } = await pruneSpent(before);
-  // Re-read just before writing and re-attach any receipts that arrived meanwhile,
-  // so a concurrent daemon append isn't lost to the prune.
-  const now = await store.list();
-  const keepIds = new Set(keep.map((r) => r.purchaseId));
+  // Network spent-check on a snapshot, OUTSIDE the lock (never hold a file lock
+  // across a mint round-trip).
+  const { dropped } = await pruneSpent(await store.list());
   const droppedIds = new Set(dropped.map((r) => r.purchaseId));
-  const merged = now.filter((r) => keepIds.has(r.purchaseId) || !droppedIds.has(r.purchaseId));
-  await store.replaceAll(merged);
-  console.error(`pruned ${dropped.length} swept receipt(s); kept ${merged.length}`);
+  // Atomic re-read + filter + write under the cross-process lock: only the
+  // confirmed-spent ids are removed, so any receipt the daemon appended since the
+  // snapshot (a new purchaseId, not in droppedIds) survives the prune.
+  const { after } = await store.compact((recs) => recs.filter((r) => !droppedIds.has(r.purchaseId)));
+  console.error(`pruned ${dropped.length} swept receipt(s); kept ${after}`);
 }
 
 async function main(): Promise<void> {

@@ -480,19 +480,10 @@ async function provisionPeer(
   const purchaseId = newPurchaseId();
   const now = new Date();
 
-  // Allocate around the IPs currently in use so two active leases never collide.
-  // ponytail: tiny residual race (two provisions reading the same `taken` set and
-  // picking the same free host); fold allocation into the ledger's serialized
-  // record() if concurrent throughput ever makes that worth closing.
-  const taken = new Set(
-    (await ledger.list(now)).filter((l) => l.status === 'active').map((l) => l.tunnelIp)
-  );
-  const tunnelIp = allocator.allocateTunnelIp(purchaseId, clientPublicKey, taken);
-
-  // Persist the operator-locked token BEFORE touching WireGuard. The buyer already
-  // minted these proofs to our lock, so if the `wg set` below fails we must keep
-  // them (sweepable offline) rather than drop them and strand the payment.
-  // Not spendable from the box; only the operator's offline key can claim it.
+  // Persist the operator-locked token BEFORE touching the ledger/WireGuard. The
+  // buyer already minted these proofs to our lock, so if provisioning below fails
+  // we must keep them (sweepable offline) rather than drop them and strand the
+  // payment. Not spendable from the box; only the operator's offline key claims it.
   if (payment?.valid && payment.token && payment.mint) {
     await proofStore.add({
       purchaseId,
@@ -506,28 +497,29 @@ async function provisionPeer(
     });
   }
 
-  if (config.mode === 'live') {
-    await (ctx.execPlan ?? executePlan)(planAddPeer(config.wgInterface, clientPublicKey, tunnelIp));
-  }
-
-  const lease: PeerLease = {
+  // Allocate the tunnel IP and record the lease in ONE serialized ledger
+  // transaction: two concurrent provisions can't read the same free-IP snapshot
+  // and grab the same /32, and any prior active lease for this key is expired in
+  // the same step (a WireGuard peer is keyed by pubkey, so one key holds one
+  // active lease — else the old lease's cleanup would `wg ... remove` the shared
+  // peer and cut this buyer).
+  const lease = await ledger.allocateAndRecord({
     purchaseId,
     clientPublicKey,
-    tunnelIp,
-    createdAt: now.toISOString(),
+    now,
     expiresAt: new Date(now.getTime() + config.leaseDurationMs).toISOString(),
-    status: 'active',
-  };
-  await ledger.record(lease);
+    allocate: (taken) => allocator.allocateTunnelIp(purchaseId, clientPublicKey, taken),
+  });
+  const { tunnelIp } = lease;
 
-  // A WireGuard peer is keyed by its public key, so the `wg set` above just moved
-  // any existing peer with this key onto the new IP — the earlier lease is now
-  // detached. Expire those prior same-key leases (no `wg ... remove`, which would
-  // delete the now-shared peer and cut THIS buyer) so one key holds one active
-  // lease and the old lease's expiry cleanup can't disconnect the new one.
-  for (const prior of await ledger.list(now)) {
-    if (prior.status === 'active' && prior.clientPublicKey === clientPublicKey && prior.purchaseId !== purchaseId) {
-      await ledger.markExpired(prior.purchaseId);
+  if (config.mode === 'live') {
+    try {
+      await (ctx.execPlan ?? executePlan)(planAddPeer(config.wgInterface, clientPublicKey, tunnelIp));
+    } catch (e) {
+      // Roll back the reservation so a failed `wg set` doesn't leave an active
+      // lease holding an IP for a peer that was never added.
+      await ledger.markExpired(purchaseId).catch(() => {});
+      throw e;
     }
   }
 

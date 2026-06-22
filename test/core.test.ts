@@ -1301,6 +1301,70 @@ test('property: planSweep partitions every receipt exactly once', () => {
   assert.ok(plan.mismatched.every((r) => r.index !== undefined), 'mismatched = indexed but wrong lock');
 });
 
+// --- Atomic provisioning + cross-process prune lock ---
+
+// Allocate the lowest free host; if `taken` isn't updated atomically per record,
+// two concurrent calls collide on the same IP.
+const lowestFree = (taken: Set<string>): string => {
+  for (let h = 2; h < 255; h++) { const ip = `10.77.0.${h}`; if (!taken.has(ip)) return ip; }
+  throw new Error('subnet exhausted');
+};
+
+test('allocateAndRecord expires a prior active lease for the same key (one key, one lease)', async () => {
+  const ledger = createMemoryLedger();
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 60_000).toISOString();
+  await ledger.allocateAndRecord({ purchaseId: 'a', clientPublicKey: 'K', now, expiresAt, allocate: lowestFree });
+  const second = await ledger.allocateAndRecord({ purchaseId: 'b', clientPublicKey: 'K', now, expiresAt, allocate: lowestFree });
+  const active = (await ledger.list()).filter((l) => l.status === 'active');
+  assert.equal(active.length, 1, 'the prior lease for this key is expired');
+  assert.equal(active[0]!.purchaseId, 'b', 'the newest lease wins');
+  assert.equal((await ledger.list()).length, 2, 'the old lease is expired, not deleted');
+  assert.ok(second.tunnelIp.startsWith('10.77.0.'));
+});
+
+test('file ledger allocateAndRecord serializes allocation — no IP collisions under concurrency', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cvpn-alloc-'));
+  const path = join(dir, 'ledger.json');
+  try {
+    const ledger = createFileLedger(path);
+    const expiresAt = new Date(Date.now() + 60_000).toISOString();
+    // 20 distinct keys provisioning at once: if the read-allocate-write weren't
+    // serialized, they'd read the same free-IP snapshot and pick duplicate /32s.
+    const leases = await Promise.all(Array.from({ length: 20 }, (_, i) =>
+      ledger.allocateAndRecord({ purchaseId: `p${i}`, clientPublicKey: `key-${i}`, now: new Date(), expiresAt, allocate: lowestFree })));
+    assert.equal(new Set(leases.map((l) => l.tunnelIp)).size, 20, 'every concurrent allocation got a distinct IP');
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('file proof store: prune compact and a concurrent daemon append lose nothing (cross-process lock)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cvpn-proofs-'));
+  const path = join(dir, 'proofs.json');
+  const rcpt = (id: string, secrets: string[]): ReceivedPayment => ({
+    purchaseId: id, mint: 'https://m', amountSats: 1, token: `tok-${id}`,
+    secrets, lockPubkey: 'a'.repeat(64), receivedAt: new Date().toISOString(),
+  });
+  try {
+    // Two SEPARATE store instances stand in for two processes: each has its own
+    // in-process serialize(), so only the on-disk lockfile coordinates them.
+    const daemon = createFileProofStore(path);
+    const pruner = createFileProofStore(path);
+    await daemon.add(rcpt('keep', ['s1']));
+    await daemon.add(rcpt('spent', ['s2']));
+
+    const droppedIds = new Set(['spent']);
+    await Promise.all([
+      pruner.compact((recs) => recs.filter((r) => !droppedIds.has(r.purchaseId))),
+      daemon.add(rcpt('newcomer', ['s3'])), // appended mid-prune
+    ]);
+
+    const ids = (await daemon.list()).map((r) => r.purchaseId).sort();
+    // 'spent' dropped; 'keep' and the concurrently-appended 'newcomer' both survive,
+    // whichever order the lock grants — never a lost paid token.
+    assert.deepEqual(ids, ['keep', 'newcomer']);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test('property: sweepAll conserves sats across batch and fallback paths', async () => {
   // Whatever the claimer does, claimedSats must equal the sats actually claimed —
   // batching or per-receipt fallback must never drop or duplicate a proof.

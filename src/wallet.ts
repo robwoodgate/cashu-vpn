@@ -9,7 +9,7 @@
  * than raw Proof objects keeps the file portable and dodges Amount JSON pitfalls.
  */
 
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { serialize } from './serialize.js';
 
@@ -35,6 +35,13 @@ export interface ProofStore {
   hasAnyOf(secrets: string[]): Promise<boolean>;
   /** Atomically replace the whole store (used by prune to drop swept receipts). */
   replaceAll(payments: ReceivedPayment[]): Promise<void>;
+  /**
+   * Atomically re-read, transform, and write the store as one unit. Used by prune
+   * to drop swept receipts WITHOUT losing a receipt the daemon appended since the
+   * caller's snapshot: the transform re-applies the drop against the current file
+   * contents under the same (cross-process) lock the daemon's writes take.
+   */
+  compact(transform: (records: ReceivedPayment[]) => ReceivedPayment[]): Promise<{ before: number; after: number }>;
 }
 
 function anySeen(records: ReceivedPayment[], secrets: string[]): boolean {
@@ -59,16 +66,68 @@ export function createMemoryProofStore(initial: ReceivedPayment[] = []): ProofSt
       records.length = 0;
       records.push(...payments);
     },
+    async compact(transform) {
+      const before = records.length;
+      const kept = transform([...records]);
+      records.length = 0;
+      records.push(...kept);
+      return { before, after: kept.length };
+    },
   };
 }
 
+// --- Cross-process advisory lock ---
+//
+// The daemon (in-process serialize()) and the off-box pruner are SEPARATE
+// processes, so the per-process serializer can't stop the pruner overwriting a
+// receipt the daemon appended mid-prune (a lost paid token). An O_EXCL lockfile
+// is the cross-process mutex both take around their read-modify-write.
+// ponytail: lockfile, not a lease/heartbeat lock. A holder that crashes mid-write
+// leaves a stale lockfile; we steal it after LOCK_STALE_MS. Our locked sections
+// are tiny (read+write a small JSON, network spent-checks stay OUTSIDE the lock),
+// so the steal window can't fire mid-operation. Move to a real lock lib only if
+// the locked sections ever grow long.
+const LOCK_STALE_MS = 30_000;
+const LOCK_RETRY_MS = 50;
+const LOCK_TIMEOUT_MS = 10_000;
+
+async function withFileLock<T>(lockPath: string, fn: () => Promise<T>): Promise<T> {
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  for (;;) {
+    let acquired = false;
+    try {
+      await mkdir(dirname(lockPath), { recursive: true });
+      const fh = await open(lockPath, 'wx'); // O_CREAT|O_EXCL — fails if held
+      await fh.close();
+      acquired = true;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      // Held elsewhere — steal it if stale (holder likely crashed mid-write).
+      try {
+        const st = await stat(lockPath);
+        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) { await unlink(lockPath).catch(() => {}); continue; }
+      } catch { continue; } // vanished between open and stat — race to re-acquire
+      if (Date.now() > deadline) throw new Error(`could not acquire lock ${lockPath} within ${LOCK_TIMEOUT_MS}ms`);
+      await new Promise((r) => setTimeout(r, LOCK_RETRY_MS));
+    }
+    if (acquired) {
+      try { return await fn(); }
+      finally { await unlink(lockPath).catch(() => {}); }
+    }
+  }
+}
+
 export function createFileProofStore(path: string): ProofStore {
-  // Serialize mutations so two concurrent payments can't both read-then-write and
-  // drop a receipt — a lost locked token is an unsweepable (lost) payment.
+  // serialize() guards in-process; withFileLock guards across processes (the
+  // off-box pruner). A lost locked token is an unsweepable (lost) payment, so
+  // every read-modify-write takes both. Reads stay lock-free — writeStoreFile's
+  // atomic tmp+rename means a reader always sees a whole file, never a partial.
   const mutate = serialize();
+  const lockPath = `${path}.lock`;
+  const locked = <T>(fn: () => Promise<T>): Promise<T> => mutate(() => withFileLock(lockPath, fn));
   return {
     add(payment) {
-      return mutate(async () => {
+      return locked(async () => {
         const records = await readStoreFile(path);
         records.push(payment);
         await writeStoreFile(path, records);
@@ -81,8 +140,14 @@ export function createFileProofStore(path: string): ProofStore {
       return anySeen(await readStoreFile(path), secrets);
     },
     replaceAll(payments) {
-      return mutate(async () => {
-        await writeStoreFile(path, payments);
+      return locked(() => writeStoreFile(path, payments));
+    },
+    compact(transform) {
+      return locked(async () => {
+        const before = await readStoreFile(path);
+        const after = transform(before);
+        await writeStoreFile(path, after);
+        return { before: before.length, after: after.length };
       });
     },
   };

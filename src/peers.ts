@@ -21,8 +21,27 @@ export interface PeerAllocator {
   allocateTunnelIp(purchaseId: string, clientPublicKey: string, taken?: Set<string>): string;
 }
 
+/** Args for an atomic allocate-and-record provisioning transaction. */
+export interface AllocateAndRecordArgs {
+  purchaseId: string;
+  clientPublicKey: string;
+  now: Date;
+  expiresAt: string;
+  /** Picks a tunnel IP given the set already in use; the ledger supplies `taken`. */
+  allocate: (taken: Set<string>) => string;
+}
+
 export interface PeerLedger {
   record(lease: PeerLease): Promise<void>;
+  /**
+   * Atomically allocate a tunnel IP and record the lease in one serialized
+   * transaction, so concurrent provisions can't read the same free-IP snapshot
+   * and grab the same /32. Reads the currently-active IPs, calls `allocate` with
+   * them, expires any prior active lease for the same client key (a WireGuard peer
+   * is keyed by pubkey — one key, one active lease), records the new active lease,
+   * and returns it.
+   */
+  allocateAndRecord(args: AllocateAndRecordArgs): Promise<PeerLease>;
   list(now?: Date): Promise<PeerLease[]>;
   listExpiredActive(now: Date): Promise<PeerLease[]>;
   markExpired(purchaseId: string): Promise<void>;
@@ -61,8 +80,25 @@ export function createAllocator(): PeerAllocator {
 export function createMemoryLedger(initial: PeerLease[] = []): PeerLedger {
   const records = [...initial];
 
+  // Active for allocation/collision purposes = status active AND not yet expired.
+  const isLive = (r: PeerLease, now: Date) =>
+    r.status === 'active' && new Date(r.expiresAt).getTime() > now.getTime();
+
   return {
     async record(lease) { records.push(lease); },
+
+    async allocateAndRecord({ purchaseId, clientPublicKey, now, expiresAt, allocate }) {
+      // No await before the push → atomic in single-threaded JS (memory ledger).
+      const taken = new Set(records.filter((r) => isLive(r, now)).map((r) => r.tunnelIp));
+      const tunnelIp = allocate(taken);
+      for (let i = 0; i < records.length; i++) {
+        const r = records[i]!;
+        if (r.clientPublicKey === clientPublicKey && isLive(r, now)) records[i] = { ...r, status: 'expired' };
+      }
+      const lease: PeerLease = { purchaseId, clientPublicKey, tunnelIp, createdAt: now.toISOString(), expiresAt, status: 'active' };
+      records.push(lease);
+      return lease;
+    },
 
     async list(now = new Date()) {
       return records.map((r) => ({
@@ -101,12 +137,28 @@ export function createFileLedger(path: string): PeerLedger {
   // Serialize every read-modify-write so concurrent provisions can't clobber each
   // other's appends (last-writer-wins would silently drop a lease record).
   const mutate = serialize();
+  const isLive = (r: PeerLease, now: Date) =>
+    r.status === 'active' && new Date(r.expiresAt).getTime() > now.getTime();
   return {
     record(lease) {
       return mutate(async () => {
         const records = await readLedgerFile(path);
         records.push(lease);
         await writeLedgerFile(path, records);
+      });
+    },
+
+    allocateAndRecord({ purchaseId, clientPublicKey, now, expiresAt, allocate }) {
+      return mutate(async () => {
+        const records = await readLedgerFile(path);
+        const taken = new Set(records.filter((r) => isLive(r, now)).map((r) => r.tunnelIp));
+        const tunnelIp = allocate(taken);
+        const updated = records.map((r) =>
+          r.clientPublicKey === clientPublicKey && isLive(r, now) ? { ...r, status: 'expired' as const } : r);
+        const lease: PeerLease = { purchaseId, clientPublicKey, tunnelIp, createdAt: now.toISOString(), expiresAt, status: 'active' };
+        updated.push(lease);
+        await writeLedgerFile(path, updated);
+        return lease;
       });
     },
 
