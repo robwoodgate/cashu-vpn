@@ -1,9 +1,28 @@
 {
   "name": "cashu-vpn",
   "version": "0.2.0",
-  "private": true,
-  "description": "Cashu-paid WireGuard access daemon",
+  "description": "Sell short-lived WireGuard VPN access for Cashu ecash — non-custodial, no accounts",
   "type": "module",
+  "license": "MIT",
+  "author": "Rob Woodgate",
+  "homepage": "https://github.com/robwoodgate/cashu-vpn#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/robwoodgate/cashu-vpn.git"
+  },
+  "bugs": {
+    "url": "https://github.com/robwoodgate/cashu-vpn/issues"
+  },
+  "keywords": [
+    "cashu",
+    "ecash",
+    "wireguard",
+    "vpn",
+    "lightning",
+    "bitcoin",
+    "nut-18",
+    "nostr"
+  ],
   "scripts": {
     "build": "tsc --project tsconfig.json && npm run build:client",
     "build:client": "esbuild src/client.ts --bundle --minify --format=iife --platform=browser --outfile=dist/public/client.js",
@@ -11,9 +30,10 @@
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "start": "node dist/src/main.js",
+    "start:env": "node --env-file=.env dist/src/main.js",
     "discover": "node dist/src/discover.js",
     "sweep": "node dist/src/sweep.js",
-    "sweep:remote": "bash notes/sweep-remote.sh",
+    "sweep:remote": "bash scripts/sweep-remote.sh",
     "prune": "node dist/src/sweep.js --prune"
   },
   "engines": {

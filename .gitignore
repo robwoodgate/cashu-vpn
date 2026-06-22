@@ -1,3 +1,9 @@
 node_modules/
 dist/
 *.tmp
+.DS_Store
+
+# Local config and runtime state — never commit keys, proofs, or leases
+.env
+state/
+swept-*.json

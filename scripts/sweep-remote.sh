@@ -6,7 +6,7 @@
 # then prunes the swept receipts on the box. Your xprv NEVER touches the server.
 #
 # Usage:
-#   OPERATOR_XPRV=xprv... ./notes/sweep-remote.sh user@host [remote-cashu-vpn-dir]
+#   OPERATOR_XPRV=xprv... npm run sweep:remote user@host [remote-cashu-vpn-dir]
 #
 # Requires: ssh/scp access to the box, and this repo built locally (npm run build).
 set -euo pipefail

@@ -1,5 +1,6 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type { Config } from './config.js';
 import type { PeerAllocator, PeerLedger, PeerLease } from './peers.js';
@@ -13,6 +14,16 @@ import { getEncodedToken, type Proof } from '@cashu/cashu-ts';
 
 const MAX_BODY_BYTES = 16 * 1024;
 const ORDER_ID_RE = /^[A-Za-z0-9_-]{16,}$/;
+
+// Reported by /info. Read from package.json (repo root, two levels up from
+// dist/src) so it never drifts from the published version.
+const VERSION = ((): string => {
+  try {
+    return JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
 
 export interface ServerDeps {
   config: Config;
@@ -74,7 +85,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
 
     if (req.method === 'GET' && path === '/info') {
       return json(res, 200, {
-        version: '0.2.0',
+        version: VERSION,
         mode: config.mode,
         priceSats: config.priceSats,
         unit: config.unit,
@@ -172,7 +183,7 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
   }
 
   // NUT-24 same-client path (agents): proofs delivered inline via X-Cashu. Verify
-  // and provision in this same response — no order/poll round-trip needed.
+  // and provision in this same response, no order/poll round-trip needed.
   const headerToken = firstHeader(req.headers['x-cashu']);
   if (headerToken) {
     const verified = await verifyAndAuthorize(ctx, headerToken);
@@ -385,7 +396,7 @@ async function provisionPeer(
   await ledger.record(lease);
 
   // Persist the operator-locked token so the operator can sweep it offline.
-  // Not spendable from the box — only the operator's offline key can claim it.
+  // Not spendable from the box, only the operator's offline key can claim it.
   if (payment?.valid && payment.token && payment.mint) {
     await proofStore.add({
       purchaseId,
@@ -604,7 +615,7 @@ function renderPage(config: Config): string {
     <h2>Get connected</h2>
     ${isDryRun
       ? '<p>Dry-run mode: no payment required, no real WireGuard peer created. A keypair is still generated in your browser.</p>'
-      : '<p>Your WireGuard keypair is generated in your browser — the private key never leaves this page.</p>'}
+      : '<p>Pay privately in Bitcoin using Cashu ecash. Your WireGuard keypair is generated in your browser. The private key never leaves this page.</p>'}
     <div class="row" style="margin-top:10px">
       <button id="buy" type="button">Get VPN config</button>
       <button type="button" id="dl" disabled class="ghost">Download .conf</button>
@@ -616,14 +627,14 @@ function renderPage(config: Config): string {
     <h2>Pay <span id="payamt">${esc(price)}</span></h2>
 
     <h3>⚡ Pay with Lightning</h3>
-    <p>No Cashu wallet needed — pay a Lightning invoice and we mint the ecash in your browser and deliver it.</p>
+    <p>No Cashu wallet needed! Pay a Lightning invoice and we mint the ecash in your browser and deliver it. Payments in sats using Cashu ecash for privacy.</p>
     <div class="row" style="margin-top:10px"><button id="lnbtn" type="button">Generate Lightning invoice</button></div>
     <div id="qrln" class="qr"></div>
     <pre id="lninvoice"></pre>
     <button type="button" id="copyln" class="ghost">Copy invoice</button>
 
     <h3>Or pay with a Cashu wallet</h3>
-    <p>Scan or copy this payment request with a NUT-18 wallet. It pays and delivers the ecash automatically — this page updates itself.</p>
+    <p>Scan or copy this payment request with a NUT-18 wallet that supports P2PK Locked tokens (NUT-11). It pays and delivers the ecash automatically, and this page updates itself.</p>
     <div id="qrcreq" class="qr"></div>
     <pre id="creq"></pre>
     <button type="button" id="copyreq" class="ghost">Copy request</button>

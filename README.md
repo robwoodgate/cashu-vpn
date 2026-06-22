@@ -17,7 +17,7 @@ The money you receive is locked to your key, so even if someone steals the whole
 Before touching a real server or any money, you can run the whole thing locally. Clone the project, install, build, and start it in its default dry-run mode:
 
 ```bash
-git clone <repo> && cd cashu-vpn
+git clone https://github.com/robwoodgate/cashu-vpn.git && cd cashu-vpn
 npm install && npm run build
 npm start
 ```
@@ -26,37 +26,56 @@ Open `http://localhost:3087` and click through the buyer flow. In dry-run mode n
 
 ## Set up your own VPN
 
-To run a real one you need a Linux server with WireGuard already running on an interface called `wg0`, Node.js version 20 or newer, and the WireGuard UDP port (51820 by default) open in your firewall. You will also put the daemon behind an HTTPS reverse proxy, because browsers only allow the in-page key generation on secure origins. [Caddy](https://caddyserver.com) is the easiest choice and gets you a certificate automatically.
+You need a Linux server with Node.js 20 or newer, root access, and a domain name pointed at the server so it can get an HTTPS certificate. The two host-level pieces are WireGuard and a reverse proxy; the steps below cover both.
 
 **1. Get the project onto the server and build it.**
 
 ```bash
-git clone <repo> && cd cashu-vpn
+git clone https://github.com/robwoodgate/cashu-vpn.git && cd cashu-vpn
 npm install && npm run build
 ```
 
-**2. Read your WireGuard details.** The `discover` command reads your server's public key, port, and public address straight off the live interface without changing anything. Note down what it prints.
+**2. Set up WireGuard.** If you do not already have a WireGuard interface, create a minimal one. Generate a server key pair, then write `/etc/wireguard/wg0.conf` with a private address range, a listen port, and that private key:
+
+```bash
+umask 077
+wg genkey | tee /etc/wireguard/server.key | wg pubkey > /etc/wireguard/server.pub
+
+cat > /etc/wireguard/wg0.conf <<EOF
+[Interface]
+Address = 10.77.0.1/24
+ListenPort = 51820
+PrivateKey = $(cat /etc/wireguard/server.key)
+EOF
+
+wg-quick up wg0
+systemctl enable wg-quick@wg0
+```
+
+Open the listen port in your firewall (`ufw allow 51820/udp`, or your provider's equivalent) and enable IP forwarding if you want buyers to reach the internet through the box (`sysctl -w net.ipv4.ip_forward=1`, plus a `MASQUERADE` rule on your public interface). cashu-vpn adds and removes buyer peers on this interface at runtime and never edits `wg0.conf`.
+
+**3. Read your WireGuard details.** This reads your server's public key, port, and public address off the live interface without changing anything. Note them down.
 
 ```bash
 npm run discover wg0
 ```
 
-**3. Create your payout key.** Generate a BIP32 HD key pair on your own computer, offline. You will give the daemon only the public half, the `xpub`. Keep the private half, the `xprv`, somewhere safe and well away from the server. The daemon uses the `xpub` to lock each sale to a fresh key, and only your offline `xprv` can ever unlock the proceeds.
+**4. Create your payout key.** Generate a BIP32 HD key pair on your own computer, offline. You give the daemon only the public half, the `xpub`. Keep the private half, the `xprv`, somewhere safe and far away from the server. The daemon uses the `xpub` to lock each sale to a fresh key, and only your offline `xprv` can ever unlock the proceeds.
 
-**4. Start the daemon.** Fill in the values from steps 2 and 3 and run it live:
+**5. Configure.** Copy the sample config and fill it in with the values from steps 3 and 4:
 
 ```bash
-MODE=live WG_INTERFACE=wg0 \
-  SERVER_PUBLIC_KEY=<from discover> WG_ENDPOINT=<ip>:51820 \
-  OPERATOR_XPUB=<your xpub> \
-  ACCEPTED_MINTS=https://mint.minibits.cash/Bitcoin PRICE_SATS=1000 \
-  PROOFS_PATH=./state/proofs.json PEER_LEDGER_PATH=./state/peers.json \
-  ORDERS_PATH=./state/orders.json LOCK_COUNTER_PATH=./state/locks.json \
-  CLEANUP_INTERVAL_MS=60000 \
-  npm start
+cp .env.example .env
+nano .env   # set SERVER_PUBLIC_KEY, WG_ENDPOINT, OPERATOR_XPUB, PUBLIC_BASE_URL, DOMAIN
 ```
 
-**5. Put it behind HTTPS.** The daemon listens only on `127.0.0.1`, so point your reverse proxy at `127.0.0.1:3087` and serve it over HTTPS. Set `PUBLIC_BASE_URL` to your public address so paying wallets know where to deliver. There is a ready-made systemd-plus-Caddy install script in `notes/deploy-systemd.sh` you can adapt.
+**6. Install it as a service.** This writes a systemd unit that runs the daemon from your `.env`, starts it on boot, and restarts it if it crashes. If you set `DOMAIN` in `.env` and have [Caddy](https://caddyserver.com) installed, it also adds an HTTPS site that proxies to the daemon and fetches a certificate automatically.
+
+```bash
+sudo scripts/install-systemd.sh
+```
+
+That is it. If you would rather wire up TLS yourself, leave `DOMAIN` blank: the daemon listens on `127.0.0.1:3087`, so point any reverse proxy at it over HTTPS. Browsers need HTTPS for the in-page key generation, and `PUBLIC_BASE_URL` must be your public address so paying wallets know where to deliver.
 
 The daemon attaches and removes peers on your existing `wg0` using `wg set` and `ip route`. It never edits your `wg0.conf`, so it sits alongside whatever you already run.
 
@@ -164,6 +183,12 @@ src/
   client.ts     browser bundle
   discover.ts   reads interface key, port, and endpoint
   sweep.ts      offline sweep and prune
+scripts/
+  install-systemd.sh   install as a systemd service (+ optional Caddy site)
+  sweep-remote.sh      pull receipts, sweep locally, prune the server
+test/
+  core.test.ts         unit and HTTP tests (npm test)
+  manual/              live integration clients (see test/manual/README.md)
 ```
 
 ## Commands
@@ -183,3 +208,7 @@ src/
 This is FOSS and is not yet hardened for unattended public operation. Before you open it up, put it behind HTTPS and a process supervisor such as systemd, keep `CLEANUP_INTERVAL_MS` set so expired peers are removed, tune the rate limit for your traffic, and use a real `OPERATOR_XPUB` with the `xprv` kept offline.
 
 And the obvious thing: when you run an exit, the traffic leaving your server is your responsibility. This software does not route or proxy any of it for you, and it makes no promise of anonymity or legal protection.
+
+## License
+
+[MIT](LICENSE).
