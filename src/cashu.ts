@@ -43,9 +43,16 @@ export function normalizeMintUrl(url: string): string {
   return String(url ?? '').trim().replace(/\/+$/, '');
 }
 
-/** Normalize a P2PK pubkey for comparison: lowercase, x-only (strip 02/03). */
+/**
+ * Normalize a P2PK pubkey for comparison: lowercase, x-only. Strip the 02/03
+ * parity prefix ONLY from a full 66-char compressed key — must be idempotent, or
+ * re-normalizing an already-x-only key whose coordinate starts 02/03 over-strips
+ * it (LockBook.resolve normalizes input that verifyPayment already normalized;
+ * ~0.8% of xpub locks would then miss the lookup and reject a paid buyer).
+ */
 export function normalizePubkey(k: string): string {
-  return String(k ?? '').toLowerCase().replace(/^0[23]/, '');
+  const s = String(k ?? '').toLowerCase();
+  return s.length === 66 && /^0[23]/.test(s) ? s.slice(2) : s;
 }
 
 /**
