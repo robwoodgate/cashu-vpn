@@ -60,7 +60,13 @@ Open the listen port in your firewall (`ufw allow 51820/udp`, or your provider's
 npm run discover wg0
 ```
 
-**4. Create your payout key.** Generate a BIP32 HD key pair on your own computer, offline. You give the daemon only the public half, the `xpub`. Keep the private half, the `xprv`, somewhere safe and far away from the server. The daemon uses the `xpub` to lock each sale to a fresh key, and only your offline `xprv` can ever unlock the proceeds.
+**4. Create your payout key.** On your own computer — not the server — generate a BIP32 HD key pair:
+
+```bash
+npm run keygen
+```
+
+It prints an `OPERATOR_XPUB` and an `OPERATOR_XPRV`. The daemon uses the `xpub` to lock each sale to a fresh key and can never spend; only the `xprv` can. Put the `xpub` on the server in the next step, and keep the `xprv` somewhere safe and offline — that string is your only backup and it controls your funds.
 
 **5. Configure.** Copy the sample config and fill it in with the values from steps 3 and 4:
 
@@ -181,6 +187,7 @@ src/
   ratelimit.ts  per-IP rate limiter
   buyer.ts      buyer-side helpers, also bundled into the browser
   client.ts     browser bundle
+  keygen.ts     generate an operator xpub/xprv pair (offline)
   discover.ts   reads interface key, port, and endpoint
   sweep.ts      offline sweep and prune
 scripts/
@@ -198,6 +205,7 @@ test/
 | `npm run build` | compile the daemon and bundle the browser client |
 | `npm test` / `npm run lint` / `npm run typecheck` | the checks |
 | `npm start` | run the daemon |
+| `npm run keygen` | generate an operator xpub/xprv pair (run offline) |
 | `npm run discover [iface] [host]` | read key, port, and endpoint off a live interface |
 | `npm run sweep:remote user@host` | pull receipts, claim them locally, and prune the server |
 | `npm run sweep` | claim a local `proofs.json`, using your `OPERATOR_XPRV` |

@@ -23,6 +23,7 @@ import { createP2PKsecret, getP2PKExpectedWitnessPubkeys } from '@cashu/cashu-ts
 import { buildPaymentRequest, normalizeMintUrl, verifyPayment, popcount } from '../src/cashu.js';
 import { discover, parseRouteSrcIp } from '../src/discover.js';
 import { deriveChildPubkey, deriveChildKeypair, isPrivateExtendedKey } from '../src/hdkeys.js';
+import { generateOperatorKeys } from '../src/keygen.js';
 import { createLockBook } from '../src/locks.js';
 import { planSweep, sweepAll, filterUnswept, pruneSpent } from '../src/sweep.js';
 import { decodeChallenge, waitForPaid } from '../src/buyer.js';
@@ -631,6 +632,20 @@ test('HD-derived pubkey works as a P2PK lock and is recoverable', () => {
   const secret = createP2PKsecret(pub);
   const expected = getP2PKExpectedWitnessPubkeys(secret);
   assert.ok(expected.map(pkNorm).includes(pkNorm(pub)));
+});
+
+test('generateOperatorKeys produces a matching, sweepable xpub/xprv pair', () => {
+  const { xpub, xprv } = generateOperatorKeys();
+  assert.ok(xpub.startsWith('xpub'));
+  assert.ok(xprv.startsWith('xprv'));
+  assert.equal(isPrivateExtendedKey(xpub), false);
+  assert.equal(isPrivateExtendedKey(xprv), true);
+  // The daemon's xpub-derived child equals the operator's xprv-derived child,
+  // so locks the daemon issues can always be swept.
+  assert.equal(pkNorm(deriveChildPubkey(xpub, 0)), pkNorm(deriveChildKeypair(xprv, 0).pubkey));
+  assert.equal(pkNorm(deriveChildPubkey(xpub, 7)), pkNorm(deriveChildKeypair(xprv, 7).pubkey));
+  // Each call generates a different key.
+  assert.notEqual(generateOperatorKeys().xprv, xprv);
 });
 
 test('deriveChildKeypair refuses an xpub, and indices are bounded', () => {
