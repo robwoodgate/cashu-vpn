@@ -33,8 +33,13 @@ interface OrderRec {
   creq?: string; // the payment request, kept so a pending order can be resumed after a reload
   conf?: string;
   tunnelIp?: string;
+  createdAt?: string;
   expiresAt?: string;
 }
+
+// How long "Your access" keeps entries before pruning them on load.
+const PENDING_MAX_AGE_MS = 60 * 60 * 1000; // drop unpaid orders after 1h (server TTL is shorter)
+const EXPIRED_GRACE_MS = 7 * 24 * 60 * 60 * 1000; // keep expired leases ~7 days so "Buy again" stays handy
 
 // localStorage holds this browser's own orders (and their private keys) so "Your
 // access" survives reloads and configs can be re-downloaded.
@@ -45,10 +50,28 @@ function saveOrders(list: OrderRec[]): void { localStorage.setItem(LS_KEY, JSON.
 function upsertOrder(rec: Partial<OrderRec> & { id: string }): OrderRec {
   const list = loadOrders();
   const i = list.findIndex((o) => o.id === rec.id);
-  const merged = { ...(i >= 0 ? list[i] : { status: 'pending' as const, priv: '', pub: '' }), ...rec } as OrderRec;
+  const base = i >= 0 ? list[i]! : { status: 'pending' as const, priv: '', pub: '', createdAt: new Date().toISOString() };
+  const merged = { ...base, ...rec } as OrderRec;
   if (i >= 0) list[i] = merged; else list.push(merged);
   saveOrders(list);
   return merged;
+}
+
+// Drop stale entries on load: unpaid orders past PENDING_MAX_AGE_MS, and expired
+// leases past EXPIRED_GRACE_MS. Recently-expired leases are kept so "Buy again"
+// stays available.
+function pruneOrders(): void {
+  const now = Date.now();
+  const list = loadOrders();
+  const kept = list.filter((o) => {
+    if (o.status === 'ready') {
+      const exp = o.expiresAt ? new Date(o.expiresAt).getTime() : Infinity;
+      return exp + EXPIRED_GRACE_MS > now;
+    }
+    const created = o.createdAt ? new Date(o.createdAt).getTime() : now;
+    return created + PENDING_MAX_AGE_MS > now;
+  });
+  if (kept.length !== list.length) saveOrders(kept);
 }
 
 let priv = '', pubKey = '';
@@ -321,7 +344,8 @@ function renderAccess(): void {
   });
 }
 
-// On load: show stored access and resume polling any still-pending orders.
+// On load: prune stale entries, show stored access, resume polling pending orders.
+pruneOrders();
 renderAccess();
 setInterval(renderAccess, 60000); // keep "active → expired" current on a long-open page
 for (const o of loadOrders()) {
