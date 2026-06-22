@@ -10,7 +10,7 @@ It is freedom tech rather than a product. The whole idea is that anyone can run 
 
 When someone wants access, their browser asks your cashu-vpn daemon for a config. The daemon replies that payment is due and hands back a Cashu payment request locked to a public key that you control (P2PK).
 
-The buyer pays, their wallet (or the built-in Lightning option) delivers the ecash straight back to the daemon, and the daemon checks the payment, adds them as a WireGuard peer, and returns the config. The page then shows the finished `.conf` to download.
+The buyer pays, their wallet (or the built-in Lightning option) delivers the ecash straight back to cashu-vpn, which checks the payment, adds them as a WireGuard peer, and returns the config. The page then shows the finished `.conf` to download.
 
 The money you receive is locked to your key, so even if someone steals the whole server they cannot spend a single sat. You claim your earnings separately, on your own computer, with a private key that never goes near the box. More detail is in [Under the hood](#under-the-hood).
 
@@ -79,7 +79,7 @@ npm run discover wg0
 npm run keygen
 ```
 
-It prints an `OPERATOR_XPUB` and an `OPERATOR_XPRV`. The daemon uses the `xpub` to lock each sale to a fresh key and can never spend; only the `xprv` can. Put the `xpub` on the server in the next step, and keep the `xprv` somewhere safe and offline — that string is your only backup and it controls your funds.
+It prints an `OPERATOR_XPUB` and an `OPERATOR_XPRV`. cashu-vpn uses the `xpub` to lock each sale to a fresh key and can never spend; only the `xprv` can. Put the `xpub` on the server in the next step, and keep the `xprv` somewhere safe and offline — that string is your only backup and it controls your funds.
 
 **5. Configure.** Copy the sample config and fill it in with the values from steps 3 and 4:
 
@@ -123,7 +123,7 @@ A sweep is cheap because all of a mint's receipts are claimed in a single swap, 
 
 A buyer opens your page and clicks **Get VPN config**. Their browser generates a WireGuard key pair on the spot, and the private key never leaves the page. They then pay one of two ways. The Lightning option needs no Cashu wallet at all: they pay an invoice and the page mints the ecash and delivers it for them. Alternatively, they scan the payment request with a Cashu wallet, which pays and delivers automatically. Either way the page finishes on its own and offers a ready-to-use `.conf` to download. Past orders are remembered under **Your access** in that browser so they can be downloaded again later.
 
-> Paying from a Cashu wallet needs a wallet that locks its proofs to the payment request, such as [cashu.me](https://cashu.me) on cashu-ts 4.6.0 or newer. Wallets that ignore the lock are refused, because the daemon never accepts unlocked ecash. The Lightning option works with any wallet, and most ecash-only wallets can melt to pay it.
+> Paying from a Cashu wallet needs a wallet that locks its proofs to the payment request, such as [cashu.me](https://cashu.me) on cashu-ts 4.6.0 or newer. Wallets that ignore the lock are refused, because cashu-vpn never accepts unlocked ecash. The Lightning option works with any wallet, and most ecash-only wallets can melt to pay it.
 
 ## Settings
 
@@ -173,13 +173,13 @@ buyer                              daemon                         mint
   │  GET /order/:orderId (poll) ────►│  ◄ ready + WireGuard .conf   │
 ```
 
-The design is non-custodial by construction. The payment request demands proofs locked to a key you control, using NUT-11 pay-to-public-key. The daemon stores those locked proofs but cannot spend them, because only your offline key can. The server therefore never holds spendable money.
+The design is non-custodial by construction. The payment request demands proofs locked to a key you control, using NUT-11 pay-to-public-key. cashu-vpn stores those locked proofs but cannot spend them, because only your offline key can. The server therefore never holds spendable money.
 
-Payments are verified entirely offline, with no swap and no per-sale call to the mint. When proofs arrive the daemon checks, against a cached copy of the mint's public keys, that the mint genuinely signed them (NUT-12 DLEQ), that they are locked to your key, that the amount covers the price, that the mint is one you accept, and that they are not a replay. Because the buyer's wallet does the minting, your server never generates mint traffic of its own.
+Payments are verified entirely offline, with no swap and no per-sale call to the mint. When proofs arrive cashu-vpn checks, against a cached copy of the mint's public keys, that the mint genuinely signed them (NUT-12 DLEQ), that they are locked to your key, that the amount covers the price, that the mint is one you accept, and that they are not a replay. Because the buyer's wallet does the minting, your server never generates mint traffic of its own.
 
 Privacy comes from the xpub. With `OPERATOR_XPUB` set, every sale is locked to a fresh derived key, so the mint cannot tie your sales together, and you sweep them all with the matching offline key. A single fixed `OPERATOR_PUBKEY` also works but lets the mint correlate your income.
 
-A dust guard protects you from griefing. Someone could try to pay in hundreds of tiny proofs that would each cost you a fee to claim, so the daemon rejects any payment with more proofs than a normal split needs, which is the number of set bits in the amount plus `PROOF_COUNT_MARGIN`. The rejected payment simply stays locked to you and useless to the sender.
+A dust guard protects you from griefing. Someone could try to pay in hundreds of tiny proofs that would each cost you a fee to claim, so cashu-vpn rejects any payment with more proofs than a normal split needs, which is the number of set bits in the amount plus `PROOF_COUNT_MARGIN`. The rejected payment simply stays locked to you and useless to the sender.
 
 Finally, there is no shell anywhere near WireGuard. Commands run as argument arrays through `execFile` with a strict allow-list and key and address validation, so a malicious public key cannot smuggle in a command.
 
