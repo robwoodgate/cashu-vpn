@@ -27,7 +27,7 @@
     "build": "tsc --project tsconfig.json && npm run build:client",
     "build:client": "esbuild src/client.ts --bundle --minify --format=iife --platform=browser --outfile=dist/public/client.js",
     "test": "npm run build --silent && node --test $(find dist/test -name '*.test.js')",
-    "lint": "eslint . --ext .ts",
+    "lint": "eslint .",
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "start": "node dist/src/main.js",
     "start:env": "node --env-file=.env dist/src/main.js",
@@ -47,11 +47,12 @@
     "qrcode-generator": "^2.0.4"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.4",
     "@types/node": "^22.15.30",
-    "@typescript-eslint/eslint-plugin": "^8.33.1",
-    "@typescript-eslint/parser": "^8.33.1",
     "esbuild": "^0.28.1",
-    "eslint": "^8.57.1",
-    "typescript": "^5.8.3"
+    "eslint": "^9.39.4",
+    "globals": "^17.7.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.62.0"
   }
 }
