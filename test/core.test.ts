@@ -38,7 +38,7 @@ test('loadConfig returns dry-run defaults', () => {
   assert.equal(c.port, 3087);
   assert.equal(c.host, '127.0.0.1');
   assert.equal(c.wgInterface, 'wg0');
-  assert.equal(c.priceSats, 250);
+  assert.equal(c.priceSats, 1000);
   assert.equal(c.leaseDurationMs, 24 * 60 * 60 * 1000);
   assert.equal(c.cleanupIntervalMs, undefined);
   assert.deepEqual(c.acceptedMints, ['https://mint.minibits.cash/Bitcoin']);
@@ -220,7 +220,7 @@ test('GET /info returns config summary', async () => {
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.mode, 'dry-run');
-    assert.equal(body.priceSats, 250);
+    assert.equal(body.priceSats, 1000);
     assert.ok(body.acceptedMints.length > 0);
   });
 });
@@ -506,7 +506,7 @@ test('live POST /purchase without payment returns 402 + x-cashu challenge', asyn
     const creq = res.headers.get('x-cashu') ?? '';
     assert.match(creq, /^creqA/);
     const decoded = decodePaymentRequest(creq);
-    assert.equal(decoded.amount?.toNumber(), 250);
+    assert.equal(decoded.amount?.toNumber(), 1000);
     assert.deepEqual(decoded.mints, ['https://mint.example.com']);
     assert.equal(decoded.nut10?.kind, 'P2PK');
     assert.equal(decoded.nut10?.data, '02' + 'a'.repeat(64));

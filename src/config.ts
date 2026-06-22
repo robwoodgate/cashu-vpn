@@ -41,7 +41,7 @@ export interface Config {
 }
 
 const DEFAULT_LEASE_MS = 24 * 60 * 60 * 1000; // 1 day — short leases get eaten by client setup time
-const DEFAULT_PRICE_SATS = 250;
+const DEFAULT_PRICE_SATS = 1000;
 const DEFAULT_ORDER_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const DEFAULT_PROOF_COUNT_MARGIN = 4;
 

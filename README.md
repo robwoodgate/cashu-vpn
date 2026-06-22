@@ -1,163 +1,130 @@
 # cashu-vpn
 
-Sell short-lived WireGuard VPN access for Cashu ecash. No accounts, no
-subscriptions, and no ecash sitting on your server waiting to be stolen.
+cashu-vpn lets you sell short-lived WireGuard VPN access for Cashu ecash. There are no accounts, no subscriptions, and no ecash sitting on your server waiting to be stolen. A buyer opens your page, pays with Lightning or a Cashu wallet, and their browser hands them a ready-to-use WireGuard config. You collect the ecash and claim it later with a key that never touches the server.
 
-A buyer opens your page, pays a Lightning invoice (or a Cashu wallet), and gets a
-working WireGuard config in their browser. You collect ecash you can claim later
-with a key that never touches the server.
+It is freedom tech rather than a product. The whole idea is that anyone can run one, so this guide assumes no special knowledge beyond being comfortable in a terminal.
 
-It's freedom tech, not a SaaS: the whole point is that anyone can run one.
+> **Status:** the full buyer-pays-and-connects loop runs on a live host behind HTTPS and is ready to try today. If you want to run one for real, read [Before you run one for real](#before-you-run-one-for-real) at the end.
 
-> **Status:** the full buyer→pay→connect loop runs on a live host behind TLS. It's
-> usable for testing today; read [Before you go public](#before-you-go-public)
-> first if you want to run one for real.
+## How it works, briefly
 
-## What you get
+When someone wants access, their browser asks your daemon for a config. The daemon replies that payment is due and hands back a Cashu payment request locked to a key only you control. The buyer pays, their wallet (or the built-in Lightning option) delivers the ecash straight back to the daemon, and the daemon checks the payment, adds them as a WireGuard peer, and returns the config. The page then shows the finished `.conf` to download.
 
-- **Buyers:** pay, get a `.conf`, connect. No sign-up, no app, no Cashu wallet
-  required (there's an in-browser Lightning option).
-- **Operators:** one Node process in front of an existing WireGuard interface.
-  Ecash lands locked to a key you keep offline. If someone steals the box, they
-  can't spend a sat.
+The money you receive is locked to your key, so even if someone steals the whole server they cannot spend a single sat. You claim your earnings separately, on your own computer, with a private key that never goes near the box. More detail is in [Under the hood](#under-the-hood).
 
-## Run your own
+## Try it first, with no risk
 
-You need a Linux box with WireGuard already up (`wg0`), Node.js ≥ 20, and
-UDP/51820 open if you want real tunnels.
+Before touching a real server or any money, you can run the whole thing locally. Clone the project, install, build, and start it in its default dry-run mode:
 
 ```bash
 git clone <repo> && cd cashu-vpn
 npm install && npm run build
+npm start
+```
 
-# Read your server's key, port, and endpoint off the live interface (read-only):
+Open `http://localhost:3087` and click through the buyer flow. In dry-run mode nothing is charged and no changes are made to your machine, so it is a safe way to see exactly what your buyers will experience.
+
+## Set up your own VPN
+
+To run a real one you need a Linux server with WireGuard already running on an interface called `wg0`, Node.js version 20 or newer, and the WireGuard UDP port (51820 by default) open in your firewall. You will also put the daemon behind an HTTPS reverse proxy, because browsers only allow the in-page key generation on secure origins. [Caddy](https://caddyserver.com) is the easiest choice and gets you a certificate automatically.
+
+**1. Get the project onto the server and build it.**
+
+```bash
+git clone <repo> && cd cashu-vpn
+npm install && npm run build
+```
+
+**2. Read your WireGuard details.** The `discover` command reads your server's public key, port, and public address straight off the live interface without changing anything. Note down what it prints.
+
+```bash
 npm run discover wg0
 ```
 
-Generate an HD key **offline** and keep the private half (`xprv`) off this
-machine. Put only the public half (`xpub`) in the config below. Then start it:
+**3. Create your payout key.** Generate a BIP32 HD key pair on your own computer, offline. You will give the daemon only the public half, the `xpub`. Keep the private half, the `xprv`, somewhere safe and well away from the server. The daemon uses the `xpub` to lock each sale to a fresh key, and only your offline `xprv` can ever unlock the proceeds.
+
+**4. Start the daemon.** Fill in the values from steps 2 and 3 and run it live:
 
 ```bash
 MODE=live WG_INTERFACE=wg0 \
   SERVER_PUBLIC_KEY=<from discover> WG_ENDPOINT=<ip>:51820 \
   OPERATOR_XPUB=<your xpub> \
-  ACCEPTED_MINTS=https://mint.minibits.cash/Bitcoin PRICE_SATS=250 \
+  ACCEPTED_MINTS=https://mint.minibits.cash/Bitcoin PRICE_SATS=1000 \
   PROOFS_PATH=./state/proofs.json PEER_LEDGER_PATH=./state/peers.json \
   ORDERS_PATH=./state/orders.json LOCK_COUNTER_PATH=./state/locks.json \
   CLEANUP_INTERVAL_MS=60000 \
   npm start
 ```
 
-The daemon listens on `127.0.0.1` and expects a TLS reverse proxy (Caddy works
-well) in front of it — browsers need HTTPS for in-browser key generation. It
-attaches peers to your running `wg0` with `wg set` / `ip route` and never edits
-`wg0.conf`.
+**5. Put it behind HTTPS.** The daemon listens only on `127.0.0.1`, so point your reverse proxy at `127.0.0.1:3087` and serve it over HTTPS. Set `PUBLIC_BASE_URL` to your public address so paying wallets know where to deliver. There is a ready-made systemd-plus-Caddy install script in `notes/deploy-systemd.sh` you can adapt.
 
-Leave `MODE` unset (or `dry-run`) to try everything locally with no payment and
-no changes to the host.
+The daemon attaches and removes peers on your existing `wg0` using `wg set` and `ip route`. It never edits your `wg0.conf`, so it sits alongside whatever you already run.
 
-## Getting your sats out
+## Getting paid
 
-Everything you earn is stored as ecash **locked to your offline key**. The server
-only holds the watch-only `xpub` and a list of locked receipts
-(`state/proofs.json`). To claim, you do a quick offline step on your own machine,
-where the `xprv` lives.
+Everything you earn is stored as ecash locked to your offline key. The server only ever holds the watch-only `xpub` and a list of locked receipts in `state/proofs.json`, so there is nothing on it worth stealing. Claiming is a quick step you run on your own computer, where the `xprv` lives.
 
-One command does the whole thing:
+One command does it all:
 
 ```bash
 OPERATOR_XPRV=<your xprv> npm run sweep:remote root@your-box
 ```
 
-That pulls the receipts off the box, claims them locally (your `xprv` never leaves
-your machine), saves the unlocked tokens to `swept-<timestamp>.json`, and cleans
-the swept receipts off the box. Import the saved tokens into any Cashu wallet.
+This copies the receipts off the server, claims them locally so your `xprv` never leaves your machine, saves the unlocked tokens to a timestamped file, and tidies the claimed receipts off the server afterwards. Import the saved tokens into any Cashu wallet and you are done.
 
-Prefer to do it by hand? The steps are just:
+If you would rather do it by hand, the same thing in two steps is to copy the receipts down and sweep them locally:
 
 ```bash
 scp root@your-box:/root/cashu-vpn/state/proofs.json ./proofs.json
 OPERATOR_XPRV=<your xprv> PROOFS_PATH=./proofs.json npm run sweep
 ```
 
-A few things worth knowing:
+A sweep is cheap because all of a mint's receipts are claimed in a single swap, so you pay the mint's fee once for the batch rather than once per sale. It is also safe to run as often as you like: the sweep first asks the mint which receipts are already claimed and skips them, so it never double-claims or errors out on a repeat run. To keep `state/proofs.json` from growing forever, `npm run prune` drops already-claimed receipts from it. Prune only reads spend status from the mint and needs no key, so it is safe to run on the server, and the remote sweep does it for you.
 
-- **It's cheap.** All of a mint's receipts are claimed in one swap, so you pay the
-  mint's input fee once for the batch instead of once per sale.
-- **It's safe to re-run.** The sweep asks the mint which receipts are already spent
-  and skips them, so running it twice won't double-anything or error out.
-- **Keep the file tidy.** `npm run prune` (or the remote sweep, which does it for
-  you) drops already-claimed receipts from `proofs.json`. It only reads spend
-  state from the mint, so it's safe to run on the box — no key needed.
+> The demo deploy keeps a throwaway `xprv` in `state/test-key.json` so unattended test sweeps work. Never do that with real money. Generate your key offline and keep the `xprv` off the server.
 
-> The demo deploy keeps a throwaway `xprv` in `state/test-key.json` for hands-off
-> test sweeps. Don't do that with real money: generate your key offline and keep
-> the `xprv` off the server.
+## What your buyers see
 
-## What buyers see
+A buyer opens your page and clicks **Get VPN config**. Their browser generates a WireGuard key pair on the spot, and the private key never leaves the page. They then pay one of two ways. The Lightning option needs no Cashu wallet at all: they pay an invoice and the page mints the ecash and delivers it for them. Alternatively, they scan the payment request with a Cashu wallet, which pays and delivers automatically. Either way the page finishes on its own and offers a ready-to-use `.conf` to download. Past orders are remembered under **Your access** in that browser so they can be downloaded again later.
 
-They click **Get VPN config**. Their browser makes a WireGuard keypair (the
-private key never leaves the page) and shows two ways to pay:
+> Paying from a Cashu wallet needs a wallet that locks its proofs to the payment request, such as [cashu.me](https://cashu.me) on cashu-ts 4.6.0 or newer. Wallets that ignore the lock are refused, because the daemon never accepts unlocked ecash. The Lightning option works with any wallet, and most ecash-only wallets can melt to pay it.
 
-- **⚡ Lightning** — no Cashu wallet needed. Pay the invoice and the page mints the
-  ecash for you and delivers it. (Ecash-only? Most wallets can melt to pay this.)
-- **Cashu wallet** — scan the payment request with a NUT-18 wallet; it pays and
-  delivers automatically.
+## Settings
 
-The page finishes on its own and hands over a ready-to-use `.conf`. Past orders
-stay under **Your access** in that browser so they can be re-downloaded.
+Everything is configured with environment variables.
 
-> Note: paying from a Cashu wallet needs one that locks its proofs to the
-> request's NUT-11 key — e.g. [cashu.me](https://cashu.me) on cashu-ts ≥ 4.6.0.
-> Wallets that ignore the lock will fail (the daemon won't accept unlocked ecash);
-> the Lightning option works with any wallet.
-
-## Configuration
-
-Set these as environment variables.
-
-| Var | Default | Purpose |
+| Variable | Default | What it does |
 |---|---|---|
-| `MODE` | `dry-run` | `live` enables payment + real WireGuard changes |
-| `HOST` / `PORT` | `127.0.0.1` / `3087` | listen address |
-| `WG_INTERFACE` | `wg0` | WireGuard interface to manage |
-| `SERVER_PUBLIC_KEY` | — | server's WG public key (goes in the buyer `.conf`) |
-| `WG_ENDPOINT` | — | `host:port` buyers connect to |
-| `OPERATOR_XPUB` | — | BIP32 xpub for per-sale P2PK locks (recommended) |
-| `OPERATOR_PUBKEY` | — | fixed P2PK pubkey (used if no xpub); live needs one of these |
-| `ACCEPTED_MINTS` | minibits | comma-separated mint URLs |
-| `PRICE_SATS` | `250` | price per lease |
-| `MINT_UNIT` | `sat` | cashu unit |
-| `LEASE_DURATION_MS` | `86400000` (1 day) | lease length |
+| `MODE` | `dry-run` | set to `live` to take payment and manage real WireGuard peers |
+| `HOST` / `PORT` | `127.0.0.1` / `3087` | address the daemon listens on |
+| `WG_INTERFACE` | `wg0` | the WireGuard interface to manage |
+| `SERVER_PUBLIC_KEY` | — | your server's WireGuard public key, included in the buyer's config |
+| `WG_ENDPOINT` | — | the `host:port` buyers connect to |
+| `OPERATOR_XPUB` | — | your BIP32 xpub, used to lock each sale to a fresh key (recommended) |
+| `OPERATOR_PUBKEY` | — | a single fixed lock key, used if you have no xpub; live mode needs one of these |
+| `ACCEPTED_MINTS` | minibits | comma-separated list of mint URLs you accept |
+| `PRICE_SATS` | `1000` | price per lease, roughly one US dollar a day at recent prices |
+| `MINT_UNIT` | `sat` | the Cashu unit |
+| `LEASE_DURATION_MS` | `86400000` | how long access lasts, one day by default |
 | `CLEANUP_INTERVAL_MS` | off | how often to remove expired peers |
-| `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | `30` / `60000` | per-IP `/purchase` limit (0 disables) |
-| `PUBLIC_BASE_URL` | request-derived | your public URL, used to build the wallet's delivery address; set it behind a proxy |
-| `ORDER_TTL_MS` | `1800000` (30m) | how long an unpaid order stays valid |
-| `PROOF_COUNT_MARGIN` | `4` | dust guard (see [How it works](#how-it-works)) |
-| `PROOFS_PATH` | memory | locked-receipt file |
-| `PEER_LEDGER_PATH` | memory | lease ledger file |
-| `ORDERS_PATH` | memory | pending-order file |
-| `LOCK_COUNTER_PATH` | memory | xpub lock index counter file |
+| `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | `30` / `60000` | per-IP limit on `/purchase`; set max to 0 to disable |
+| `PUBLIC_BASE_URL` | from request | your public URL, used to tell wallets where to deliver payment |
+| `ORDER_TTL_MS` | `1800000` | how long an unpaid order stays valid, 30 minutes by default |
+| `PROOF_COUNT_MARGIN` | `4` | dust-payment guard, explained in [Under the hood](#under-the-hood) |
+| `PROOFS_PATH` | memory | file for the locked receipts you will sweep |
+| `PEER_LEDGER_PATH` | memory | file for the lease ledger |
+| `ORDERS_PATH` | memory | file for pending orders |
+| `LOCK_COUNTER_PATH` | memory | file for the xpub lock counter |
 
-Leave the `*_PATH` vars unset to keep state in memory (handy for dev; lost on
-restart).
+Leave the file path settings unset to keep state in memory, which is handy for development but lost on restart.
 
-## HTTP API
+## The HTTP endpoints
 
-- `GET /` — buyer page · `GET /client.js` — its bundle
-- `GET /health` · `GET /info` — status, price, accepted mints
-- `POST /purchase` `{clientPublicKey}` — returns **402** with an `orderId` and a
-  payment request. (Agents can instead retry with an `X-Cashu` header to pay and
-  receive the config in one shot.)
-- `POST /pay/:orderId` — where a paying wallet delivers its proofs
-- `GET /order/:orderId` — poll your order; returns the `.conf` once it's ready
+The buyer page is served at `/`, with its script at `/client.js`. `GET /health` and `GET /info` report status, price, and accepted mints. A buyer starts with `POST /purchase`, sending their WireGuard public key, and gets back a `402` response carrying an order id and a payment request. Their wallet then delivers the paid ecash to `POST /pay/:orderId`, and the browser watches `GET /order/:orderId` until the config is ready. An automated client can skip the back-and-forth by retrying `POST /purchase` with an `X-Cashu` header to pay and receive the config in one request.
 
-There's no endpoint that lists everyone's leases — orders are private to whoever
-holds the order id.
+There is deliberately no endpoint that lists everyone's leases. Each order is private to whoever holds its order id.
 
-## How it works
-
-The flow, end to end:
+## Under the hood
 
 ```
 buyer                              daemon                         mint
@@ -170,69 +137,49 @@ buyer                              daemon                         mint
   │  GET /order/:orderId (poll) ────►│  ◄ ready + WireGuard .conf   │
 ```
 
-**Non-custodial by design.** The payment request demands proofs locked (NUT-11
-P2PK) to a key you control. The daemon stores those locked proofs but can't spend
-them — only your offline key can. So the server never holds spendable money.
+The design is non-custodial by construction. The payment request demands proofs locked to a key you control, using NUT-11 pay-to-public-key. The daemon stores those locked proofs but cannot spend them, because only your offline key can. The server therefore never holds spendable money.
 
-**Verified offline, no swap.** When proofs arrive the daemon checks them locally:
-the mint's signature is genuine (NUT-12 DLEQ, against a cached public keyset),
-they're locked to your key, the amount covers the price, the mint is one you
-accept, and they're not a replay. The buyer's wallet did the minting, so your
-server never makes a per-sale call to the mint.
+Payments are verified entirely offline, with no swap and no per-sale call to the mint. When proofs arrive the daemon checks, against a cached copy of the mint's public keys, that the mint genuinely signed them (NUT-12 DLEQ), that they are locked to your key, that the amount covers the price, that the mint is one you accept, and that they are not a replay. Because the buyer's wallet does the minting, your server never generates mint traffic of its own.
 
-**Privacy.** With `OPERATOR_XPUB` set, each sale locks to a fresh derived child
-key, so the mint can't tie your sales together. You sweep with the matching
-offline `xprv`. (A single fixed `OPERATOR_PUBKEY` also works but is correlatable.)
+Privacy comes from the xpub. With `OPERATOR_XPUB` set, every sale is locked to a fresh derived key, so the mint cannot tie your sales together, and you sweep them all with the matching offline key. A single fixed `OPERATOR_PUBKEY` also works but lets the mint correlate your income.
 
-**Dust guard.** A buyer could try to grief you by paying in hundreds of tiny
-proofs that cost you fees to claim. The daemon rejects any token with more proofs
-than a normal split needs (`popcount(amount) + PROOF_COUNT_MARGIN`) before storing
-it, so a griefer's token just stays locked and useless to them.
+A dust guard protects you from griefing. Someone could try to pay in hundreds of tiny proofs that would each cost you a fee to claim, so the daemon rejects any payment with more proofs than a normal split needs, which is the number of set bits in the amount plus `PROOF_COUNT_MARGIN`. The rejected payment simply stays locked to you and useless to the sender.
 
-**No shell.** WireGuard commands run as argv arrays through `execFile` with a
-strict allowlist and key/IP validation, so a malicious public key can't smuggle in
-a command.
+Finally, there is no shell anywhere near WireGuard. Commands run as argument arrays through `execFile` with a strict allow-list and key and address validation, so a malicious public key cannot smuggle in a command.
 
 ## Project layout
 
 ```
 src/
   server.ts     HTTP server, per-order payment flow, buyer page
-  cashu.ts      payment request + offline verification
-  orders.ts     pending-order store (capability ids)
-  locks.ts      per-sale lock keys from your xpub
-  hdkeys.ts     BIP32 watch-only derivation
-  wallet.ts     locked-receipt store
-  peers.ts      IP allocation + lease ledger
-  wireguard.ts  wg/ip command planning + execution
-  ratelimit.ts  per-IP limiter
-  buyer.ts      shared buyer-side helpers (also bundled for the browser)
+  cashu.ts      payment request and offline verification
+  orders.ts     pending-order store keyed by capability id
+  locks.ts      per-sale lock keys derived from your xpub
+  hdkeys.ts     BIP32 watch-only key derivation
+  wallet.ts     store of locked receipts
+  peers.ts      IP allocation and lease ledger
+  wireguard.ts  wg/ip command planning and execution
+  ratelimit.ts  per-IP rate limiter
+  buyer.ts      buyer-side helpers, also bundled into the browser
   client.ts     browser bundle
-  discover.ts   read interface key/port/endpoint
-  sweep.ts      offline sweep + prune
+  discover.ts   reads interface key, port, and endpoint
+  sweep.ts      offline sweep and prune
 ```
 
-## Scripts
+## Commands
 
-| Command | Does |
+| Command | What it does |
 |---|---|
-| `npm run build` | compile (tsc) + bundle the browser client (esbuild) |
-| `npm test` / `npm run lint` / `npm run typecheck` | checks |
+| `npm run build` | compile the daemon and bundle the browser client |
+| `npm test` / `npm run lint` / `npm run typecheck` | the checks |
 | `npm start` | run the daemon |
-| `npm run discover [iface] [host]` | read key/port/endpoint off a live interface |
-| `npm run sweep:remote user@host` | pull receipts, claim locally, prune the box |
-| `npm run sweep` | claim a local `proofs.json` (needs `OPERATOR_XPRV`) |
+| `npm run discover [iface] [host]` | read key, port, and endpoint off a live interface |
+| `npm run sweep:remote user@host` | pull receipts, claim them locally, and prune the server |
+| `npm run sweep` | claim a local `proofs.json`, using your `OPERATOR_XPRV` |
 | `npm run prune` | drop already-claimed receipts from a `proofs.json` |
 
-## Before you go public
+## Before you run one for real
 
-This is FOSS and not yet hardened for unattended public operation. Before running
-one for real:
+This is FOSS and is not yet hardened for unattended public operation. Before you open it up, put it behind HTTPS and a process supervisor such as systemd, keep `CLEANUP_INTERVAL_MS` set so expired peers are removed, tune the rate limit for your traffic, and use a real `OPERATOR_XPUB` with the `xprv` kept offline.
 
-- put it behind TLS and a process supervisor (systemd)
-- keep `CLEANUP_INTERVAL_MS` set so expired peers get removed
-- tune `RATE_LIMIT_*` for your traffic
-- use a real `OPERATOR_XPUB` and keep the `xprv` offline
-
-And the obvious one: operators run their own exit, so the traffic leaving your box
-is your responsibility. This software doesn't route or proxy any of it for you.
+And the obvious thing: when you run an exit, the traffic leaving your server is your responsibility. This software does not route or proxy any of it for you, and it makes no promise of anonymity or legal protection.
