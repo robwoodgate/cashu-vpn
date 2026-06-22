@@ -44,17 +44,20 @@ const DEFAULT_LEASE_MS = 24 * 60 * 60 * 1000; // 1 day — short leases get eate
 const DEFAULT_PRICE_SATS = 1000;
 const DEFAULT_ORDER_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const DEFAULT_PROOF_COUNT_MARGIN = 4;
+const DEFAULT_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute — on by default so expired peers always get removed
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const mode = env.MODE === 'live' ? 'live' : 'dry-run';
 
-  const cleanupValue = env.CLEANUP_INTERVAL_MS;
-  let cleanupIntervalMs: number | undefined;
-  if (cleanupValue) {
-    cleanupIntervalMs = Number(cleanupValue);
-    if (!Number.isInteger(cleanupIntervalMs) || cleanupIntervalMs <= 0) {
-      throw new Error('CLEANUP_INTERVAL_MS must be a positive integer');
+  // Expired-peer cleanup runs in-process. On by default; set CLEANUP_INTERVAL_MS=0
+  // to disable. Any other non-negative integer overrides the interval.
+  let cleanupIntervalMs: number | undefined = DEFAULT_CLEANUP_INTERVAL_MS;
+  if (env.CLEANUP_INTERVAL_MS !== undefined && env.CLEANUP_INTERVAL_MS !== '') {
+    const parsed = Number(env.CLEANUP_INTERVAL_MS);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error('CLEANUP_INTERVAL_MS must be a non-negative integer (0 disables cleanup)');
     }
+    cleanupIntervalMs = parsed === 0 ? undefined : parsed;
   }
 
   const acceptedMints = env.ACCEPTED_MINTS

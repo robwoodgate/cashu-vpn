@@ -41,7 +41,7 @@ test('loadConfig returns dry-run defaults', () => {
   assert.equal(c.wgInterface, 'wg0');
   assert.equal(c.priceSats, 1000);
   assert.equal(c.leaseDurationMs, 24 * 60 * 60 * 1000);
-  assert.equal(c.cleanupIntervalMs, undefined);
+  assert.equal(c.cleanupIntervalMs, 60000); // on by default
   assert.deepEqual(c.acceptedMints, ['https://mint.minibits.cash/Bitcoin']);
 });
 
@@ -53,7 +53,7 @@ test('loadConfig reads env overrides', () => {
     WG_INTERFACE: 'wg1',
     PRICE_SATS: '500',
     LEASE_DURATION_MS: '7200000',
-    CLEANUP_INTERVAL_MS: '60000',
+    CLEANUP_INTERVAL_MS: '30000',
     ACCEPTED_MINTS: 'https://mint.a.com,https://mint.b.com',
     SERVER_PUBLIC_KEY: 'abc',
     WG_ENDPOINT: '1.2.3.4:51820',
@@ -62,8 +62,15 @@ test('loadConfig reads env overrides', () => {
   assert.equal(c.port, 4000);
   assert.equal(c.wgInterface, 'wg1');
   assert.equal(c.priceSats, 500);
-  assert.equal(c.cleanupIntervalMs, 60000);
+  assert.equal(c.cleanupIntervalMs, 30000); // explicit override
   assert.deepEqual(c.acceptedMints, ['https://mint.a.com', 'https://mint.b.com']);
+});
+
+test('CLEANUP_INTERVAL_MS=0 disables cleanup; invalid values are rejected', () => {
+  assert.equal(loadConfig({ CLEANUP_INTERVAL_MS: '0' }).cleanupIntervalMs, undefined);
+  assert.equal(loadConfig({ CLEANUP_INTERVAL_MS: '' }).cleanupIntervalMs, 60000); // empty → default
+  assert.throws(() => loadConfig({ CLEANUP_INTERVAL_MS: '-1' }), /non-negative integer/);
+  assert.throws(() => loadConfig({ CLEANUP_INTERVAL_MS: 'soon' }), /non-negative integer/);
 });
 
 // --- Allocator ---

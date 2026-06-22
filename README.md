@@ -142,7 +142,7 @@ Everything is configured with environment variables.
 | `PRICE_SATS` | `1000` | price per lease, roughly one US dollar a day at recent prices |
 | `MINT_UNIT` | `sat` | the Cashu unit |
 | `LEASE_DURATION_MS` | `86400000` | how long access lasts, one day by default |
-| `CLEANUP_INTERVAL_MS` | off | how often to remove expired peers |
+| `CLEANUP_INTERVAL_MS` | `60000` | how often to remove expired peers; set `0` to disable |
 | `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | `30` / `60000` | per-IP limit on `/purchase`; set max to 0 to disable |
 | `PUBLIC_BASE_URL` | from request | your public URL, used to tell wallets where to deliver payment |
 | `ORDER_TTL_MS` | `1800000` | how long an unpaid order stays valid, 30 minutes by default |
@@ -165,8 +165,8 @@ There is deliberately no endpoint that lists everyone's leases. Each order is pr
 ```
 buyer                              daemon                         mint
   │  POST /purchase (no payment)     │                             │
-  │ ───────────────────────────────►│  402 + orderId + request     │
-  │ ◄───────────────────────────────│  (locked to your key,        │
+  │ ───────────────────────────────► │  402 + orderId + request     │
+  │ ◄─────────────────────────────── │  (locked to your key,        │
   │                                  │   deliver to /pay/:orderId)  │
   │  pay LN invoice / mint ecash ───────────────────────────────► mint
   │  POST /pay/:orderId  {proofs} ──►│  verify offline, add peer    │
@@ -224,7 +224,7 @@ test/
 
 ## Before you run one for real
 
-This is FOSS and is not yet hardened for unattended public operation. Before you open it up, put it behind HTTPS and a process supervisor such as systemd, keep `CLEANUP_INTERVAL_MS` set so expired peers are removed, tune the rate limit for your traffic, and use a real `OPERATOR_XPUB` with the `xprv` kept offline.
+This is FOSS and is not yet hardened for unattended public operation. Before you open it up, put it behind HTTPS and a process supervisor such as systemd, tune the rate limit for your traffic, and use a real `OPERATOR_XPUB` with the `xprv` kept offline.
 
 And the obvious thing: when you run an exit, the traffic leaving your server is your responsibility. This software does not route or proxy any of it for you, and it makes no promise of anonymity or legal protection.
 
