@@ -54,6 +54,18 @@ export interface OrderStore {
   get(id: string, now?: Date): Promise<Order | undefined>;
   /** Atomically transition pending -> ready. Returns the updated order, or undefined if the id is unknown / not pending. */
   markReady(id: string, patch: ReadyPatch): Promise<Order | undefined>;
+  /**
+   * Forget orders that are well past their useful life: ready orders whose lease
+   * expired at/before `cutoff`, and pending orders whose request expired then.
+   * Returns how many were removed. Bounds the store so per-order writes stay small.
+   */
+  pruneExpiredBefore(cutoff: Date): Promise<number>;
+}
+
+/** The moment an order stops being useful: a ready order's lease end, else its request expiry. */
+function effectiveExpiry(order: Order): number {
+  const ts = order.status === 'ready' ? order.lease?.expiresAt ?? order.expiresAt : order.expiresAt;
+  return new Date(ts).getTime();
 }
 
 /** A fresh, URL-safe capability id with ~192 bits of entropy. */
@@ -107,6 +119,20 @@ function makeStore(records: Map<string, Order>, persist: (recs: Order[]) => Prom
         records.set(id, updated);
         await persist([...records.values()]);
         return { ...updated };
+      });
+    },
+
+    pruneExpiredBefore(cutoff) {
+      return queue(async () => {
+        let removed = 0;
+        for (const [id, order] of records) {
+          if (effectiveExpiry(order) <= cutoff.getTime()) {
+            records.delete(id);
+            removed++;
+          }
+        }
+        if (removed > 0) await persist([...records.values()]);
+        return removed;
       });
     },
   };

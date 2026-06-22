@@ -73,6 +73,13 @@ test('CLEANUP_INTERVAL_MS=0 disables cleanup; invalid values are rejected', () =
   assert.throws(() => loadConfig({ CLEANUP_INTERVAL_MS: 'soon' }), /non-negative integer/);
 });
 
+test('RETAIN_EXPIRED_MS defaults to 1 day; 0 keeps everything; invalid rejected', () => {
+  assert.equal(loadConfig({}).retainExpiredMs, 24 * 60 * 60 * 1000);
+  assert.equal(loadConfig({ RETAIN_EXPIRED_MS: '0' }).retainExpiredMs, 0);
+  assert.equal(loadConfig({ RETAIN_EXPIRED_MS: '3600000' }).retainExpiredMs, 3600000);
+  assert.throws(() => loadConfig({ RETAIN_EXPIRED_MS: '-5' }), /non-negative integer/);
+});
+
 // --- Allocator ---
 
 test('allocator produces deterministic IPs in valid range', () => {
@@ -144,6 +151,23 @@ test('file-backed ledger persists across instances', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('ledger pruneExpiredBefore forgets old leases, keeps recent/active', async () => {
+  const ledger = createMemoryLedger();
+  await ledger.record({
+    purchaseId: 'old', clientPublicKey: 'k', tunnelIp: '10.77.0.2',
+    createdAt: '2026-01-01T00:00:00Z', expiresAt: '2026-01-01T01:00:00Z', status: 'active',
+  });
+  await ledger.record({
+    purchaseId: 'recent', clientPublicKey: 'k', tunnelIp: '10.77.0.3',
+    createdAt: '2026-06-01T00:00:00Z', expiresAt: '2999-01-01T00:00:00Z', status: 'active',
+  });
+  const removed = await ledger.pruneExpiredBefore(new Date('2026-02-01T00:00:00Z'));
+  assert.equal(removed, 1);
+  const list = await ledger.list(new Date('2026-06-02T00:00:00Z'));
+  assert.equal(list.length, 1);
+  assert.equal(list[0]?.purchaseId, 'recent');
 });
 
 // --- WireGuard ---
@@ -792,6 +816,27 @@ test('order store: create, poll, markReady once, and prune expired pending', asy
     createdAt: past, expiresAt: past,
   });
   assert.equal(await store.get(expiredId), undefined);
+});
+
+test('order store pruneExpiredBefore forgets ready leases past cutoff, keeps live', async () => {
+  const store = createMemoryOrderStore();
+  const past = new Date(Date.now() - 1000).toISOString();
+  const future = new Date(Date.now() + 3600_000).toISOString();
+  // ready order whose lease already expired
+  await store.create({
+    id: newOrderId(), status: 'ready', clientPublicKey: 'k', lockPubkey: OP_PUBKEY,
+    createdAt: past, expiresAt: past,
+    lease: { purchaseId: 'p', clientPublicKey: 'k', tunnelIp: '10.77.0.2', createdAt: past, expiresAt: past, status: 'active' },
+  });
+  // pending order still within its request window
+  const live = newOrderId();
+  await store.create({
+    id: live, status: 'pending', clientPublicKey: 'k', lockPubkey: OP_PUBKEY,
+    createdAt: new Date().toISOString(), expiresAt: future,
+  });
+  const removed = await store.pruneExpiredBefore(new Date());
+  assert.equal(removed, 1);
+  assert.ok(await store.get(live)); // the live pending order survived
 });
 
 // --- Sweep (operator claims locked proofs offline) ---

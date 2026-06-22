@@ -24,6 +24,8 @@ export interface PeerLedger {
   list(now?: Date): Promise<PeerLease[]>;
   listExpiredActive(now: Date): Promise<PeerLease[]>;
   markExpired(purchaseId: string): Promise<void>;
+  /** Forget leases that expired at/before `cutoff`. Returns how many were removed. */
+  pruneExpiredBefore(cutoff: Date): Promise<number>;
 }
 
 // --- Allocator ---
@@ -74,6 +76,14 @@ export function createMemoryLedger(initial: PeerLease[] = []): PeerLedger {
           records[i] = { ...records[i], status: 'expired' };
         }
       }
+    },
+
+    async pruneExpiredBefore(cutoff) {
+      const before = records.length;
+      const kept = records.filter((r) => new Date(r.expiresAt).getTime() > cutoff.getTime());
+      records.length = 0;
+      records.push(...kept);
+      return before - records.length;
     }
   };
 }
@@ -106,6 +116,13 @@ export function createFileLedger(path: string): PeerLedger {
       await writeLedgerFile(path, records.map((r) =>
         r.purchaseId === purchaseId ? { ...r, status: 'expired' as const } : r
       ));
+    },
+
+    async pruneExpiredBefore(cutoff) {
+      const records = await readLedgerFile(path);
+      const kept = records.filter((r) => new Date(r.expiresAt).getTime() > cutoff.getTime());
+      if (kept.length !== records.length) await writeLedgerFile(path, kept);
+      return records.length - kept.length;
     }
   };
 }

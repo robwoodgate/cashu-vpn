@@ -51,14 +51,15 @@ export function createServer(deps: ServerDeps): http.Server {
 
   const ctx: Ctx = { ...deps, limiter, processing: new Set() };
 
-  // Cleanup interval
+  // Housekeeping interval: remove expired WireGuard peers, then forget records
+  // whose lease expired more than retainExpiredMs ago. Pruning keeps the lease
+  // ledger and order store small so per-purchase writes (which rewrite the whole
+  // file) stay cheap.
   let cleanupTimer: NodeJS.Timeout | undefined;
   if (config.cleanupIntervalMs) {
     const intervalMs = config.cleanupIntervalMs;
     cleanupTimer = setInterval(() => {
-      cleanupExpiredPeers(deps.ledger, config.wgInterface, config.mode === 'dry-run').catch((e) => {
-        console.error('cleanup failed:', e instanceof Error ? e.message : e);
-      });
+      void housekeep(ctx);
     }, intervalMs);
     cleanupTimer.unref();
   }
@@ -72,6 +73,29 @@ export function createServer(deps: ServerDeps): http.Server {
   });
 
   return server;
+}
+
+// One housekeeping pass: remove expired peers, then forget records older than the
+// retention window so the lease ledger and order store don't grow unbounded.
+async function housekeep(ctx: Ctx): Promise<void> {
+  const { config, ledger, orderStore } = ctx;
+  try {
+    await cleanupExpiredPeers(ledger, config.wgInterface, config.mode === 'dry-run');
+  } catch (e) {
+    console.error('peer cleanup failed:', e instanceof Error ? e.message : e);
+  }
+  if (config.retainExpiredMs > 0) {
+    const cutoff = new Date(Date.now() - config.retainExpiredMs);
+    try {
+      const [peers, orders] = await Promise.all([
+        ledger.pruneExpiredBefore(cutoff),
+        orderStore.pruneExpiredBefore(cutoff),
+      ]);
+      if (peers || orders) console.log(`pruned ${peers} expired lease(s), ${orders} order(s)`);
+    } catch (e) {
+      console.error('retention prune failed:', e instanceof Error ? e.message : e);
+    }
+  }
 }
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx): Promise<void> {

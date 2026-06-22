@@ -8,6 +8,12 @@ export interface Config {
   peerLedgerPath?: string;
   leaseDurationMs: number;
   cleanupIntervalMs?: number;
+  /**
+   * How long to keep expired leases/orders before the cleanup tick forgets them.
+   * Bounds the lease ledger and order store so per-purchase writes (which rewrite
+   * the whole file) stay small. 0 keeps everything forever.
+   */
+  retainExpiredMs: number;
   acceptedMints: string[];
   priceSats: number;
   unit: string;
@@ -45,6 +51,7 @@ const DEFAULT_PRICE_SATS = 1000;
 const DEFAULT_ORDER_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const DEFAULT_PROOF_COUNT_MARGIN = 4;
 const DEFAULT_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute — on by default so expired peers always get removed
+const DEFAULT_RETAIN_EXPIRED_MS = 24 * 60 * 60 * 1000; // keep expired records 1 day, then forget (bounds file growth)
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const mode = env.MODE === 'live' ? 'live' : 'dry-run';
@@ -58,6 +65,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       throw new Error('CLEANUP_INTERVAL_MS must be a non-negative integer (0 disables cleanup)');
     }
     cleanupIntervalMs = parsed === 0 ? undefined : parsed;
+  }
+
+  // How long expired records are kept before the cleanup tick forgets them.
+  // 0 keeps everything. Bounds file growth (each purchase rewrites the file).
+  let retainExpiredMs = DEFAULT_RETAIN_EXPIRED_MS;
+  if (env.RETAIN_EXPIRED_MS !== undefined && env.RETAIN_EXPIRED_MS !== '') {
+    const parsed = Number(env.RETAIN_EXPIRED_MS);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error('RETAIN_EXPIRED_MS must be a non-negative integer (0 keeps everything)');
+    }
+    retainExpiredMs = parsed;
   }
 
   const acceptedMints = env.ACCEPTED_MINTS
@@ -74,6 +92,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     peerLedgerPath: env.PEER_LEDGER_PATH,
     leaseDurationMs: Number(env.LEASE_DURATION_MS ?? DEFAULT_LEASE_MS),
     cleanupIntervalMs,
+    retainExpiredMs,
     acceptedMints,
     priceSats: Number(env.PRICE_SATS ?? DEFAULT_PRICE_SATS),
     unit: env.MINT_UNIT ?? 'sat',

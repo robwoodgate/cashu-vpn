@@ -144,7 +144,8 @@ Everything is configured with environment variables.
 | `PRICE_SATS` | `1000` | price per lease, roughly one US dollar a day at recent prices |
 | `MINT_UNIT` | `sat` | the Cashu unit |
 | `LEASE_DURATION_MS` | `86400000` | how long access lasts, one day by default |
-| `CLEANUP_INTERVAL_MS` | `60000` | how often to remove expired peers; set `0` to disable |
+| `CLEANUP_INTERVAL_MS` | `60000` | how often to remove expired peers and run retention; set `0` to disable |
+| `RETAIN_EXPIRED_MS` | `86400000` (1 day) | how long expired leases/orders are kept before they are forgotten; `0` keeps everything |
 | `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | `30` / `60000` | per-IP limit on `/purchase`; set max to 0 to disable |
 | `PUBLIC_BASE_URL` | from request | your public URL, used to tell wallets where to deliver payment |
 | `ORDER_TTL_MS` | `1800000` | how long an unpaid order stays valid, 30 minutes by default |
