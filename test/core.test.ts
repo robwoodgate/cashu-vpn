@@ -486,6 +486,15 @@ test('normalizeMintUrl strips trailing slashes', () => {
   assert.equal(normalizeMintUrl('  https://mint.example.com///  '), 'https://mint.example.com');
 });
 
+test('normalizeMintUrl is idempotent (safe to call twice)', () => {
+  // A normalize fn that isn't idempotent corrupts already-normalized input on a
+  // re-pass — the trap that bit normalizePubkey. Pin normalize(normalize(x)) === normalize(x).
+  for (const raw of ['https://mint.example.com///', '  https://mint.example.com/  ', 'https://mint.example.com', '']) {
+    const once = normalizeMintUrl(raw);
+    assert.equal(normalizeMintUrl(once), once);
+  }
+});
+
 const OP_PUBKEY = '02' + 'a'.repeat(64);
 
 test('buildPaymentRequest produces a decodable creqA locked to the pubkey', () => {
