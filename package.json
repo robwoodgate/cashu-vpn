@@ -26,7 +26,7 @@
   "scripts": {
     "build": "tsc --project tsconfig.json && npm run build:client",
     "build:client": "esbuild src/client.ts --bundle --minify --format=iife --platform=browser --outfile=dist/public/client.js",
-    "test": "npm run build --silent && node --test dist/test/**/*.test.js",
+    "test": "npm run build --silent && node --test $(find dist/test -name '*.test.js')",
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "start": "node dist/src/main.js",
