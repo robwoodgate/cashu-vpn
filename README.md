@@ -96,6 +96,12 @@ sudo scripts/install-systemd.sh
 
 That is it. If you would rather wire up TLS yourself, leave `DOMAIN` blank: the daemon listens on `127.0.0.1:3087`, so point any reverse proxy at it over HTTPS. Browsers need HTTPS for the in-page key generation, and `PUBLIC_BASE_URL` must be your public address so paying wallets know where to deliver.
 
+To update later, pull and restart in one step from the repo on the server:
+
+```bash
+npm run update
+```
+
 ## Getting paid
 
 Everything you earn is stored as ecash locked to your offline key. The server only ever holds the watch-only `xpub` and a list of locked receipts in `state/proofs.json`, so there is nothing on it worth stealing. Claiming is a quick step you run on your own computer, where the `xprv` lives.
@@ -219,6 +225,7 @@ test/
 | `npm run build` | compile the daemon and bundle the browser client |
 | `npm test` / `npm run lint` / `npm run typecheck` | the checks |
 | `npm start` | run the daemon |
+| `npm run update` | pull latest, reinstall, rebuild, restart the service (run on the server) |
 | `npm run keygen` | generate an operator xpub/xprv pair (run offline) |
 | `npm run discover [iface] [host]` | read key, port, and endpoint off a live interface |
 | `npm run sweep:remote user@host` | pull receipts, claim them locally, and prune the server |
