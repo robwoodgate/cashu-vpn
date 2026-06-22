@@ -227,11 +227,13 @@ test('generateClientConfig dry-run vs live', () => {
 
   const live = generateClientConfig({
     tunnelIp: '10.77.0.42', serverPublicKey: 'SPK', endpoint: '1.2.3.4:51820',
-    purchaseId: 'p1', dryRun: false,
+    purchaseId: 'p1', dryRun: false, dns: ['1.1.1.1'],
   });
   assert.doesNotMatch(live, /dry-run/);
   assert.match(live, /PublicKey = SPK/);
   assert.match(live, /Endpoint = 1\.2\.3\.4:51820/);
+  // Full-tunnel config must carry a DNS line, or names won't resolve client-side.
+  assert.match(live, /DNS = 1\.1\.1\.1/);
 });
 
 // --- HTTP server ---

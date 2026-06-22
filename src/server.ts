@@ -442,6 +442,7 @@ async function provisionPeer(
     endpoint: config.endpoint,
     purchaseId,
     dryRun: config.mode === 'dry-run',
+    dns: config.dns,
   });
 
   return { purchaseId, tunnelIp, amountSats: payment?.amountSats, lease, clientConfig };

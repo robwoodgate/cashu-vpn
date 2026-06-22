@@ -5,6 +5,14 @@ export interface Config {
   wgInterface: string;
   serverPublicKey: string;
   endpoint: string;
+  /**
+   * DNS resolver(s) written into the buyer's WireGuard config. Required for a
+   * full-tunnel (AllowedIPs = 0.0.0.0/0) config to actually work: without it the
+   * client keeps its LAN resolver, which is unreachable through the tunnel, so
+   * names stop resolving and it looks like "connected but no internet". Defaults
+   * to a public privacy-respecting resolver; override with WG_DNS.
+   */
+  dns: string[];
   peerLedgerPath?: string;
   leaseDurationMs: number;
   cleanupIntervalMs?: number;
@@ -82,6 +90,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     retainExpiredMs = parsed;
   }
 
+  // DNS resolver(s) for the buyer config. Default Cloudflare 1.1.1.1: fastest
+  // public resolver, unfiltered, no-log (audited). Queries exit masqueraded
+  // behind the box's IP, so they aren't tied to the buyer. Comma-separated to
+  // set several; override with WG_DNS.
+  const dns = (env.WG_DNS ?? '1.1.1.1')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
   const acceptedMints = env.ACCEPTED_MINTS
     ? env.ACCEPTED_MINTS.split(',').map((m) => m.trim()).filter(Boolean)
     : ['https://mint.minibits.cash/Bitcoin'];
@@ -93,6 +110,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     wgInterface: env.WG_INTERFACE ?? 'wg0',
     serverPublicKey: env.SERVER_PUBLIC_KEY ?? '',
     endpoint: env.WG_ENDPOINT ?? '',
+    dns,
     peerLedgerPath: env.PEER_LEDGER_PATH,
     leaseDurationMs: Number(env.LEASE_DURATION_MS ?? DEFAULT_LEASE_MS),
     cleanupIntervalMs,

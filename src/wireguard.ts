@@ -151,12 +151,19 @@ export function generateClientConfig(opts: {
   endpoint: string;
   purchaseId: string;
   dryRun: boolean;
+  dns?: string[];
 }): string {
+  // Full-tunnel (AllowedIPs = 0.0.0.0/0) needs an explicit DNS line, or the
+  // client keeps its LAN resolver — unreachable through the tunnel — and name
+  // resolution silently dies ("connected but no internet").
+  const dnsLine = opts.dns && opts.dns.length > 0 ? `DNS = ${opts.dns.join(', ')}` : undefined;
+
   if (opts.dryRun) {
     return [
       '# dry-run WireGuard client config preview',
       '[Interface]',
       `Address = ${opts.tunnelIp}/32`,
+      ...(dnsLine ? [dnsLine] : []),
       '# PrivateKey = <generate locally>',
       '',
       '[Peer]',
@@ -170,6 +177,7 @@ export function generateClientConfig(opts: {
   return [
     '[Interface]',
     `Address = ${opts.tunnelIp}/32`,
+    ...(dnsLine ? [dnsLine] : []),
     '# PrivateKey = <generate locally>',
     '',
     '[Peer]',
