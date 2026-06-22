@@ -6,7 +6,7 @@
 # that gets a host account suspended — outbound spam (SMTP), port scanning,
 # SSH/RDP brute-forcing, and most torrenting — while normal web browsing keeps
 # working. It does NOT stop bad things done over HTTPS itself; pair it with an
-# upstream VPN (e.g. an upstream VPN) if you want that residual risk off your host too.
+# upstream VPN (see scripts/upstream-egress.sh) if you want that risk off your host too.
 #
 # This only touches FORWARD (routed buyer traffic). It never affects the box's
 # own SSH/HTTP/daemon (those are INPUT/OUTPUT), so it can't lock you out.

@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
-# Route buyer egress through an upstream WireGuard VPN (e.g. an upstream VPN), so abuse
-# complaints about buyer traffic land on the upstream provider instead of your
-# host. Only the buyer subnet is sent through the upstream; the box's own traffic
-# (SSH, the daemon, Caddy) stays on the normal default route. If the upstream
-# tunnel drops, buyer traffic is blackholed (killswitch) rather than leaking out
-# your host's real IP.
+# Route buyer egress through a separate upstream WireGuard VPN, so abuse
+# complaints about buyer traffic land on the upstream instead of your host. Only
+# the buyer subnet is sent through the upstream; the box's own traffic (SSH, the
+# daemon, Caddy) stays on the normal default route. If the upstream tunnel drops,
+# buyer traffic is blackholed (killswitch) rather than leaking out your host's IP.
 #
-# This is provider-agnostic — it works with any WireGuard upstream (an upstream VPN, an upstream VPN,
-# a second VPS you run). You supply the tunnel; this just steers the buyer subnet.
+# This is provider-agnostic — it works with any WireGuard upstream. You supply the
+# tunnel; this just steers the buyer subnet. Make sure your upstream's terms of
+# service permit this kind of use; running your own second VPS as the upstream
+# avoids the question entirely.
 #
 # PREREQUISITE — bring the upstream tunnel up WITHOUT hijacking the box's routes:
-#   1. Get a WireGuard config from your provider (an upstream VPN: Account → WireGuard).
+#   1. Get a WireGuard config for your upstream and save it (e.g.
+#      /etc/wireguard/upstream.conf).
 #   2. Add `Table = off` under its [Interface]. This is essential: otherwise
 #      wg-quick installs a default route that sends the WHOLE box (including your
 #      SSH session) through the VPN. `Table = off` lets the tunnel come up while
 #      this script decides what actually uses it.
-#   3. wg-quick up <iface>   (e.g. save as /etc/wireguard/upstream.conf, then
-#      `wg-quick up upstream`)
+#   3. wg-quick up upstream   (use whatever you named the interface)
 #   4. Run this script with that interface name.
 #
 # Buyer packets are SNATed as they leave the upstream interface by the existing

@@ -216,7 +216,7 @@ scripts/
   install-systemd.sh   install as a systemd service (+ optional Caddy site)
   update.sh            pull, reinstall, rebuild, restart (npm run update)
   egress-filter.sh     restrict buyer egress to DNS + web + ICMP
-  upstream-egress.sh   route buyer egress through an upstream VPN (e.g. an upstream VPN)
+  upstream-egress.sh   route buyer egress through an upstream WireGuard VPN
   sweep-remote.sh      pull receipts, sweep locally, prune the server
 test/
   core.test.ts         unit and HTTP tests (npm test)
@@ -243,7 +243,7 @@ This is FOSS and is not yet hardened for unattended public operation. Before you
 
 And the obvious thing: when you run an exit, the traffic leaving your server is your responsibility. This software does not route or proxy any of it for you, and it makes no promise of anonymity or legal protection.
 
-**Limiting exit abuse.** Because buyers exit from your IP, you'll want to bound what they can do. `scripts/egress-filter.sh` restricts buyer egress to DNS + HTTP/HTTPS + ICMP, which removes the abuse that gets host accounts suspended (outbound spam, port scanning, brute-forcing, most torrenting) while normal browsing keeps working. For stronger insulation, `scripts/upstream-egress.sh` routes the buyer subnet out through an upstream WireGuard VPN (an upstream VPN, an upstream VPN, or your own) — abuse complaints then land on the upstream provider, not your host, and a killswitch drops buyer traffic if that tunnel goes down so nothing leaks out your real IP. The two stack. A `NOTICE` / `TERMS_URL` can also state your acceptable-use policy on the page.
+**Limiting exit abuse.** Because buyers exit from your IP, you'll want to bound what they can do. `scripts/egress-filter.sh` restricts buyer egress to DNS + HTTP/HTTPS + ICMP, which removes the abuse that gets host accounts suspended (outbound spam, port scanning, brute-forcing, most torrenting) while normal browsing keeps working. For stronger insulation, `scripts/upstream-egress.sh` routes the buyer subnet out through a separate upstream WireGuard VPN — abuse complaints then land on that upstream rather than your host, and a killswitch drops buyer traffic if the tunnel goes down so nothing leaks out your real IP. Use an upstream whose terms permit this (running your own second VPS avoids any question). The two stack. A `NOTICE` / `TERMS_URL` can also state your acceptable-use policy on the page.
 
 ## License
 
