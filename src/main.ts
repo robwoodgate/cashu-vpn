@@ -6,6 +6,13 @@ import { createLockBook, type LockBook } from './locks.js';
 import { createServer } from './server.js';
 
 const config = loadConfig();
+
+// Fail fast rather than sell a dead config: live mode hands the buyer a .conf
+// built from these, and a blank PublicKey/Endpoint connects to nothing.
+if (config.mode === 'live' && (!config.serverPublicKey || !config.endpoint)) {
+  throw new Error('live mode requires SERVER_PUBLIC_KEY and WG_ENDPOINT (run `npm run discover`)');
+}
+
 const allocator = createAllocator();
 const ledger = config.peerLedgerPath
   ? createFileLedger(config.peerLedgerPath)

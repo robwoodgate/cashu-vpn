@@ -13,6 +13,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { deriveChildPubkey } from './hdkeys.js';
 import { normalizePubkey } from './cashu.js';
+import { serialize } from './serialize.js';
 
 export interface IssuedLock {
   index: number;
@@ -36,14 +37,22 @@ export async function createLockBook(xpub: string, counterPath?: string): Promis
     indexByPubkey.set(normalizePubkey(deriveChildPubkey(xpub, i)), i);
   }
 
+  // Serialize issuance so concurrent /purchase hits can't race the counter write:
+  // two unserialized writeCounter() calls share one tmp path and can ENOENT on
+  // rename or persist a counter below the highest index issued (stranding a later
+  // payment as lock_not_recognized after a restart).
+  const mutate = serialize();
+
   return {
-    async issue() {
-      const index = counter;
-      const pubkey = deriveChildPubkey(xpub, index);
-      counter += 1;
-      await writeCounter(counterPath, counter);
-      indexByPubkey.set(normalizePubkey(pubkey), index);
-      return { index, pubkey };
+    issue() {
+      return mutate(async () => {
+        const index = counter;
+        const pubkey = deriveChildPubkey(xpub, index);
+        counter += 1;
+        await writeCounter(counterPath, counter);
+        indexByPubkey.set(normalizePubkey(pubkey), index);
+        return { index, pubkey };
+      });
     },
     resolve(pubkey) {
       return indexByPubkey.get(normalizePubkey(pubkey));
