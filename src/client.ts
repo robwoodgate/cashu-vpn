@@ -70,11 +70,38 @@ function setMsg(text: string, cls = ''): void {
   m.textContent = text;
 }
 
-function renderQR(elId: string, text: string): void {
+async function copyToClipboard(text: string): Promise<boolean> {
+  if (!text) return false;
+  try { await navigator.clipboard.writeText(text); return true; } catch { return false; }
+}
+
+// Flash a button's label to confirm a copy, then restore it.
+function flashButton(b: HTMLButtonElement): void {
+  const prev = b.textContent;
+  b.textContent = 'Copied!';
+  setTimeout(() => { b.textContent = prev; }, 1200);
+}
+
+// Render a QR, and make the whole code click-to-copy. `qrText` is what the QR
+// encodes; `copyText` is what gets copied (defaults to the same — they differ for
+// the Lightning invoice, whose QR is uppercased for density but copies as-is).
+function renderQR(elId: string, qrText: string, copyText: string = qrText): void {
   const qr = qrcode(0, 'M');
-  qr.addData(text);
+  qr.addData(qrText);
   qr.make();
-  $(elId).innerHTML = qr.createImgTag(4, 8);
+  const el = $(elId);
+  el.innerHTML = qr.createImgTag(4, 8);
+  el.title = 'Click to copy';
+  el.style.cursor = 'pointer';
+  el.onclick = async () => {
+    if (!(await copyToClipboard(copyText))) { setMsg('Copy failed — select the text and copy manually.', 'err'); return; }
+    setMsg('Copied to clipboard.', 'ok');
+    const note = document.createElement('div');
+    note.textContent = 'Copied!';
+    note.style.cssText = 'color:var(--good);font-size:.8rem;margin-top:4px';
+    el.appendChild(note);
+    setTimeout(() => note.remove(), 1200);
+  };
 }
 
 function injectPriv(clientConfig: string, privKey: string): string {
@@ -184,7 +211,7 @@ btn('lnbtn').onclick = async () => {
     const quote = await w.createMintQuoteBolt11(challenge.amount);
     if (quote.request) {
       $('lninvoice').textContent = quote.request;
-      renderQR('qrln', quote.request.toUpperCase()); // bolt11 QR is uppercased for density
+      renderQR('qrln', quote.request.toUpperCase(), quote.request); // QR uppercased for density; copy keeps original case
     }
     setMsg('Waiting for Lightning payment…');
     const paid = await waitForPaid(w, quote.quote, { intervalMs: 2000, tries: 150 });
@@ -209,8 +236,8 @@ btn('lnbtn').onclick = async () => {
   btn('lnbtn').disabled = false;
 };
 
-btn('copyreq').onclick = () => void navigator.clipboard?.writeText($('creq').textContent ?? '');
-btn('copyln').onclick = () => void navigator.clipboard?.writeText($('lninvoice').textContent ?? '');
+btn('copyreq').onclick = async () => { if (await copyToClipboard($('creq').textContent ?? '')) flashButton(btn('copyreq')); };
+btn('copyln').onclick = async () => { if (await copyToClipboard($('lninvoice').textContent ?? '')) flashButton(btn('copyln')); };
 
 // Poll an order until it is ready (or gone). Many can run at once; dedup by id.
 async function poll(id: string): Promise<void> {
