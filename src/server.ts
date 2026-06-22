@@ -650,6 +650,7 @@ function renderPage(config: Config): string {
       <p style="margin-top:12px">To connect, install the free <a href="https://www.wireguard.com/install/" target="_blank" rel="noopener">WireGuard app</a> (macOS, Windows, Linux, iOS, Android — it is not built into your OS VPN settings). Open it, choose <strong>Import tunnel from file</strong>, and pick the <code>.conf</code> you downloaded — then activate it.</p>
       <p style="margin-top:8px">On a phone, scan this in the WireGuard app instead:</p>
       <div id="qrcfg" class="qr"></div>
+      <p style="margin-top:10px">If a tunnel ever stops passing traffic — for example once its lease expires — switch it off in the WireGuard app to restore your connection.</p>
     </div>
   </div>
 

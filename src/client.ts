@@ -239,8 +239,10 @@ function renderAccess(): void {
     if (o.status !== 'ready') {
       status = '<small>waiting for payment…</small>';
     } else if (when && when.getTime() <= now) {
-      status = '<small class="expired">expired' + ' ' + esc(when.toLocaleString()) + '</small>';
-      action = '<button class="ghost dlacc" data-id="' + esc(o.id) + '" type="button">Download</button>';
+      // Expired: the peer is gone server-side, so the old config is dead. Offer a
+      // fresh purchase rather than a download that can't connect.
+      status = '<small class="expired">expired ' + esc(when.toLocaleString()) + '</small>';
+      action = '<button class="buyagain" type="button">Buy again</button>';
     } else {
       status = '<small>active' + (when ? ' until ' + esc(when.toLocaleString()) : '') + '</small>';
       action = '<button class="ghost dlacc" data-id="' + esc(o.id) + '" type="button">Download</button>';
@@ -252,6 +254,13 @@ function renderAccess(): void {
       const id = (b as HTMLElement).dataset.id ?? '';
       const rec = loadOrders().find((o) => o.id === id);
       if (rec?.conf) { showConfig(rec.conf, id, rec.tunnelIp, rec.expiresAt); download(rec.conf, id); }
+    });
+  });
+  // "Buy again" starts a brand-new purchase (fresh key + lease), not a renewal.
+  el.querySelectorAll('.buyagain').forEach((b) => {
+    b.addEventListener('click', () => {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      btn('buy').click();
     });
   });
 }
