@@ -149,6 +149,8 @@ Everything is configured with environment variables.
 | `ACCEPTED_MINTS` | minibits | comma-separated list of mint URLs you accept |
 | `PRICE_SATS` | `1000` | price per lease, roughly one US dollar a day at recent prices |
 | `MINT_UNIT` | `sat` | the Cashu unit |
+| `NOTICE` | — | optional operator notice (MOTD) shown on the page and in `/info` |
+| `TERMS_URL` | — | optional acceptable-use / terms URL, linked on the page and in `/info` |
 | `LEASE_DURATION_MS` | `86400000` | how long access lasts, one day by default |
 | `CLEANUP_INTERVAL_MS` | `60000` | how often to remove expired peers and run retention; set `0` to disable |
 | `RETAIN_EXPIRED_MS` | `86400000` (1 day) | how long expired leases/orders are kept before they are forgotten; `0` keeps everything |
@@ -212,6 +214,8 @@ src/
   sweep.ts      offline sweep and prune
 scripts/
   install-systemd.sh   install as a systemd service (+ optional Caddy site)
+  update.sh            pull, reinstall, rebuild, restart (npm run update)
+  egress-filter.sh     restrict buyer egress to DNS + web + ICMP
   sweep-remote.sh      pull receipts, sweep locally, prune the server
 test/
   core.test.ts         unit and HTTP tests (npm test)
@@ -237,6 +241,8 @@ test/
 This is FOSS and is not yet hardened for unattended public operation. Before you open it up, put it behind HTTPS and a process supervisor such as systemd, tune the rate limit for your traffic, and use a real `OPERATOR_XPUB` with the `xprv` kept offline.
 
 And the obvious thing: when you run an exit, the traffic leaving your server is your responsibility. This software does not route or proxy any of it for you, and it makes no promise of anonymity or legal protection.
+
+**Limiting exit abuse.** Because buyers exit from your IP, you'll want to bound what they can do. `scripts/egress-filter.sh` restricts buyer egress to DNS + HTTP/HTTPS + ICMP, which removes the abuse that gets host accounts suspended (outbound spam, port scanning, brute-forcing, most torrenting) while normal browsing keeps working. For stronger insulation, route the box's egress through an upstream VPN so complaints land there instead of your host. A `NOTICE` / `TERMS_URL` can also state your acceptable-use policy on the page.
 
 ## License
 

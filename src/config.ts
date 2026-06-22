@@ -17,6 +17,10 @@ export interface Config {
   acceptedMints: string[];
   priceSats: number;
   unit: string;
+  /** Optional operator notice (MOTD) shown on the buyer page and in /info. */
+  notice?: string;
+  /** Optional acceptable-use / terms URL, linked on the buyer page and in /info. */
+  termsUrl?: string;
   /**
    * Externally reachable base URL (behind TLS), used to build the NUT-18 POST
    * transport target a paying wallet hits (`<base>/pay/:orderId`). When unset it
@@ -96,6 +100,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     acceptedMints,
     priceSats: Number(env.PRICE_SATS ?? DEFAULT_PRICE_SATS),
     unit: env.MINT_UNIT ?? 'sat',
+    notice: env.NOTICE || undefined,
+    termsUrl: env.TERMS_URL || undefined,
     publicBaseUrl: env.PUBLIC_BASE_URL ? env.PUBLIC_BASE_URL.replace(/\/+$/, '') : undefined,
     orderStorePath: env.ORDERS_PATH,
     orderTtlMs: Number(env.ORDER_TTL_MS ?? DEFAULT_ORDER_TTL_MS),

@@ -324,6 +324,29 @@ test('GET /marketplace returns HTML page', async () => {
   });
 });
 
+test('NOTICE and TERMS_URL surface on the page and in /info', async () => {
+  const env = { NOTICE: 'Demo node — be nice', TERMS_URL: 'https://example.com/terms' };
+  await withServer(async (url) => {
+    const info = await (await fetch(`${url}/info`)).json();
+    assert.equal(info.notice, 'Demo node — be nice');
+    assert.equal(info.termsUrl, 'https://example.com/terms');
+    const html = await (await fetch(url)).text();
+    assert.match(html, /Demo node — be nice/);
+    assert.match(html, /href="https:\/\/example\.com\/terms"/);
+  }, env);
+});
+
+test('no notice/terms shown when unset', async () => {
+  await withServer(async (url) => {
+    const info = await (await fetch(`${url}/info`)).json();
+    assert.equal(info.notice, undefined);
+    assert.equal(info.termsUrl, undefined);
+    const html = await (await fetch(url)).text();
+    assert.doesNotMatch(html, /class="panel notice"/);
+    assert.doesNotMatch(html, /Terms of use/);
+  });
+});
+
 test('GET /client.js serves the esbuild bundle', async () => {
   await withServer(async (url) => {
     const res = await fetch(`${url}/client.js`);

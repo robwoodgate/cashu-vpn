@@ -116,6 +116,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
         leaseDuration: `${config.leaseDurationMs / 1000}s`,
         acceptedMints: config.acceptedMints,
         lock: ctx.lockBook ? 'xpub-per-tx' : config.operatorPubkey ? 'fixed-pubkey' : 'none',
+        notice: config.notice,
+        termsUrl: config.termsUrl,
       });
     }
 
@@ -620,6 +622,7 @@ function renderPage(config: Config): string {
     .qr { margin-top: 10px; }
     .qr img { background: #fff; padding: 8px; border-radius: 8px; display: block; width: 240px; max-width: 100%; height: auto; image-rendering: pixelated; }
     a { color: var(--accent); }
+    .notice { border-color: var(--accent); color: var(--text); white-space: pre-wrap; }
     code { background: #080b10; border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font-size: .85em; }
     .acc small.expired { color: var(--warn); }
     @media (max-width: 600px) { .facts { grid-template-columns: 1fr; } }
@@ -637,6 +640,8 @@ function renderPage(config: Config): string {
     <div class="fact"><span>Payment</span><strong>Cashu ecash</strong></div>
     <div class="fact"><span>Protocol</span><strong>WireGuard</strong></div>
   </div>
+${config.notice ? `
+  <div class="panel notice">${esc(config.notice)}</div>` : ''}
 
   <div class="panel">
     <h2>Get connected</h2>
@@ -682,6 +687,8 @@ function renderPage(config: Config): string {
     <h2>Your access</h2>
     <div id="access"><div class="empty">No access yet.</div></div>
   </div>
+${config.termsUrl ? `
+  <p style="text-align:center;margin-top:18px"><a href="${esc(config.termsUrl)}" target="_blank" rel="noopener">Terms of use</a></p>` : ''}
 </main>
 <script src="/client.js"></script>
 </body></html>`;
