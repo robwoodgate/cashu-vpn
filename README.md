@@ -107,9 +107,10 @@ private key never leaves the page) and shows two ways to pay:
 The page finishes on its own and hands over a ready-to-use `.conf`. Past orders
 stay under **Your access** in that browser so they can be re-downloaded.
 
-> Heads up: Cashu-wallet support for the locked payment request is still patchy
-> (cashu.me, for one, doesn't lock proofs yet). The Lightning option is the
-> reliable path for everyone today.
+> Note: paying from a Cashu wallet needs one that locks its proofs to the
+> request's NUT-11 key — e.g. [cashu.me](https://cashu.me) on cashu-ts ≥ 4.6.0.
+> Wallets that ignore the lock will fail (the daemon won't accept unlocked ecash);
+> the Lightning option works with any wallet.
 
 ## Configuration
 
