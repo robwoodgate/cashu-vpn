@@ -94,11 +94,12 @@ function renderQR(elId: string, qrText: string, copyText: string = qrText): void
   el.title = 'Click to copy';
   el.style.cursor = 'pointer';
   el.onclick = async () => {
-    if (!(await copyToClipboard(copyText))) { setMsg('Copy failed — select the text and copy manually.', 'err'); return; }
-    setMsg('Copied to clipboard.', 'ok');
+    const ok = await copyToClipboard(copyText);
+    el.querySelectorAll('.qrnote').forEach((n) => n.remove()); // no stacking on repeat clicks
     const note = document.createElement('div');
-    note.textContent = 'Copied!';
-    note.style.cssText = 'color:var(--good);font-size:.8rem;margin-top:4px';
+    note.className = 'qrnote';
+    note.textContent = ok ? 'Copied!' : 'Copy failed — select and copy manually';
+    note.style.cssText = 'color:var(--' + (ok ? 'good' : 'warn') + ');font-size:.8rem;margin-top:4px';
     el.appendChild(note);
     setTimeout(() => note.remove(), 1200);
   };
