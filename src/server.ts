@@ -598,6 +598,9 @@ function esc(s: string): string {
 
 function renderPage(config: Config): string {
   const price = `${config.priceSats} sats / ${config.leaseDurationMs / 3600000}h`;
+  // Subheader carries the cap so it isn't just a duplicate of the Price fact.
+  const capGb = config.leaseDataCapBytes > 0 ? config.leaseDataCapBytes / 1024 ** 3 : 0;
+  const headline = capGb ? `${price} (${+capGb.toFixed(1)} GB max)` : price;
   const isDryRun = config.mode === 'dry-run';
 
   return `<!doctype html>
@@ -645,7 +648,7 @@ function renderPage(config: Config): string {
 <body>
 <main>
   <div class="hdr">
-    <div><h1>Cashu VPN</h1><p>${esc(price)}</p></div>
+    <div><h1>Cashu VPN</h1><p>${esc(headline)}</p></div>
     <span class="pill">${isDryRun ? 'Dry-run' : 'Live'}</span>
   </div>
 
