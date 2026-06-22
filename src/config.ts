@@ -15,6 +15,13 @@ export interface Config {
   dns: string[];
   peerLedgerPath?: string;
   leaseDurationMs: number;
+  /**
+   * Per-lease cumulative data cap in bytes (rx + tx). Once a buyer reaches it the
+   * cleanup tick disconnects them, same as expiry — bounds how much a single
+   * lease can bill against the host's egress allowance (e.g. Hetzner's ~20 TB/mo).
+   * 0 disables the cap.
+   */
+  leaseDataCapBytes: number;
   cleanupIntervalMs?: number;
   /**
    * How long to keep expired leases/orders before the cleanup tick forgets them.
@@ -99,6 +106,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     .map((s) => s.trim())
     .filter(Boolean);
 
+  // Per-lease data cap. Default 50 GiB; set LEASE_DATA_CAP_GB=0 to disable.
+  let leaseDataCapBytes = 50 * 1024 ** 3;
+  if (env.LEASE_DATA_CAP_GB !== undefined && env.LEASE_DATA_CAP_GB !== '') {
+    const gb = Number(env.LEASE_DATA_CAP_GB);
+    if (!Number.isFinite(gb) || gb < 0) {
+      throw new Error('LEASE_DATA_CAP_GB must be a non-negative number (0 disables the cap)');
+    }
+    leaseDataCapBytes = Math.round(gb * 1024 ** 3);
+  }
+
   const acceptedMints = env.ACCEPTED_MINTS
     ? env.ACCEPTED_MINTS.split(',').map((m) => m.trim()).filter(Boolean)
     : ['https://mint.minibits.cash/Bitcoin'];
@@ -113,6 +130,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     dns,
     peerLedgerPath: env.PEER_LEDGER_PATH,
     leaseDurationMs: Number(env.LEASE_DURATION_MS ?? DEFAULT_LEASE_MS),
+    leaseDataCapBytes,
     cleanupIntervalMs,
     retainExpiredMs,
     acceptedMints,

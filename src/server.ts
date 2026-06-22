@@ -8,7 +8,7 @@ import type { ProofStore } from './wallet.js';
 import type { LockBook } from './locks.js';
 import { newOrderId, type Order, type OrderStore } from './orders.js';
 import { createRateLimiter, type RateLimiter } from './ratelimit.js';
-import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, validatePublicKey } from './wireguard.js';
+import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, enforceDataCaps, validatePublicKey } from './wireguard.js';
 import { buildPaymentRequest, verifyPayment, normalizePubkey, type VerifyResult } from './cashu.js';
 import { getEncodedToken, type Proof } from '@cashu/cashu-ts';
 
@@ -84,6 +84,18 @@ async function housekeep(ctx: Ctx): Promise<void> {
   } catch (e) {
     console.error('peer cleanup failed:', e instanceof Error ? e.message : e);
   }
+  if (config.leaseDataCapBytes > 0) {
+    try {
+      const capped = await enforceDataCaps(
+        ledger, config.wgInterface, config.leaseDataCapBytes, config.mode === 'dry-run'
+      );
+      for (const lease of capped.cleaned) {
+        console.log(`disconnected ${lease.purchaseId} (${lease.tunnelIp}): data cap reached`);
+      }
+    } catch (e) {
+      console.error('data-cap enforcement failed:', e instanceof Error ? e.message : e);
+    }
+  }
   if (config.retainExpiredMs > 0) {
     const cutoff = new Date(Date.now() - config.retainExpiredMs);
     try {
@@ -114,6 +126,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
         priceSats: config.priceSats,
         unit: config.unit,
         leaseDuration: `${config.leaseDurationMs / 1000}s`,
+        dataCapGb: config.leaseDataCapBytes > 0 ? config.leaseDataCapBytes / 1024 ** 3 : null,
         acceptedMints: config.acceptedMints,
         lock: ctx.lockBook ? 'xpub-per-tx' : config.operatorPubkey ? 'fixed-pubkey' : 'none',
         notice: config.notice,

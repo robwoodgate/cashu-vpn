@@ -17,7 +17,9 @@ import {
   planRemovePeer,
   executePlan,
   generateClientConfig,
+  leasesOverCap,
 } from '../src/wireguard.js';
+import type { PeerLease } from '../src/peers.js';
 import { HDKey } from '@scure/bip32';
 import { createP2PKsecret, getP2PKExpectedWitnessPubkeys } from '@cashu/cashu-ts';
 import { buildPaymentRequest, normalizeMintUrl, verifyPayment, popcount } from '../src/cashu.js';
@@ -78,6 +80,15 @@ test('RETAIN_EXPIRED_MS defaults to 1 day; 0 keeps everything; invalid rejected'
   assert.equal(loadConfig({ RETAIN_EXPIRED_MS: '0' }).retainExpiredMs, 0);
   assert.equal(loadConfig({ RETAIN_EXPIRED_MS: '3600000' }).retainExpiredMs, 3600000);
   assert.throws(() => loadConfig({ RETAIN_EXPIRED_MS: '-5' }), /non-negative integer/);
+});
+
+test('LEASE_DATA_CAP_GB defaults to 50 GiB; 0 disables; invalid rejected', () => {
+  assert.equal(loadConfig({}).leaseDataCapBytes, 50 * 1024 ** 3);
+  assert.equal(loadConfig({ LEASE_DATA_CAP_GB: '0' }).leaseDataCapBytes, 0);
+  assert.equal(loadConfig({ LEASE_DATA_CAP_GB: '10' }).leaseDataCapBytes, 10 * 1024 ** 3);
+  assert.equal(loadConfig({ LEASE_DATA_CAP_GB: '' }).leaseDataCapBytes, 50 * 1024 ** 3); // empty → default
+  assert.throws(() => loadConfig({ LEASE_DATA_CAP_GB: '-1' }), /non-negative number/);
+  assert.throws(() => loadConfig({ LEASE_DATA_CAP_GB: 'lots' }), /non-negative number/);
 });
 
 // --- Allocator ---
@@ -234,6 +245,27 @@ test('generateClientConfig dry-run vs live', () => {
   assert.match(live, /Endpoint = 1\.2\.3\.4:51820/);
   // Full-tunnel config must carry a DNS line, or names won't resolve client-side.
   assert.match(live, /DNS = 1\.1\.1\.1/);
+});
+
+test('leasesOverCap selects only leases at/over the cap (rx + tx)', () => {
+  const lease = (purchaseId: string, clientPublicKey: string): PeerLease => ({
+    purchaseId, clientPublicKey, tunnelIp: '10.77.0.5',
+    createdAt: '2026-01-01T00:00:00Z', expiresAt: '2999-01-01T00:00:00Z', status: 'active',
+  });
+  const active = [lease('under', 'kU'), lease('at', 'kA'), lease('over', 'kO'), lease('missing', 'kM')];
+  const cap = 1000;
+  const transfers = new Map([
+    ['kU', { rx: 400, tx: 400 }], // 800 < cap
+    ['kA', { rx: 600, tx: 400 }], // 1000 == cap
+    ['kO', { rx: 900, tx: 900 }], // 1800 > cap
+    // kM absent: peer not on the interface
+  ]);
+
+  const over = leasesOverCap(active, transfers, cap).map((l) => l.purchaseId).sort();
+  assert.deepEqual(over, ['at', 'over']);
+
+  // cap <= 0 disables the cap entirely
+  assert.deepEqual(leasesOverCap(active, transfers, 0), []);
 });
 
 // --- HTTP server ---

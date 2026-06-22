@@ -188,6 +188,99 @@ export function generateClientConfig(opts: {
   ].join('\n');
 }
 
+// --- Per-peer data usage ---
+
+export interface PeerTransfer {
+  /** Bytes received from the peer (buyer uploads). */
+  rx: number;
+  /** Bytes sent to the peer (buyer downloads). */
+  tx: number;
+}
+
+/**
+ * Read cumulative per-peer transfer counters from `wg show <iface> transfer`.
+ * Output is one tab-separated `pubkey\trx\ttx` line per peer. Counters are
+ * since the peer was added and reset if it is removed and re-added.
+ */
+export async function readPeerTransfers(iface: string): Promise<Map<string, PeerTransfer>> {
+  validateInterface(iface);
+  const { stdout } = await execFileAsync('wg', ['show', iface, 'transfer']);
+  const transfers = new Map<string, PeerTransfer>();
+  for (const line of stdout.split('\n')) {
+    const parts = line.split('\t');
+    if (parts.length !== 3) continue;
+    const [pub, rx, tx] = parts;
+    // wg emits the counters as plain integers; guard against anything else.
+    const rxN = Number(rx);
+    const txN = Number(tx);
+    if (!pub || !Number.isFinite(rxN) || !Number.isFinite(txN)) continue;
+    transfers.set(pub, { rx: rxN, tx: txN });
+  }
+  return transfers;
+}
+
+// --- Data-cap enforcement ---
+
+/**
+ * Pure selection: of the given active leases, which have reached `capBytes` of
+ * cumulative usage (rx + tx)? Both directions count — buyer downloads (tx) and
+ * uploads (rx) both leave the box on its public NIC, so both bill against the
+ * host's egress allowance. Leases with no transfer entry (peer not on the
+ * interface) are skipped. `capBytes <= 0` selects nothing (cap disabled).
+ */
+export function leasesOverCap(
+  active: PeerLease[],
+  transfers: Map<string, PeerTransfer>,
+  capBytes: number
+): PeerLease[] {
+  if (!(capBytes > 0)) return [];
+  return active.filter((lease) => {
+    const usage = transfers.get(lease.clientPublicKey);
+    return usage !== undefined && usage.rx + usage.tx >= capBytes;
+  });
+}
+
+/**
+ * Disconnect any active lease whose cumulative usage has reached `capBytes`.
+ * Mirrors expiry: the peer is removed from the interface and the lease marked
+ * expired. `capBytes <= 0` disables the cap (no-op).
+ */
+export async function enforceDataCaps(
+  ledger: PeerLedger,
+  iface: string,
+  capBytes: number,
+  dryRun: boolean,
+  now = new Date()
+): Promise<CleanupResult> {
+  if (!(capBytes > 0)) return { inspected: 0, cleaned: [], skipped: [] };
+
+  const active = (await ledger.list(now)).filter((l) => l.status === 'active');
+  if (active.length === 0) return { inspected: 0, cleaned: [], skipped: [] };
+
+  const transfers = await readPeerTransfers(iface);
+  const overCap = leasesOverCap(active, transfers, capBytes);
+  const cleaned: PeerLease[] = [];
+  const skipped: PeerLease[] = [];
+
+  for (const lease of overCap) {
+    if (dryRun) {
+      skipped.push(lease);
+      continue;
+    }
+
+    const plan = planRemovePeer(iface, lease.clientPublicKey, lease.tunnelIp);
+    try {
+      await executePlan(plan);
+      await ledger.markExpired(lease.purchaseId);
+      cleaned.push({ ...lease, status: 'expired' });
+    } catch {
+      skipped.push(lease);
+    }
+  }
+
+  return { inspected: active.length, cleaned, skipped };
+}
+
 // --- Expired peer cleanup ---
 
 export async function cleanupExpiredPeers(

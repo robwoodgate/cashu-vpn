@@ -156,6 +156,7 @@ Everything is configured with environment variables.
 | `NOTICE` | — | optional operator notice (MOTD) shown on the page and in `/info` |
 | `TERMS_URL` | — | optional acceptable-use / terms URL, linked on the page and in `/info` |
 | `LEASE_DURATION_MS` | `86400000` | how long access lasts, one day by default |
+| `LEASE_DATA_CAP_GB` | `50` | per-lease data cap (rx + tx) in GiB; buyer is disconnected once reached. `0` disables |
 | `CLEANUP_INTERVAL_MS` | `60000` | how often to remove expired peers and run retention; set `0` to disable |
 | `RETAIN_EXPIRED_MS` | `86400000` (1 day) | how long expired leases/orders are kept before they are forgotten; `0` keeps everything |
 | `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | `30` / `60000` | per-IP limit on `/purchase`; set max to 0 to disable |
@@ -249,6 +250,8 @@ This is FOSS and is not yet hardened for unattended public operation. Before you
 And the obvious thing: when you run an exit, the traffic leaving your server is your responsibility. This software does not route or proxy any of it for you, and it makes no promise of anonymity or legal protection.
 
 **Limiting exit abuse.** Because buyers exit from your IP, you'll want to bound what they can do. `scripts/egress-filter.sh` restricts buyer egress to DNS + HTTP/HTTPS + ICMP, which removes the abuse that gets host accounts suspended (outbound spam, port scanning, brute-forcing, most torrenting) while normal browsing keeps working. For stronger insulation, `scripts/upstream-egress.sh` routes the buyer subnet out through a separate upstream WireGuard VPN — abuse complaints then land on that upstream rather than your host, and a killswitch drops buyer traffic if the tunnel goes down so nothing leaks out your real IP. Use an upstream whose terms permit this (running your own second VPS avoids any question). The two stack. A `NOTICE` / `TERMS_URL` can also state your acceptable-use policy on the page.
+
+**Bounding egress volume.** Hosts meter outbound traffic — Hetzner Cloud, for example, includes ~20 TB/month and bills beyond it. At ~140 Mbit/s a single buyer can move over a terabyte a day, so a few heavy leases can run up a surprise bill. `LEASE_DATA_CAP_GB` (default 50) caps each lease's combined up + download; the cleanup tick disconnects a buyer once they reach it, the same way it removes an expired one. Set it to `0` to sell uncapped. This is a per-lease cap, not an account-wide budget — for the latter, also watch your host's traffic dashboard (or `vnstat`).
 
 ## Troubleshooting
 
