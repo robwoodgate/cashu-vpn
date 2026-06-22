@@ -83,6 +83,8 @@ function injectPriv(clientConfig: string, privKey: string): string {
 // Render a ready config into the main panel + enable its download.
 function showConfig(conf: string, name: string, tunnelIp?: string, expiresAt?: string): void {
   $('cfg').textContent = conf + (tunnelIp ? '\n\nLease: ' + tunnelIp + (expiresAt ? ' until ' + new Date(expiresAt).toLocaleString() : '') : '');
+  renderQR('qrcfg', conf); // for one-tap import into the WireGuard mobile app
+  $('cfghelp').style.display = '';
   setMsg('Config ready.', 'ok');
   const dl = btn('dl');
   dl.disabled = false;
@@ -222,17 +224,28 @@ function dropOrder(id: string): void {
 
 const esc = (s: unknown) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-// "Your access": this browser's own orders, from localStorage.
+// "Your access": this browser's own orders, from localStorage. A ready lease
+// shows its expiry and flips to "expired" once the time passes (the peer is
+// removed server-side at that point, so the config stops working).
 function renderAccess(): void {
   const list = loadOrders();
   const el = $('access');
   if (!list.length) { el.innerHTML = '<div class="empty">No access yet.</div>'; return; }
+  const now = Date.now();
   el.innerHTML = list.slice().reverse().map((o) => {
     const label = o.tunnelIp ? esc(o.tunnelIp) : esc(o.id.slice(0, 10) + '…');
-    const action = o.status === 'ready'
-      ? '<button class="ghost dlacc" data-id="' + esc(o.id) + '" type="button">Download</button>'
-      : '<small>waiting for payment…</small>';
-    return '<div class="acc"><span><strong>' + label + '</strong> &middot; <small>' + esc(o.status) + '</small></span>' + action + '</div>';
+    const when = o.expiresAt ? new Date(o.expiresAt) : null;
+    let status: string, action = '';
+    if (o.status !== 'ready') {
+      status = '<small>waiting for payment…</small>';
+    } else if (when && when.getTime() <= now) {
+      status = '<small class="expired">expired' + ' ' + esc(when.toLocaleString()) + '</small>';
+      action = '<button class="ghost dlacc" data-id="' + esc(o.id) + '" type="button">Download</button>';
+    } else {
+      status = '<small>active' + (when ? ' until ' + esc(when.toLocaleString()) : '') + '</small>';
+      action = '<button class="ghost dlacc" data-id="' + esc(o.id) + '" type="button">Download</button>';
+    }
+    return '<div class="acc"><span><strong>' + label + '</strong> &middot; ' + status + '</span>' + action + '</div>';
   }).join('');
   el.querySelectorAll('.dlacc').forEach((b) => {
     b.addEventListener('click', () => {
@@ -245,6 +258,7 @@ function renderAccess(): void {
 
 // On load: show stored access and resume polling any still-pending orders.
 renderAccess();
+setInterval(renderAccess, 60000); // keep "active → expired" current on a long-open page
 for (const o of loadOrders()) {
   if (o.status === 'pending') void poll(o.id);
 }

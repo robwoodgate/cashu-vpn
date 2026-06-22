@@ -595,6 +595,9 @@ function renderPage(config: Config): string {
     .ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
     .qr { margin-top: 10px; }
     .qr img { background: #fff; padding: 8px; border-radius: 8px; display: block; width: 240px; max-width: 100%; height: auto; image-rendering: pixelated; }
+    a { color: var(--accent); }
+    code { background: #080b10; border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font-size: .85em; }
+    .acc small.expired { color: var(--warn); }
     @media (max-width: 600px) { .facts { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -643,6 +646,11 @@ function renderPage(config: Config): string {
   <div class="panel">
     <h2>WireGuard config</h2>
     <pre id="cfg">Purchase a lease to generate a config.</pre>
+    <div id="cfghelp" style="display:none">
+      <p style="margin-top:12px">To connect, install the free <a href="https://www.wireguard.com/install/" target="_blank" rel="noopener">WireGuard app</a> (macOS, Windows, Linux, iOS, Android — it is not built into your OS VPN settings). Open it, choose <strong>Import tunnel from file</strong>, and pick the <code>.conf</code> you downloaded — then activate it.</p>
+      <p style="margin-top:8px">On a phone, scan this in the WireGuard app instead:</p>
+      <div id="qrcfg" class="qr"></div>
+    </div>
   </div>
 
   <div class="panel">

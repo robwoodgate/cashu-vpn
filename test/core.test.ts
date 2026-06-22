@@ -293,6 +293,9 @@ test('GET /marketplace returns HTML page', async () => {
     assert.doesNotMatch(html, /Complete &amp; get config/);
     assert.doesNotMatch(html, /id="token"/);
     assert.match(html, /Your access/);
+    // Buyers are told they need the WireGuard app, with a link + import QR slot.
+    assert.match(html, /wireguard\.com\/install/);
+    assert.match(html, /id="qrcfg"/);
     assert.match(html, /<script src="\/client\.js">/);
   });
 });
