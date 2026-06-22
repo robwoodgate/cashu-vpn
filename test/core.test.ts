@@ -39,7 +39,7 @@ test('loadConfig returns dry-run defaults', () => {
   assert.equal(c.host, '127.0.0.1');
   assert.equal(c.wgInterface, 'wg0');
   assert.equal(c.priceSats, 250);
-  assert.equal(c.leaseDurationMs, 3 * 60 * 60 * 1000);
+  assert.equal(c.leaseDurationMs, 24 * 60 * 60 * 1000);
   assert.equal(c.cleanupIntervalMs, undefined);
   assert.deepEqual(c.acceptedMints, ['https://mint.minibits.cash/Bitcoin']);
 });

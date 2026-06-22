@@ -128,7 +128,7 @@ Set these as environment variables.
 | `ACCEPTED_MINTS` | minibits | comma-separated mint URLs |
 | `PRICE_SATS` | `250` | price per lease |
 | `MINT_UNIT` | `sat` | cashu unit |
-| `LEASE_DURATION_MS` | `10800000` (3h) | lease length |
+| `LEASE_DURATION_MS` | `86400000` (1 day) | lease length |
 | `CLEANUP_INTERVAL_MS` | off | how often to remove expired peers |
 | `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | `30` / `60000` | per-IP `/purchase` limit (0 disables) |
 | `PUBLIC_BASE_URL` | request-derived | your public URL, used to build the wallet's delivery address; set it behind a proxy |
