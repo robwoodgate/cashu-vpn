@@ -1410,6 +1410,45 @@ test('concurrent inline X-Cashu deliveries provision exactly once', async () => 
   }, LIVE_ENV, { ledger, proofStore, verifyDeps: PASS_VERIFY, execPlan: async () => [] });
 });
 
+test('malformed JSON returns 400 and an oversized body 413 (not 500)', async () => {
+  await withServer(async (url) => {
+    const bad = await fetch(`${url}/purchase`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{ not json',
+    });
+    assert.equal(bad.status, 400);
+    assert.equal((await bad.json()).error, 'invalid_json');
+
+    const big = await fetch(`${url}/purchase`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: 'x'.repeat(20_000),
+    });
+    assert.equal(big.status, 413);
+    assert.equal((await big.json()).error, 'payload_too_large');
+  }, LIVE_ENV);
+});
+
+test('re-buying with an already-active key replaces the old lease (no early disconnect)', async () => {
+  // WireGuard keys a peer by its pubkey, so a second purchase with the same key
+  // moves the peer to a new IP; the old lease must be expired (not left active),
+  // or its cleanup later runs `wg ... peer remove` and cuts the new buyer.
+  const ledger = createMemoryLedger();
+  let n = 0;
+  const verifyDeps: VerifyDeps = { ...PASS_VERIFY, decode: () => [{ id: 'k1', secret: `uniq-${n++}`, amount: 1000 }] as never };
+  await withServer(async (url) => {
+    const buy = () => fetch(`${url}/purchase`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-cashu': 'tok' },
+      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+    });
+    assert.equal((await buy()).status, 200);
+    assert.equal((await buy()).status, 200);
+
+    const all = await ledger.list();
+    assert.equal(all.length, 2, 'both purchases recorded a lease');
+    const active = all.filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
+    assert.equal(active.length, 1, 'one key holds exactly one active lease (old one expired, not removed)');
+  }, LIVE_ENV, { ledger, verifyDeps, execPlan: async () => [] });
+});
+
 // --- Real P2PK secret parsing through verifyPayment (offline, no mint) ---
 //
 // The witness-pubkey extraction is the half of verification that breaks silently

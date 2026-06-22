@@ -190,6 +190,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
 
     json(res, 404, { error: 'not_found' });
   } catch (e) {
+    // readBody attaches a statusCode to its client errors (400 bad JSON, 413 too
+    // large). Honour it — these are routine client input, not server failures.
+    const statusCode = (e as { statusCode?: number } | null)?.statusCode;
+    if (statusCode === 400) return json(res, 400, { error: 'invalid_json', message: 'Request body must be valid JSON' });
+    if (statusCode === 413) return json(res, 413, { error: 'payload_too_large', message: `Body exceeds ${MAX_BODY_BYTES} bytes` });
     console.error('request error:', e);
     json(res, 500, { error: 'internal_error' });
   }
@@ -514,6 +519,17 @@ async function provisionPeer(
     status: 'active',
   };
   await ledger.record(lease);
+
+  // A WireGuard peer is keyed by its public key, so the `wg set` above just moved
+  // any existing peer with this key onto the new IP — the earlier lease is now
+  // detached. Expire those prior same-key leases (no `wg ... remove`, which would
+  // delete the now-shared peer and cut THIS buyer) so one key holds one active
+  // lease and the old lease's expiry cleanup can't disconnect the new one.
+  for (const prior of await ledger.list(now)) {
+    if (prior.status === 'active' && prior.clientPublicKey === clientPublicKey && prior.purchaseId !== purchaseId) {
+      await ledger.markExpired(prior.purchaseId);
+    }
+  }
 
   const clientConfig = generateClientConfig({
     tunnelIp,
