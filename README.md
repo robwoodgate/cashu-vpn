@@ -63,6 +63,10 @@ ufw allow 51820/udp
 # Optional: let buyers reach the internet through the box
 sysctl -w net.ipv4.ip_forward=1
 iptables -t nat -A POSTROUTING -s 10.77.0.0/24 -o eth0 -j MASQUERADE   # eth0 = your public interface
+
+# Recommended on any real exit: tune kernel buffers + enable BBR, or throughput
+# is capped to tens of Mbit/s by the small default socket buffers (see Troubleshooting)
+sudo scripts/tune-perf.sh
 ```
 
 Whether you create `wg0` here or already had one, cashu-vpn attaches and removes buyer peers on it at runtime with `wg set` and `ip route`, and never edits `wg0.conf`.
@@ -217,6 +221,7 @@ scripts/
   update.sh            pull, reinstall, rebuild, restart (npm run update)
   egress-filter.sh     restrict buyer egress to DNS + web + ICMP
   upstream-egress.sh   route buyer egress through an upstream WireGuard VPN
+  tune-perf.sh         raise socket buffers + enable BBR for a high-RTT exit
   sweep-remote.sh      pull receipts, sweep locally, prune the server
 test/
   core.test.ts         unit and HTTP tests (npm test)
@@ -253,6 +258,8 @@ And the obvious thing: when you run an exit, the traffic leaving your server is 
 - **No NAT / masquerade.** Buyer packets get forwarded out with their private `10.77.0.x` source and the replies never come back. Add the rule from setup: `iptables -t nat -A POSTROUTING -s 10.77.0.0/24 -o eth0 -j MASQUERADE`.
 
   Gotcha: if WireGuard was brought up by `wg-quick`/`systemd-networkd`, the masquerade may already exist as a **native nftables** rule (`iifname "wg0" masquerade`) — which is invisible to `iptables -t nat -S`. Always check `nft list ruleset` before concluding NAT is missing, or you'll add a duplicate.
+
+**Tunnel works but is slow (tens of Mbit/s).** An exit is usually far from the buyer, so the bandwidth-delay product is large — but the kernel defaults to ~208 KB socket buffers (which caps a flow at roughly buffer ÷ RTT, e.g. ~27 Mbit/s at 60 ms, and starves WireGuard's UDP socket) and to CUBIC congestion control (which collapses on the path's loss). Run `sudo scripts/tune-perf.sh` to raise the buffers to 16 MB and switch to BBR + `fq`; it's persistent across reboot. In one test (UK→Helsinki, ~62 ms) this took download from ~37 to ~140 Mbit/s. Confirm with `iperf3` over the tunnel — a slow link shows a high `Retr` count under load even when an idle `ping` reports 0% loss. Upload stays bounded by the buyer's own uplink and OS, so box-side tuning barely moves it.
 
 ## License
 
