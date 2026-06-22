@@ -39,10 +39,10 @@
     "prune": "node dist/src/sweep.js --prune"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.4.0"
   },
   "dependencies": {
-    "@cashu/cashu-ts": "^4.5.1",
+    "@cashu/cashu-ts": "^4.6.0",
     "@scure/bip32": "^2.2.0",
     "qrcode-generator": "^2.0.4"
   },

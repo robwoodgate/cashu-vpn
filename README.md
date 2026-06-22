@@ -28,7 +28,7 @@ Open `http://localhost:3087` and click through the buyer flow. In dry-run mode n
 
 ## Set up your own VPN
 
-You need a Linux server with Node.js 20 or newer, root access, and a domain name pointed at the server so it can get an HTTPS certificate. The two host-level pieces are WireGuard and a reverse proxy; the steps below cover both.
+You need a Linux server with Node.js 22.4 or newer (required by `@cashu/cashu-ts`), root access, and a domain name pointed at the server so it can get an HTTPS certificate. The two host-level pieces are WireGuard and a reverse proxy; the steps below cover both.
 
 **1. Get the project onto the server and build it.**
 
