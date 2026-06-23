@@ -695,8 +695,10 @@ function renderPage(config: Config): string {
     #pay { text-align: center; }
     .paylabel { color: var(--muted); font-size: .8rem; margin: 0; }
     .payamt { font-size: 1.9rem; font-weight: 800; margin: 2px 0 14px; }
-    /* Segmented control: one rounded track, active segment filled. */
-    .tabs { display: inline-flex; gap: 4px; margin: 0 0 4px; padding: 4px; background: #17202b; border: 1px solid var(--line); border-radius: 999px; }
+    /* Segmented control: one rounded track, active segment filled. A content-width
+       flex row centered with margin:auto so it sits on its own line (not inline
+       beside the QR). */
+    .tabs { display: flex; width: max-content; max-width: 100%; margin: 0 auto 4px; gap: 4px; padding: 4px; background: #17202b; border: 1px solid var(--line); border-radius: 999px; }
     .tab { background: transparent; border: 0; color: var(--muted); border-radius: 999px; padding: 8px 18px; font-weight: 600; cursor: pointer; }
     .tab.is-active { background: var(--accent); color: #03121f; }
     .paytip { min-height: 1.4em; margin: 12px auto 0; max-width: 320px; font-size: .85rem; }
