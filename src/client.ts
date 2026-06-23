@@ -192,10 +192,8 @@ function drawTab(mode: PayMode): void {
   $('paytip').textContent = PAY_TIPS[mode];
   if (payQr[mode]) {
     renderQR('payqr', payQr[mode], payCopy[mode] || payQr[mode], PAY_ICONS[mode]);
-    $('paytext').textContent = payCopy[mode] || payQr[mode];
   } else {
     $('payqr').innerHTML = '<div class="empty">Generating invoice…</div>';
-    $('paytext').textContent = '';
   }
 }
 

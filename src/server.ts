@@ -693,12 +693,14 @@ function renderPage(config: Config): string {
     h3 { font-size: 1rem; margin: 18px 0 4px; color: var(--text); }
     .ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
     #pay { text-align: center; }
-    #pay h2 { text-align: left; }
-    #pay pre { text-align: left; }
-    .tabs { display: flex; gap: 6px; margin: 14px 0 8px; justify-content: center; }
-    .tab { background: #17202b; border: 1px solid var(--line); color: var(--muted); border-radius: 8px; padding: 8px 14px; font-weight: 600; cursor: pointer; }
-    .tab.is-active { background: var(--accent); color: #03121f; border-color: var(--accent); }
-    .paytip { min-height: 1.4em; margin-bottom: 6px; }
+    .paylabel { color: var(--muted); font-size: .8rem; margin: 0; }
+    .payamt { font-size: 1.9rem; font-weight: 800; margin: 2px 0 14px; }
+    /* Segmented control: one rounded track, active segment filled. */
+    .tabs { display: inline-flex; gap: 4px; margin: 0 0 4px; padding: 4px; background: #17202b; border: 1px solid var(--line); border-radius: 999px; }
+    .tab { background: transparent; border: 0; color: var(--muted); border-radius: 999px; padding: 8px 18px; font-weight: 600; cursor: pointer; }
+    .tab.is-active { background: var(--accent); color: #03121f; }
+    .paytip { min-height: 1.4em; margin: 12px auto 0; max-width: 320px; font-size: .85rem; }
+    #copypay { margin-top: 12px; }
     .qr { margin-top: 10px; }
     .qr img { background: #fff; padding: 8px; border-radius: 8px; display: block; width: 240px; max-width: 100%; height: auto; image-rendering: pixelated; }
     /* Centre logo badge — circular, like CFW. Higher specificity than .qr img so
@@ -739,15 +741,15 @@ ${config.notice ? `
   </div>
 
   <div class="panel" id="pay" style="display:none">
-    <h2>Pay <span id="payamt">${esc(price)}</span></h2>
+    <p class="paylabel">Amount due</p>
+    <div class="payamt" id="payamt">${esc(price)}</div>
     <div class="tabs" role="tablist">
       <button class="tab is-active" data-tab="unified" role="tab" aria-selected="true" type="button">Auto</button>
       <button class="tab" data-tab="lightning" role="tab" aria-selected="false" type="button">⚡ Lightning</button>
       <button class="tab" data-tab="cashu" role="tab" aria-selected="false" type="button">Cashu</button>
     </div>
-    <p class="paytip" id="paytip"></p>
     <div id="payqr" class="qr"></div>
-    <pre id="paytext"></pre>
+    <p class="paytip" id="paytip"></p>
     <button type="button" id="copypay" class="ghost">Copy</button>
   </div>
 
