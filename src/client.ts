@@ -17,7 +17,7 @@
 
 import { Wallet } from '@cashu/cashu-ts';
 import qrcode from 'qrcode-generator';
-import { decodeChallenge, waitForPaid, mintLockedPayload, type MintWallet, type MintQuote, type Challenge } from './buyer.js';
+import { decodeChallenge, waitForPaid, mintLockedPayload, type MintWallet, type MintQuote, type PaymentPayload, type Challenge } from './buyer.js';
 // Inlined as data-URIs by esbuild (--loader:.svg=dataurl). Centre-overlay marks for
 // the Cashu / Lightning QR tabs; the unified (BIP-321) tab shows none.
 import cashuIcon from './icons/cashu.svg';
@@ -40,6 +40,10 @@ interface OrderRec {
   // sats) and leave any already-shown invoice unwatched.
   mintQuote?: string;
   mintInvoice?: string;
+  // The minted NUT-18 proofs, persisted between mint and a confirmed delivery so a
+  // reload re-delivers them rather than stranding paid ecash (minting isn't
+  // idempotent). Cleared once the order is ready.
+  payload?: PaymentPayload;
   conf?: string;
   tunnelIp?: string;
   createdAt?: string;
@@ -218,6 +222,19 @@ function openPayPanel(orderId: string, creq: string): void {
   void armLightning(orderId, creq);
 }
 
+// POST minted proofs to the order's NUT-18 sink. Idempotent server-side, so a
+// reload safely re-delivers persisted proofs. On success the config is applied
+// (or polled for); on failure the proofs stay persisted for a later retry.
+async function deliver(orderId: string, payload: PaymentPayload): Promise<void> {
+  const r = await fetch('/pay/' + encodeURIComponent(orderId), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: orderId, ...payload }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { setMsg(d.detail ?? d.error ?? 'Delivery failed', 'err'); return; }
+  if (d.clientConfig) applyReady(orderId, d); else void poll(orderId); // /pay returns the config
+}
+
 // Browser-side: create a mint quote, build the Auto (BIP-321) + Lightning payloads,
 // then wait for the invoice to be paid and mint+deliver the locked proofs. The mint
 // call is per-buyer (fanned out across their own IPs), never via our server.
@@ -227,10 +244,20 @@ async function armLightning(orderId: string, creq: string): Promise<void> {
     const wallet = new Wallet(challenge.mintUrl, { unit: challenge.unit });
     await wallet.loadMint();
     const w = wallet as unknown as MintWallet;
-    // Reuse a persisted quote across reloads; only mint a fresh one for a new order.
-    // A reused quote that's already PAID is reclaimed below (mint the proofs we paid
-    // for) instead of stranded behind a brand-new invoice.
     const rec = loadOrders().find((o) => o.id === orderId);
+
+    // Already minted in a prior session: the proofs were persisted BEFORE delivery
+    // (below), so just re-deliver them. Minting is NOT idempotent — the mint signed
+    // the original outputs whose secrets we'd otherwise have lost — so we must never
+    // re-mint a quote we've already minted.
+    if (rec?.payload) {
+      setMsg('Delivering…');
+      await deliver(orderId, rec.payload);
+      return;
+    }
+
+    // Reuse a persisted quote across reloads; only mint a fresh one for a new order,
+    // so a reload never strands a paid quote behind a brand-new invoice.
     let quote: MintQuote;
     if (rec?.mintQuote) {
       const { state } = await w.checkMintQuoteBolt11(rec.mintQuote);
@@ -250,20 +277,26 @@ async function armLightning(orderId: string, creq: string): Promise<void> {
     payQr.lightning = 'LIGHTNING:' + ln; payCopy.lightning = bolt11;
     drawTab(payMode); // re-render the current tab now that the payloads exist
 
-    // A reclaimed quote may already be paid — mint immediately rather than wait.
-    const paid = quote.state === 'PAID' || quote.state === 'ISSUED'
-      ? true
+    if (quote.state === 'ISSUED') {
+      // The mint already issued signatures for outputs minted in a prior session,
+      // but we have no persisted proofs (rec.payload was handled above) — so those
+      // outputs' secrets are gone and this ecash can't be recovered from here.
+      // ponytail: only the rare mint-signed-but-response-lost case lands here;
+      // upgrade path is a per-order seed + deterministic P2PK outputs + NUT-09
+      // restore (cf. cashu-for-woocommerce) if that residual ever proves to matter.
+      setMsg('This invoice was already claimed in an earlier session and its ecash can’t be recovered here. Please start a new order.', 'err');
+      return;
+    }
+    const paid = quote.state === 'PAID'
+      ? true // reclaimed a paid-but-unminted quote — mint it now
       : await waitForPaid(w, quote.quote, { intervalMs: 2000, tries: 150 });
     if (!paid || currentOrderId !== orderId) return;
     setMsg('Minting & delivering…');
     const payload = await mintLockedPayload(w, challenge, quote);
-    const r = await fetch('/pay/' + encodeURIComponent(orderId), {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ id: orderId, ...payload }),
-    });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) { setMsg(d.detail ?? d.error ?? 'Delivery failed', 'err'); return; }
-    if (d.clientConfig) applyReady(orderId, d); else void poll(orderId); // /pay returns the config
+    // Persist the proofs BEFORE delivery so a crash/close between here and the POST
+    // can re-deliver them on reload (above) instead of stranding paid ecash.
+    upsertOrder({ id: orderId, payload });
+    await deliver(orderId, payload);
   } catch (e) {
     // Mint/Lightning unreachable — the Cashu tab still works (a wallet pays the creqA).
     if (currentOrderId === orderId) setMsg('Lightning unavailable; use the Cashu tab. (' + errText(e) + ')', 'err');
@@ -342,7 +375,8 @@ btn('copypay').onclick = async () => { if (await copyToClipboard(payCopy[payMode
 function applyReady(id: string, d: { clientConfig?: string; tunnelIp?: string; lease?: { expiresAt?: string } }): void {
   const rec = loadOrders().find((o) => o.id === id);
   const conf = injectPriv(String(d.clientConfig ?? ''), rec?.priv ?? '');
-  upsertOrder({ id, status: 'ready', conf, tunnelIp: d.tunnelIp, expiresAt: d.lease?.expiresAt });
+  // Delivery confirmed — drop the persisted proofs; they've been redeemed.
+  upsertOrder({ id, status: 'ready', conf, tunnelIp: d.tunnelIp, expiresAt: d.lease?.expiresAt, payload: undefined });
   if (id === currentOrderId) showConfig(conf, id, d.tunnelIp, d.lease?.expiresAt);
   renderAccess();
 }

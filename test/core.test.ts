@@ -1624,7 +1624,7 @@ test('re-buying with an already-active key replaces the old lease (no early disc
     assert.equal(all.length, 2, 'both purchases recorded a lease');
     const active = all.filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
     assert.equal(active.length, 1, 'one key holds exactly one active lease (old one expired, not removed)');
-  }, LIVE_ENV, { ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
+  }, LIVE_ENV, { ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], readTransfers: async () => new Map(), lockBook });
 });
 
 test('a failed wg renewal keeps the original lease active (no orphaned peer)', async () => {
@@ -1642,7 +1642,40 @@ test('a failed wg renewal keeps the original lease active (no orphaned peer)', a
     assert.equal(all.length, 2, 'both leases recorded');
     const active = all.filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
     assert.equal(active.length, 1, 'the original lease is active again — its peer stays reapable, not orphaned');
-  }, LIVE_ENV, { ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: execPlan as never, lockBook });
+  }, LIVE_ENV, { ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: execPlan as never, readTransfers: async () => new Map(), lockBook });
+});
+
+test('a same-key renewal baselines the cap to the peer\'s current counter', async () => {
+  // The renewal's lease must record the peer's cumulative counter as its baseline,
+  // so cap enforcement later charges it only for traffic beyond the prior lease.
+  const ledger = createMemoryLedger();
+  const lockBook = await createLockBook(TEST_XPUB);
+  await withServer(async (url) => {
+    assert.equal((await buyViaPay(url, 0)).status, 200); // fresh: baseline 0
+    assert.equal((await buyViaPay(url, 1)).status, 200); // renewal: baseline = counter below
+  }, LIVE_ENV, {
+    ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [],
+    readTransfers: async () => new Map([[VALID_WG_KEY, { rx: 700, tx: 300 }]]), lockBook,
+  });
+  const leases = await ledger.list();
+  assert.equal(leases.find((l) => l.status === 'active')!.capBaseline, 1000, 'renewal baselined to rx+tx');
+  assert.equal(leases.find((l) => l.status === 'expired')!.capBaseline ?? 0, 0, 'first lease was fresh (no baseline)');
+});
+
+test('a same-key renewal fails (not insta-caps) when the counter read fails', async () => {
+  // A transient `wg show transfer` failure on a renewal must roll back, not baseline
+  // to 0 — else the paid replacement inherits the prior usage and is insta-capped.
+  const ledger = createMemoryLedger();
+  const lockBook = await createLockBook(TEST_XPUB);
+  await withServer(async (url) => {
+    assert.equal((await buyViaPay(url, 0)).status, 200); // fresh provision succeeds
+    assert.equal((await buyViaPay(url, 1)).status, 500); // renewal: counter read throws → rolled back
+    const active = (await ledger.list()).filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
+    assert.equal(active.length, 1, 'the original lease stays active; the renewal did not record');
+  }, LIVE_ENV, {
+    ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [],
+    readTransfers: async () => { throw new Error('wg show failed'); }, lockBook,
+  });
 });
 
 test('a failed FRESH provision removes the peer wg set may have added', async () => {

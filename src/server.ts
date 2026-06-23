@@ -38,6 +38,8 @@ export interface ServerDeps {
   verifyDeps?: VerifyDeps;
   /** Test seam: override the WireGuard executor so a provision can run without a live interface. */
   execPlan?: typeof executePlan;
+  /** Test seam: override the per-peer transfer reader (defaults to `wg show transfer`). */
+  readTransfers?: typeof readPeerTransfers;
 }
 
 // Everything a request handler needs, assembled once in createServer.
@@ -458,12 +460,20 @@ async function provisionPeer(
   // Cap baseline: `wg` transfer counters are cumulative and only reset when a peer
   // is removed and re-added. A same-key renewal reuses the peer, so snapshot its
   // current counter now and charge this lease only for usage beyond it — else the
-  // renewal inherits the prior lease's usage and can be insta-capped. Fresh key →
-  // no peer → 0. (Read directly, not via the exec seam; live mode only.)
+  // renewal inherits the prior lease's usage and can be insta-capped.
   let capBaseline = 0;
   if (config.mode === 'live' && config.leaseDataCapBytes > 0) {
-    const t = (await readPeerTransfers(config.wgInterface).catch(() => new Map())).get(clientPublicKey);
-    if (t) capBaseline = t.rx + t.tx;
+    // A key we've never recorded has no peer on the interface, so its counter is 0
+    // and no read is needed. For a key we HAVE seen, the peer may still carry prior
+    // traffic, so we MUST read its counter — and a read failure must fail the
+    // provision (it rolls back, the buyer retries) rather than silently baseline to
+    // 0, which would inherit the prior usage and insta-cap the paid renewal.
+    const seen = (await ledger.list()).some((l) => l.clientPublicKey === clientPublicKey);
+    if (seen) {
+      const readTransfers = ctx.readTransfers ?? readPeerTransfers;
+      const t = (await readTransfers(config.wgInterface)).get(clientPublicKey);
+      capBaseline = t ? t.rx + t.tx : 0;
+    }
   }
 
   // Persist the operator-locked token BEFORE touching the ledger/WireGuard. The
