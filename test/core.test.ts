@@ -720,6 +720,25 @@ test('live POST /purchase without payment returns 402 + x-cashu challenge', asyn
   }, LIVE_ENV);
 });
 
+test('live POST /purchase refuses with 503 sold_out when every tunnel IP is in use', async () => {
+  // One live lease already occupying the only slot; a capacity-1 allocator means
+  // the subnet is full, so /purchase must refuse before quoting a payment.
+  const future = new Date(Date.now() + 3600_000).toISOString();
+  const occupied = createMemoryStateStore([orderWithLease({
+    purchaseId: 'p-occupied', clientPublicKey: 'someoneelse', tunnelIp: '10.77.0.2',
+    createdAt: new Date().toISOString(), expiresAt: future, status: 'active',
+  })]);
+  await withServer(async (url) => {
+    const res = await fetch(`${url}/purchase`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+    });
+    assert.equal(res.status, 503);
+    assert.equal((await res.json()).error, 'sold_out');
+  }, LIVE_ENV, { store: occupied, allocator: { capacity: 1, allocateTunnelIp: () => '10.77.0.2' } });
+});
+
 test('order lifecycle: pending order, poll, CORS preflight, and /pay validation', async () => {
   await withServer(async (url) => {
     const r = await fetch(`${url}/purchase`, {

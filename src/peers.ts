@@ -23,6 +23,8 @@ export interface PeerLease {
 export interface PeerAllocator {
   /** `taken` is the set of tunnel IPs currently in use; the result avoids them. */
   allocateTunnelIp(purchaseId: string, clientPublicKey: string, taken?: Set<string>): string;
+  /** Total usable tunnel IPs — i.e. the max number of concurrent live leases. */
+  readonly capacity: number;
 }
 
 /**
@@ -46,6 +48,7 @@ const HOST_COUNT = 253; // usable hosts 2..254 (.0/.1/.255 reserved)
 
 export function createAllocator(): PeerAllocator {
   return {
+    capacity: HOST_COUNT,
     allocateTunnelIp(purchaseId: string, clientPublicKey: string, taken = new Set<string>()): string {
       // Deterministic starting host from the hash (stable per purchase), then
       // linear-probe forward to the first free one. Two live leases must never

@@ -268,6 +268,16 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     });
   }
 
+  // Don't quote a payment we can't fulfil: if every tunnel IP is already on a
+  // live lease, refuse before issuing the request. Best-effort (capacity can
+  // still vanish between this quote and /pay) — the /pay 503 no_capacity stays
+  // the hard backstop — but it stops us selling into a full subnet.
+  const now0 = new Date();
+  const liveLeases = (await ctx.store.list(now0)).filter((l) => l.status === 'active').length;
+  if (liveLeases >= ctx.allocator.capacity) {
+    return json(res, 503, { error: 'sold_out', message: 'All tunnel slots are in use; try again later.' });
+  }
+
   // Create an order and answer with a 402 + PaymentRequest. The creqA
   // carries a NUT-18 POST transport to /pay/:orderId, so a wallet pays and
   // delivers automatically; the browser polls GET /order/:orderId.
