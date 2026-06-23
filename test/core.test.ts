@@ -18,7 +18,9 @@ import {
   executePlan,
   generateClientConfig,
   leasesOverCap,
+  cleanupExpiredPeers,
 } from '../src/wireguard.js';
+import { serialize } from '../src/serialize.js';
 import type { PeerLease } from '../src/peers.js';
 import { HDKey } from '@scure/bip32';
 import { createP2PKsecret, getP2PKExpectedWitnessPubkeys } from '@cashu/cashu-ts';
@@ -1371,6 +1373,35 @@ test('reactivate restores an expired lease (rollback of a failed renewal)', asyn
   assert.equal(active.length, 1, 'exactly one active lease after rollback');
   assert.equal(active[0]!.purchaseId, 'a', 'the original lease is live again, so cleanup still reaps its peer');
   assert.ok(first.lease.tunnelIp.startsWith('10.77.0.'));
+});
+
+test('cleanup skips removing a peer whose key a concurrent re-buy now owns', async () => {
+  // Race: cleanup snapshots an expired lease for key K, then a re-buy with the same
+  // key records a new live lease and re-adds the peer (WireGuard keys a peer by its
+  // pubkey). Cleanup must NOT `wg ... remove` K — that would cut the renewed buyer.
+  const now = new Date();
+  const past = new Date(now.getTime() - 1000).toISOString();
+  const future = new Date(now.getTime() + 60_000).toISOString();
+  const mk = (purchaseId: string, expiresAt: string, tunnelIp: string): PeerLease =>
+    ({ purchaseId, clientPublicKey: 'K', tunnelIp, createdAt: past, expiresAt, status: 'active' });
+
+  // Post-renewal state: old lease expired-by-time but still status 'active', plus a
+  // fresh live lease for the same key.
+  const renewed = createMemoryLedger([mk('old', past, '10.77.0.2'), mk('new', future, '10.77.0.3')]);
+  let execCalls = 0;
+  const fakeExec = async () => { execCalls += 1; return []; };
+  const r1 = await cleanupExpiredPeers(renewed, 'wg0', false, now, serialize(), fakeExec as never);
+  assert.equal(execCalls, 0, 'no wg command issued — the renewed peer is left alone');
+  assert.deepEqual(r1.skipped.map((l) => l.purchaseId), ['old'], 'the stale lease is skipped, not cleaned');
+  const stillActive = (await renewed.list(now)).filter((l) => l.status === 'active');
+  assert.deepEqual(stillActive.map((l) => l.purchaseId), ['new'], 'the renewal stays active');
+
+  // Control: with no renewal, the same expired lease IS removed.
+  const orphan = createMemoryLedger([mk('old', past, '10.77.0.2')]);
+  execCalls = 0;
+  const r2 = await cleanupExpiredPeers(orphan, 'wg0', false, now, serialize(), fakeExec as never);
+  assert.equal(execCalls, 1, 'expired peer removed when no live lease claims its key');
+  assert.deepEqual(r2.cleaned.map((l) => l.purchaseId), ['old']);
 });
 
 test('file ledger allocateAndRecord serializes allocation — no IP collisions under concurrency', async () => {

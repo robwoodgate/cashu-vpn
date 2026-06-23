@@ -8,7 +8,8 @@ import type { ProofStore } from './wallet.js';
 import type { LockBook } from './locks.js';
 import { newOrderId, type Order, type OrderStore } from './orders.js';
 import { createRateLimiter, type RateLimiter } from './ratelimit.js';
-import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, enforceDataCaps, validatePublicKey } from './wireguard.js';
+import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, enforceDataCaps, validatePublicKey, type WgLock } from './wireguard.js';
+import { serialize } from './serialize.js';
 import { buildPaymentRequest, verifyPayment, normalizePubkey, type VerifyResult, type VerifyDeps } from './cashu.js';
 import { getEncodedToken, type Proof } from '@cashu/cashu-ts';
 
@@ -49,6 +50,13 @@ interface Ctx extends ServerDeps {
    * per-secret reservation needed.
    */
   processing: Set<string>;
+  /**
+   * Shared serializer for WireGuard mutations, so provisioning's `wg set` and
+   * cleanup's `wg ... remove` can't interleave on a peer keyed by the same
+   * WireGuard public key (a concurrent re-buy with that key would otherwise be
+   * cut by cleanup acting on a stale snapshot).
+   */
+  wgLock: WgLock;
 }
 
 export function createServer(deps: ServerDeps): http.Server {
@@ -58,7 +66,9 @@ export function createServer(deps: ServerDeps): http.Server {
     ? createRateLimiter({ max: config.rateLimitMax, windowMs: config.rateLimitWindowMs })
     : undefined;
 
-  const ctx: Ctx = { ...deps, limiter, processing: new Set() };
+  // ponytail: one global wg lock; switch to per-pubkey locks only if provisioning
+  // throughput ever makes a global serializer the bottleneck.
+  const ctx: Ctx = { ...deps, limiter, processing: new Set(), wgLock: serialize() };
 
   // Housekeeping interval: remove expired WireGuard peers, then forget records
   // whose lease expired more than retainExpiredMs ago. Pruning keeps the lease
@@ -89,14 +99,14 @@ export function createServer(deps: ServerDeps): http.Server {
 async function housekeep(ctx: Ctx): Promise<void> {
   const { config, ledger, orderStore } = ctx;
   try {
-    await cleanupExpiredPeers(ledger, config.wgInterface, config.mode === 'dry-run');
+    await cleanupExpiredPeers(ledger, config.wgInterface, config.mode === 'dry-run', new Date(), ctx.wgLock);
   } catch (e) {
     console.error('peer cleanup failed:', e instanceof Error ? e.message : e);
   }
   if (config.leaseDataCapBytes > 0) {
     try {
       const capped = await enforceDataCaps(
-        ledger, config.wgInterface, config.leaseDataCapBytes, config.mode === 'dry-run'
+        ledger, config.wgInterface, config.leaseDataCapBytes, config.mode === 'dry-run', new Date(), ctx.wgLock
       );
       for (const lease of capped.cleaned) {
         console.log(`disconnected ${lease.purchaseId} (${lease.tunnelIp}): data cap reached`);
@@ -478,17 +488,33 @@ async function provisionPeer(
   const { tunnelIp } = lease;
 
   if (config.mode === 'live') {
-    try {
-      await (ctx.execPlan ?? executePlan)(planAddPeer(config.wgInterface, clientPublicKey, tunnelIp));
-    } catch (e) {
-      // Roll back the reservation so a failed `wg set` doesn't leave an active
-      // lease holding an IP for a peer that was never added — AND re-activate any
-      // prior same-key lease we expired, so its still-live peer keeps getting
-      // reaped by cleanup instead of being orphaned on the interface forever.
-      await ledger.markExpired(purchaseId).catch(() => {});
-      if (expiredPriorIds.length) await ledger.reactivate(expiredPriorIds).catch(() => {});
-      throw e;
-    }
+    const exec = ctx.execPlan ?? executePlan;
+    // Under the shared wg lock so this `wg set` can't interleave with cleanup's
+    // `wg ... remove` on the same peer key (see Ctx.wgLock).
+    await ctx.wgLock(async () => {
+      try {
+        await exec(planAddPeer(config.wgInterface, clientPublicKey, tunnelIp));
+      } catch (e) {
+        // Roll back the reservation so a failed `wg set` doesn't leave an active
+        // lease holding an IP for a peer that was never added — AND re-activate any
+        // prior same-key lease we expired, so its still-live peer keeps getting
+        // reaped by cleanup instead of being orphaned on the interface forever.
+        await ledger.markExpired(purchaseId).catch(() => {});
+        if (expiredPriorIds.length) {
+          await ledger.reactivate(expiredPriorIds).catch(() => {});
+          // A renewal's `wg set` may have already clobbered the prior peer's
+          // allowed-ips/route to this (failed) lease's IP before failing. Re-apply
+          // each reactivated lease's own config so the previously-paid buyer keeps
+          // working — cleanup only ever removes peers, it never re-adds them.
+          const priorIds = new Set(expiredPriorIds);
+          const priors = (await ledger.list().catch(() => [])).filter((l) => priorIds.has(l.purchaseId));
+          for (const p of priors) {
+            await exec(planAddPeer(config.wgInterface, p.clientPublicKey, p.tunnelIp)).catch(() => {});
+          }
+        }
+        throw e;
+      }
+    });
   }
 
   const clientConfig = generateClientConfig({

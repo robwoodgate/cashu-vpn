@@ -29,6 +29,14 @@ export interface CleanupResult {
   skipped: PeerLease[];
 }
 
+/**
+ * A serializer shared by provisioning and cleanup so their WireGuard mutations
+ * can't interleave on a shared peer key. Same shape as serialize() — pass the
+ * one instance to both sides. Defaults to running inline (no shared lock).
+ */
+export type WgLock = <T>(fn: () => Promise<T>) => Promise<T>;
+const runDirect: WgLock = (fn) => fn();
+
 // --- Interface validation ---
 
 export function validateInterface(name: string): string {
@@ -219,6 +227,36 @@ export async function readPeerTransfers(iface: string): Promise<Map<string, Peer
   return transfers;
 }
 
+// --- Shared peer removal ---
+
+/**
+ * Remove a peer for a lease we snapshotted as removable — but FIRST re-check, under
+ * the shared wg lock, that no *other* live lease still claims this WireGuard key. A
+ * concurrent re-buy with the same key (allocateAndRecord expires our snapshotted
+ * lease and records a new live one, then `wg set`s the peer to a new IP) would
+ * otherwise be cut by our `wg ... peer remove`, since WireGuard keys a peer by its
+ * pubkey. Returns true if the peer was removed. Must be called inside the wg lock so
+ * the re-check and the removal are atomic w.r.t. provisioning's `wg set`.
+ */
+async function removeStalePeer(
+  ledger: PeerLedger,
+  iface: string,
+  lease: PeerLease,
+  now: Date,
+  exec: typeof executePlan
+): Promise<boolean> {
+  const renewed = (await ledger.list(now)).some(
+    (l) =>
+      l.clientPublicKey === lease.clientPublicKey &&
+      l.status === 'active' &&
+      l.purchaseId !== lease.purchaseId
+  );
+  if (renewed) return false; // a re-buy owns this key now — leave its peer alone
+  await exec(planRemovePeer(iface, lease.clientPublicKey, lease.tunnelIp));
+  await ledger.markExpired(lease.purchaseId);
+  return true;
+}
+
 // --- Data-cap enforcement ---
 
 /**
@@ -250,7 +288,9 @@ export async function enforceDataCaps(
   iface: string,
   capBytes: number,
   dryRun: boolean,
-  now = new Date()
+  now = new Date(),
+  wgLock: WgLock = runDirect,
+  exec: typeof executePlan = executePlan
 ): Promise<CleanupResult> {
   if (!(capBytes > 0)) return { inspected: 0, cleaned: [], skipped: [] };
 
@@ -268,11 +308,12 @@ export async function enforceDataCaps(
       continue;
     }
 
-    const plan = planRemovePeer(iface, lease.clientPublicKey, lease.tunnelIp);
     try {
-      await executePlan(plan);
-      await ledger.markExpired(lease.purchaseId);
-      cleaned.push({ ...lease, status: 'expired' });
+      if (await wgLock(() => removeStalePeer(ledger, iface, lease, now, exec))) {
+        cleaned.push({ ...lease, status: 'expired' });
+      } else {
+        skipped.push(lease);
+      }
     } catch {
       skipped.push(lease);
     }
@@ -287,7 +328,9 @@ export async function cleanupExpiredPeers(
   ledger: PeerLedger,
   iface: string,
   dryRun: boolean,
-  now = new Date()
+  now = new Date(),
+  wgLock: WgLock = runDirect,
+  exec: typeof executePlan = executePlan
 ): Promise<CleanupResult> {
   const expired = await ledger.listExpiredActive(now);
   const cleaned: PeerLease[] = [];
@@ -299,11 +342,12 @@ export async function cleanupExpiredPeers(
       continue;
     }
 
-    const plan = planRemovePeer(iface, lease.clientPublicKey, lease.tunnelIp);
     try {
-      await executePlan(plan);
-      await ledger.markExpired(lease.purchaseId);
-      cleaned.push({ ...lease, status: 'expired' });
+      if (await wgLock(() => removeStalePeer(ledger, iface, lease, now, exec))) {
+        cleaned.push({ ...lease, status: 'expired' });
+      } else {
+        skipped.push(lease);
+      }
     } catch {
       skipped.push(lease);
     }
