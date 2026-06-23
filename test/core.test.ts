@@ -1456,16 +1456,20 @@ function xpubVerifyDeps(xpub: string): VerifyDeps {
   };
 }
 
-// POST /purchase with no token: create an order (issues the next xpub child).
+// POST /purchase: create an order (issues the next xpub child). Returns the Response.
 const newOrder = (url: string) => fetch(`${url}/purchase`, {
   method: 'POST', headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
 });
-// POST /purchase with X-Cashu: inline-deliver the token for child `idx`.
-const deliverInlineTok = (url: string, idx: number) => fetch(`${url}/purchase`, {
-  method: 'POST', headers: { 'content-type': 'application/json', 'x-cashu': fakeToken(idx) },
-  body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+// Deliver the token for child `idx` to its order's /pay sink.
+const payOrder = (url: string, orderId: string, idx: number) => fetch(`${url}/pay/${orderId}`, {
+  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: fakeToken(idx) }),
 });
+// Create an order and pay it in one step; returns the final /pay Response.
+async function buyViaPay(url: string, idx: number): Promise<Response> {
+  const { orderId } = await (await newOrder(url)).json();
+  return payOrder(url, orderId, idx);
+}
 
 test('concurrent /pay deliveries for one order provision exactly once', async () => {
   const ledger = createMemoryLedger();
@@ -1487,34 +1491,6 @@ test('concurrent /pay deliveries for one order provision exactly once', async ()
   }, LIVE_ENV, { ledger, proofStore, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
 });
 
-test('concurrent inline deliveries bind to one order and provision exactly once', async () => {
-  const ledger = createMemoryLedger();
-  const proofStore = slowProofStore(40);
-  const lockBook = await createLockBook(TEST_XPUB);
-  await withServer(async (url) => {
-    await newOrder(url); // order for child 0
-    // 8 concurrent inline deliveries of the same token all resolve to that order.
-    const codes = (await Promise.all(Array.from({ length: 8 }, () => deliverInlineTok(url, 0)))).map((x) => x.status);
-
-    assert.equal((await ledger.list()).length, 1, 'exactly one lease provisioned');
-    assert.equal((await proofStore.list()).length, 1, 'exactly one receipt stored');
-    assert.ok(codes.includes(200), 'at least one delivery succeeds');
-    assert.ok(codes.every((c) => c === 200 || c === 409), `unexpected status: ${codes}`);
-  }, LIVE_ENV, { ledger, proofStore, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
-});
-
-test('inline delivery for an issued lock with no order is rejected (replay after prune)', async () => {
-  // child 0 IS a lock we issued (resolves), but no order exists for it — the state
-  // after a swept order is pruned. Must reject, not provision a free lease.
-  const lockBook = await createLockBook(TEST_XPUB);
-  await lockBook.issue(); // advance the counter so child 0 resolves...
-  await withServer(async (url) => {
-    const res = await deliverInlineTok(url, 0); // ...but no order was ever stored for it
-    assert.equal(res.status, 402);
-    assert.equal((await res.json()).detail, 'no_matching_order');
-  }, LIVE_ENV, { verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
-});
-
 test('/pay rejects a token locked to a different order (per-order binding)', async () => {
   // The binding is the replay defense: a token can only satisfy the order whose
   // unique lock it carries — so an old/foreign token can't redeem a fresh order.
@@ -1530,18 +1506,22 @@ test('/pay rejects a token locked to a different order (per-order binding)', asy
   }, LIVE_ENV, { verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
 });
 
-test('inline delivery to an already-ready order returns the config (idempotent)', async () => {
+test('/pay returns the config bundle, and a repeat delivery is idempotent', async () => {
+  const ledger = createMemoryLedger();
   const lockBook = await createLockBook(TEST_XPUB);
   await withServer(async (url) => {
-    await newOrder(url);                          // child 0
-    const first = await deliverInlineTok(url, 0); // provisions
+    const { orderId } = await (await newOrder(url)).json(); // child 0
+    const first = await payOrder(url, orderId, 0);
     assert.equal(first.status, 200);
     const firstBody = await first.json();
-    const again = await deliverInlineTok(url, 0); // same token again
+    // An agent POSTing to /pay gets the config in the response (no /order poll).
+    assert.ok(firstBody.clientConfig && firstBody.tunnelIp, 'config returned inline from /pay');
+
+    const again = await payOrder(url, orderId, 0); // same token again
     assert.equal(again.status, 200);
-    const againBody = await again.json();
-    assert.equal(againBody.tunnelIp, firstBody.tunnelIp, 'idempotent: same config returned, not a second lease');
-  }, LIVE_ENV, { verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
+    assert.equal((await again.json()).tunnelIp, firstBody.tunnelIp, 'idempotent: same config, not a second lease');
+    assert.equal((await ledger.list()).length, 1, 'exactly one lease');
+  }, LIVE_ENV, { ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
 });
 
 test('malformed JSON returns 400 and an oversized body 413 (not 500)', async () => {
@@ -1567,8 +1547,8 @@ test('re-buying with an already-active key replaces the old lease (no early disc
   const ledger = createMemoryLedger();
   const lockBook = await createLockBook(TEST_XPUB);
   await withServer(async (url) => {
-    await newOrder(url); await deliverInlineTok(url, 0); // order child 0 → lease 1
-    await newOrder(url); await deliverInlineTok(url, 1); // order child 1 → lease 2 (same key)
+    await buyViaPay(url, 0); // order child 0 → lease 1
+    await buyViaPay(url, 1); // order child 1 → lease 2 (same key)
 
     const all = await ledger.list();
     assert.equal(all.length, 2, 'both purchases recorded a lease');
@@ -1585,10 +1565,8 @@ test('a failed wg renewal keeps the original lease active (no orphaned peer)', a
   let calls = 0;
   const execPlan = async () => { calls += 1; if (calls === 2) throw new Error('wg down'); return []; };
   await withServer(async (url) => {
-    await newOrder(url);
-    assert.equal((await deliverInlineTok(url, 0)).status, 200); // first lease provisioned
-    await newOrder(url);
-    assert.equal((await deliverInlineTok(url, 1)).status, 500); // renewal: wg fails mid-provision → rolled back
+    assert.equal((await buyViaPay(url, 0)).status, 200); // first lease provisioned
+    assert.equal((await buyViaPay(url, 1)).status, 500); // renewal: wg fails mid-provision → rolled back
 
     const all = await ledger.list();
     assert.equal(all.length, 2, 'both leases recorded');

@@ -74,12 +74,12 @@ function hasEscapeClause(secret: string): boolean {
 /**
  * Build the NUT-18 PaymentRequest (creqA) used as the NUT-24 402 challenge.
  * `lockPubkey` is the P2PK pubkey the requested proofs must be locked to — a
- * fixed operator pubkey, or a fresh xpub-derived per-tx pubkey (see locks.ts).
+ * fresh xpub-derived per-tx pubkey (see locks.ts).
  *
- * When `transportTarget` is set the request carries a NUT-18 HTTP POST transport,
- * so a NUT-18 wallet pays and POSTs the proofs straight to that URL (the
- * per-order /pay/:orderId sink) — no copy/paste. A NUT-24 agent ignores the
- * transport and delivers the same proofs via the `X-Cashu` retry header instead.
+ * The request carries a NUT-18 HTTP POST transport, so a wallet pays and POSTs the
+ * proofs straight to that URL (the per-order /pay/:orderId sink) — no copy/paste.
+ * An agent does the same: decode the creqA, mint locked proofs, POST to the
+ * transport target, then read the config from the response (or poll /order).
  */
 export function buildPaymentRequest(opts: {
   paymentId: string;
@@ -185,8 +185,8 @@ const defaultLoadMintContext = async (mint: string, unit: string): Promise<MintC
 };
 
 /**
- * Verify a Cashu token delivered via the `X-Cashu` header, fully offline.
- * Returns the operator-locked token + proof secrets on success; never swaps.
+ * Verify a delivered Cashu token fully offline (no swap, no per-sale mint call).
+ * Returns the operator-locked token + proof secrets on success.
  */
 export async function verifyPayment(
   encodedToken: string,

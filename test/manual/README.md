@@ -11,13 +11,12 @@ confirms a config comes back.
 ```bash
 # Point at your daemon (defaults to http://127.0.0.1:3087)
 DAEMON=https://vpn.example.com node test/manual/pay-order.mjs
-DAEMON=https://vpn.example.com node test/manual/pay-header.mjs
 ```
 
-- **pay-order.mjs** — the per-order flow: `POST /purchase` → pay → `POST /pay/:id`
-  → poll `GET /order/:id`. This is what a browser/NUT-18 wallet does.
-- **pay-header.mjs** — the single-request NUT-24 flow: pay and retry `POST
-  /purchase` with an `X-Cashu` header. This is what an automated client does.
+- **pay-order.mjs** — the delivery flow: `POST /purchase` → decode the creqA →
+  mint locked proofs → `POST /pay/:id`. The `.conf` comes back in the `/pay`
+  response (what an agent reads); the script also polls `GET /order/:id`, the way
+  the browser does (the browser isn't the one POSTing to `/pay`).
 
 Use a test mint such as `https://testnut.cashudevkit.org` (free) so you're not
 spending real sats, and make sure the daemon's `ACCEPTED_MINTS` includes it.

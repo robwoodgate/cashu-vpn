@@ -44,9 +44,9 @@ interface Ctx extends ServerDeps {
   limiter?: RateLimiter;
   /**
    * Order ids currently being provisioned, to serialize concurrent deliveries to
-   * the same order. Every delivery (both /pay and the inline X-Cashu route) is
-   * bound to exactly one order, so this per-order guard is the whole concurrency
-   * story — no per-secret reservation needed.
+   * the same order. Every payment is delivered to /pay/:orderId, bound to exactly
+   * one order, so this per-order guard is the whole concurrency story — no
+   * per-secret reservation needed.
    */
   processing: Set<string>;
 }
@@ -235,15 +235,7 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     });
   }
 
-  // NUT-24 same-request path (agents): proofs delivered inline via X-Cashu. Bind
-  // the token to the pending order we issued its lock for (so a replayed/unexpected
-  // token with no matching order is rejected), then provision and return the config.
-  const headerToken = firstHeader(req.headers['x-cashu']);
-  if (headerToken) {
-    return await deliverInline(ctx, res, headerToken);
-  }
-
-  // Otherwise create an order and answer with a 402 + PaymentRequest. The creqA
+  // Create an order and answer with a 402 + PaymentRequest. The creqA
   // carries a NUT-18 POST transport to /pay/:orderId, so a wallet pays and
   // delivers automatically; the browser polls GET /order/:orderId.
   const lock = await ctx.lockBook.issue();
@@ -298,7 +290,11 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
   // re-verify. (includeExpired: a wallet may deliver just after the TTL.)
   const order = await ctx.orderStore.get(orderId, undefined, { includeExpired: true });
   if (!order) return json(res, 404, { error: 'order_not_found' });
-  if (order.status === 'ready') return json(res, 200, { ok: true, status: 'ready' });
+  // Idempotent: already provisioned. Return the config too, so an agent that POSTs
+  // here itself gets the .conf in one shot (a wallet just ignores the extra fields).
+  if (order.status === 'ready') {
+    return json(res, 200, { ok: true, status: 'ready', ...readyBundleOf(order), mode: ctx.config.mode });
+  }
 
   const body = await readBody(req);
   console.log(`[pay] order=${tag} payload=${describePayload(body)}`);
@@ -322,28 +318,9 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
     return json(res, r.status, r.status === 402 ? { error: 'payment_failed', detail: r.error } : { error: r.error });
   }
   if (r.kind === 'provisioned') console.log(`[pay] order=${tag} ready: ${r.payment.amountSats} sat`);
-  return json(res, 200, { ok: true, status: 'ready' });
-}
-
-// --- POST /purchase with X-Cashu (inline NUT-24 delivery) ---
-
-// Bind an inline token to the pending order we issued its lock for, then provision
-// (or return the existing config if already ready). A token with no matching order
-// — a replay of a swept token whose order is gone, or a never-ordered token — is
-// rejected, exactly as /pay rejects a lock_mismatch.
-async function deliverInline(ctx: Ctx, res: ServerResponse, encodedToken: string): Promise<void> {
-  const verified = await verifyAndAuthorize(ctx, encodedToken);
-  if ('error' in verified) return json(res, 402, { error: 'payment_failed', detail: verified.error });
-
-  const order = await ctx.orderStore.findByLock(verified.payment.lockPubkey!);
-  if (!order) return json(res, 402, { error: 'payment_failed', detail: 'no_matching_order' });
-
-  const r = await provisionOrder(ctx, order.id, verified);
-  if (r.kind === 'error') {
-    return json(res, r.status, r.status === 402 ? { error: 'payment_failed', detail: r.error } : { error: r.error });
-  }
-  // Provisioned now, or already ready (idempotent) — either way return the config.
-  return json(res, 200, { ...readyBundleOf(r.order), mode: ctx.config.mode });
+  // Return the config bundle: an agent POSTing here gets the .conf synchronously,
+  // no /order poll needed. Browser/NUT-18 wallet ignores the extra fields.
+  return json(res, 200, { ok: true, status: 'ready', ...readyBundleOf(r.order), mode: ctx.config.mode });
 }
 
 /** The buyer-facing config bundle for a ready order. */

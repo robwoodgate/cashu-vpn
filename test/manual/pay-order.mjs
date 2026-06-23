@@ -1,7 +1,7 @@
-// Buyer-side test client for the PER-ORDER path: get the 402 (order id + creqA
-// with a NUT-18 POST transport), mint P2PK-locked proofs at the test mint, POST
-// the NUT-18 payload to /pay/:orderId, then poll /order/:orderId for the .conf.
-// (The NUT-24 X-Cashu header path is covered by testclient.mjs.)
+// Buyer/agent test client: get the 402 (order id + creqA with a NUT-18 POST
+// transport), mint P2PK-locked proofs at the test mint, POST the NUT-18 payload
+// to /pay/:orderId. The .conf comes back in the /pay response (the agent path);
+// this script also polls /order/:orderId, the way the browser does.
 import { Wallet, OutputData, decodePaymentRequest } from '@cashu/cashu-ts';
 import { generateKeyPairSync } from 'node:crypto';
 
@@ -45,15 +45,17 @@ const outputs = OutputData.createP2PKData({ pubkey: lockPubkey }, amount, keyset
 const proofs = await wallet.ops.mintBolt11(amount, quote).asCustom(outputs).run();
 log({ step: 'minted', proofs: proofs.length, hasDleq: proofs.every((p) => p.dleq != null) });
 
-// 3) Deliver the NUT-18 payload to the order's transport sink
+// 3) Deliver the NUT-18 payload to the order's transport sink. The .conf comes
+//    back here directly — an agent can stop at this step.
 const r2 = await fetch(`${DAEMON}/pay/${orderId}`, {
   method: 'POST', headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ id: orderId, mint: mintUrl, unit: 'sat', proofs }),
 });
-log({ step: 'pay', status: r2.status, body: await r2.json() });
+const payBody = await r2.json();
+log({ step: 'pay', status: r2.status, tunnelIp: payBody.tunnelIp, hasConfig: !!payBody.clientConfig });
 if (r2.status !== 200) process.exit(1);
 
-// 4) Poll the order until ready
+// 4) Poll the order until ready (the browser path — it isn't the one POSTing above)
 for (let i = 0; i < 15; i++) {
   const r = await fetch(`${DAEMON}/order/${orderId}`);
   const d = await r.json();
