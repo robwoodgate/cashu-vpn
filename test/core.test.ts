@@ -1314,13 +1314,30 @@ test('allocateAndRecord expires a prior active lease for the same key (one key, 
   const ledger = createMemoryLedger();
   const now = new Date();
   const expiresAt = new Date(now.getTime() + 60_000).toISOString();
-  await ledger.allocateAndRecord({ purchaseId: 'a', clientPublicKey: 'K', now, expiresAt, allocate: lowestFree });
+  const first = await ledger.allocateAndRecord({ purchaseId: 'a', clientPublicKey: 'K', now, expiresAt, allocate: lowestFree });
   const second = await ledger.allocateAndRecord({ purchaseId: 'b', clientPublicKey: 'K', now, expiresAt, allocate: lowestFree });
+  assert.deepEqual(second.expiredPriorIds, ['a'], 'the prior same-key lease is reported as expired');
+  assert.deepEqual(first.expiredPriorIds, [], 'the first lease expired nothing');
   const active = (await ledger.list()).filter((l) => l.status === 'active');
   assert.equal(active.length, 1, 'the prior lease for this key is expired');
   assert.equal(active[0]!.purchaseId, 'b', 'the newest lease wins');
   assert.equal((await ledger.list()).length, 2, 'the old lease is expired, not deleted');
-  assert.ok(second.tunnelIp.startsWith('10.77.0.'));
+  assert.ok(second.lease.tunnelIp.startsWith('10.77.0.'));
+});
+
+test('reactivate restores an expired lease (rollback of a failed renewal)', async () => {
+  const ledger = createMemoryLedger();
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 60_000).toISOString();
+  const first = await ledger.allocateAndRecord({ purchaseId: 'a', clientPublicKey: 'K', now, expiresAt, allocate: lowestFree });
+  const second = await ledger.allocateAndRecord({ purchaseId: 'b', clientPublicKey: 'K', now, expiresAt, allocate: lowestFree });
+  // Simulate provisionPeer's wg-failure rollback: expire the new, re-activate the prior.
+  await ledger.markExpired('b');
+  await ledger.reactivate(second.expiredPriorIds);
+  const active = (await ledger.list()).filter((l) => l.status === 'active');
+  assert.equal(active.length, 1, 'exactly one active lease after rollback');
+  assert.equal(active[0]!.purchaseId, 'a', 'the original lease is live again, so cleanup still reaps its peer');
+  assert.ok(first.lease.tunnelIp.startsWith('10.77.0.'));
 });
 
 test('file ledger allocateAndRecord serializes allocation — no IP collisions under concurrency', async () => {
@@ -1331,9 +1348,9 @@ test('file ledger allocateAndRecord serializes allocation — no IP collisions u
     const expiresAt = new Date(Date.now() + 60_000).toISOString();
     // 20 distinct keys provisioning at once: if the read-allocate-write weren't
     // serialized, they'd read the same free-IP snapshot and pick duplicate /32s.
-    const leases = await Promise.all(Array.from({ length: 20 }, (_, i) =>
+    const results = await Promise.all(Array.from({ length: 20 }, (_, i) =>
       ledger.allocateAndRecord({ purchaseId: `p${i}`, clientPublicKey: `key-${i}`, now: new Date(), expiresAt, allocate: lowestFree })));
-    assert.equal(new Set(leases.map((l) => l.tunnelIp)).size, 20, 'every concurrent allocation got a distinct IP');
+    assert.equal(new Set(results.map((r) => r.lease.tunnelIp)).size, 20, 'every concurrent allocation got a distinct IP');
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -1511,6 +1528,29 @@ test('re-buying with an already-active key replaces the old lease (no early disc
     const active = all.filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
     assert.equal(active.length, 1, 'one key holds exactly one active lease (old one expired, not removed)');
   }, LIVE_ENV, { ledger, verifyDeps, execPlan: async () => [] });
+});
+
+test('a failed wg renewal keeps the original lease active (no orphaned peer)', async () => {
+  // Renewal expires the prior lease atomically; if `wg set` then fails, the prior
+  // lease must be re-activated, or cleanup (active-only) never reaps its live peer.
+  const ledger = createMemoryLedger();
+  let n = 0;
+  const verifyDeps: VerifyDeps = { ...PASS_VERIFY, decode: () => [{ id: 'k1', secret: `u${n++}`, amount: 1000 }] as never };
+  let calls = 0;
+  const execPlan = async () => { calls += 1; if (calls === 2) throw new Error('wg down'); return []; };
+  await withServer(async (url) => {
+    const buy = () => fetch(`${url}/purchase`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-cashu': 'tok' },
+      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+    });
+    assert.equal((await buy()).status, 200);            // first lease provisioned
+    assert.equal((await buy()).status, 500);            // renewal: wg fails mid-provision → rolled back
+
+    const all = await ledger.list();
+    assert.equal(all.length, 2, 'both leases recorded');
+    const active = all.filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
+    assert.equal(active.length, 1, 'the original lease is active again — its peer stays reapable, not orphaned');
+  }, LIVE_ENV, { ledger, verifyDeps, execPlan: execPlan as never });
 });
 
 // --- Real P2PK secret parsing through verifyPayment (offline, no mint) ---
