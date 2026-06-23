@@ -1645,6 +1645,27 @@ test('a failed wg renewal keeps the original lease active (no orphaned peer)', a
   }, LIVE_ENV, { ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: execPlan as never, lockBook });
 });
 
+test('a failed FRESH provision removes the peer wg set may have added', async () => {
+  // No prior lease for this key, so rollback can't re-activate anything — it must
+  // best-effort remove the just-added peer instead of orphaning it on the interface.
+  const ledger = createMemoryLedger();
+  const lockBook = await createLockBook(TEST_XPUB);
+  const plans: string[][] = [];
+  const execPlan = async (plan: { steps: { argv: string[] }[] }) => {
+    plans.push(plan.steps.map((s) => s.argv.join(' ')));
+    if (plans.length === 1) throw new Error('wg down'); // the add fails
+    return []; // the rollback remove succeeds
+  };
+  await withServer(async (url) => {
+    assert.equal((await buyViaPay(url, 0)).status, 500); // fresh provision fails mid-wg
+    const active = (await ledger.list()).filter((l) => l.status === 'active');
+    assert.equal(active.length, 0, 'no active lease left holding an IP');
+  }, LIVE_ENV, { ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: execPlan as never, lockBook });
+
+  assert.equal(plans.length, 2, 'rollback attempted a second wg op (the remove)');
+  assert.ok(plans[1]!.some((c) => c.includes('peer') && c.includes('remove')), 'second op removes the peer');
+});
+
 // --- Real P2PK secret parsing through verifyPayment (offline, no mint) ---
 //
 // The witness-pubkey extraction is the half of verification that breaks silently
