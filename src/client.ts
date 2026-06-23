@@ -18,6 +18,10 @@
 import { Wallet } from '@cashu/cashu-ts';
 import qrcode from 'qrcode-generator';
 import { decodeChallenge, waitForPaid, mintLockedPayload, type MintWallet, type Challenge } from './buyer.js';
+// Inlined as data-URIs by esbuild (--loader:.svg=dataurl). Centre-overlay marks for
+// the Cashu / Lightning QR tabs; the unified (BIP-321) tab shows none.
+import cashuIcon from './icons/cashu.svg';
+import lnIcon from './icons/lightning.svg';
 
 const $ = (id: string) => document.getElementById(id) as HTMLElement;
 const btn = (id: string) => document.getElementById(id) as HTMLButtonElement;
@@ -108,12 +112,21 @@ function flashButton(b: HTMLButtonElement): void {
 // Render a QR, and make the whole code click-to-copy. `qrText` is what the QR
 // encodes; `copyText` is what gets copied (defaults to the same — they differ for
 // the Lightning invoice, whose QR is uppercased for density but copies as-is).
-function renderQR(elId: string, qrText: string, copyText: string = qrText): void {
+function renderQR(elId: string, qrText: string, copyText: string = qrText, icon?: string): void {
   const qr = qrcode(0, 'M');
   qr.addData(qrText);
   qr.make();
   const el = $(elId);
   el.innerHTML = qr.createImgTag(4, 8);
+  el.style.position = 'relative';
+  el.style.display = 'inline-block';
+  // Small centre logo (~3% of QR area) — well within 'M' error correction.
+  if (icon) {
+    const ic = document.createElement('img');
+    ic.src = icon;
+    ic.className = 'qricon';
+    el.appendChild(ic);
+  }
   el.title = 'Click to copy';
   el.style.cursor = 'pointer';
   el.onclick = async () => {
@@ -151,15 +164,87 @@ function download(conf: string, name: string): void {
   a.click();
 }
 
-// Show the pay panel for an order (its creqA, QR, and amount), and arm the
-// Lightning + Cashu-wallet paths by setting the active order/challenge.
+// --- Unified pay panel: Auto (BIP-321) / Lightning / Cashu tabs ---
+
+type PayMode = 'unified' | 'lightning' | 'cashu';
+const payQr: Record<PayMode, string> = { unified: '', lightning: '', cashu: '' };
+const payCopy: Record<PayMode, string> = { unified: '', lightning: '', cashu: '' };
+let payMode: PayMode = 'unified';
+
+const PAY_TIPS: Record<PayMode, string> = {
+  unified: 'Scan with any Lightning or Cashu wallet — it uses whichever rail it supports. Keep this page open.',
+  lightning: 'Pay this Lightning invoice with any wallet. The ecash is minted here and delivered automatically — keep this page open.',
+  cashu: 'Scan or copy with a NUT-18 Cashu wallet that supports P2PK (NUT-11). It pays and delivers automatically.',
+};
+
+// Centre-overlay mark per tab. Unified (BIP-321) shows none — dual-protocol, and
+// the denser payload wants the error-correction headroom.
+const PAY_ICONS: Record<PayMode, string | undefined> = { unified: undefined, lightning: lnIcon, cashu: cashuIcon };
+
+// Render the active tab's QR + copy text (or a placeholder until the quote lands).
+function drawTab(mode: PayMode): void {
+  payMode = mode;
+  document.querySelectorAll('[data-tab]').forEach((b) => {
+    const active = (b as HTMLElement).dataset.tab === mode;
+    b.classList.toggle('is-active', active);
+    b.setAttribute('aria-selected', String(active));
+  });
+  $('paytip').textContent = PAY_TIPS[mode];
+  if (payQr[mode]) {
+    renderQR('payqr', payQr[mode], payCopy[mode] || payQr[mode], PAY_ICONS[mode]);
+    $('paytext').textContent = payCopy[mode] || payQr[mode];
+  } else {
+    $('payqr').innerHTML = '<div class="empty">Generating invoice…</div>';
+    $('paytext').textContent = '';
+  }
+}
+
+// Show the pay panel. The Cashu request works immediately; the Auto (BIP-321) and
+// Lightning QRs fill in once the in-browser mint quote is ready (armLightning).
 function openPayPanel(orderId: string, creq: string): void {
   currentOrderId = orderId;
   challenge = decodeChallenge(creq);
-  $('creq').textContent = creq;
-  renderQR('qrcreq', creq);
   $('payamt').textContent = challenge.amount + ' ' + challenge.unit;
+  payQr.unified = ''; payQr.lightning = ''; payQr.cashu = creq;
+  payCopy.unified = ''; payCopy.lightning = ''; payCopy.cashu = creq;
   $('pay').style.display = '';
+  drawTab('unified');
+  void armLightning(orderId, creq);
+}
+
+// Browser-side: create a mint quote, build the Auto (BIP-321) + Lightning payloads,
+// then wait for the invoice to be paid and mint+deliver the locked proofs. The mint
+// call is per-buyer (fanned out across their own IPs), never via our server.
+async function armLightning(orderId: string, creq: string): Promise<void> {
+  if (!challenge) return;
+  try {
+    const wallet = new Wallet(challenge.mintUrl, { unit: challenge.unit });
+    await wallet.loadMint();
+    const w = wallet as unknown as MintWallet;
+    const quote = await w.createMintQuoteBolt11(challenge.amount);
+    const bolt11 = quote.request ?? '';
+    if (currentOrderId !== orderId) return; // a newer order took over while we waited
+    // BIP-321 unified URI carries both rails; uppercased for a denser QR.
+    const unified = 'bitcoin:?lightning=' + bolt11.toUpperCase() + '&creq=' + creq;
+    payQr.unified = unified; payCopy.unified = unified;
+    payQr.lightning = 'lightning:' + bolt11.toUpperCase(); payCopy.lightning = bolt11;
+    drawTab(payMode); // re-render the current tab now that the payloads exist
+
+    const paid = await waitForPaid(w, quote.quote, { intervalMs: 2000, tries: 150 });
+    if (!paid || currentOrderId !== orderId) return;
+    setMsg('Minting & delivering…');
+    const payload = await mintLockedPayload(w, challenge, quote);
+    const r = await fetch('/pay/' + encodeURIComponent(orderId), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: orderId, ...payload }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { setMsg(d.detail ?? d.error ?? 'Delivery failed', 'err'); return; }
+    if (d.clientConfig) applyReady(orderId, d); else void poll(orderId); // /pay returns the config
+  } catch (e) {
+    // Mint/Lightning unreachable — the Cashu tab still works (a wallet pays the creqA).
+    if (currentOrderId === orderId) setMsg('Lightning unavailable; use the Cashu tab. (' + errText(e) + ')', 'err');
+  }
 }
 
 // Reopen a still-pending order after a reload, so it can be paid.
@@ -223,47 +308,24 @@ btn('buy').onclick = async () => {
   btn('buy').disabled = false;
 };
 
-// Pay with Lightning: mint P2PK-locked proofs in-browser, POST them to /pay/:id.
-btn('lnbtn').onclick = async () => {
-  if (!challenge || !currentOrderId) return;
-  btn('lnbtn').disabled = true;
-  try {
-    setMsg('Connecting to mint…');
-    const wallet = new Wallet(challenge.mintUrl, { unit: challenge.unit });
-    await wallet.loadMint();
-    const w = wallet as unknown as MintWallet;
-    const quote = await w.createMintQuoteBolt11(challenge.amount);
-    if (quote.request) {
-      $('lninvoice').textContent = quote.request;
-      renderQR('qrln', quote.request.toUpperCase(), quote.request); // QR uppercased for density; copy keeps original case
-    }
-    setMsg('Waiting for Lightning payment…');
-    const paid = await waitForPaid(w, quote.quote, { intervalMs: 2000, tries: 150 });
-    if (!paid) { setMsg('Invoice not paid in time.', 'err'); btn('lnbtn').disabled = false; return; }
-    setMsg('Minting & delivering…');
-    const payload = await mintLockedPayload(w, challenge, quote);
-    const r = await fetch('/pay/' + encodeURIComponent(currentOrderId), {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ id: currentOrderId, ...payload }),
-    });
-    if (!r.ok) {
-      const d = await r.json().catch(() => ({}));
-      setMsg(d.detail ?? d.error ?? 'Delivery failed', 'err');
-    } else {
-      setMsg('Delivered — finalizing…');
-      void poll(currentOrderId);
-    }
-  } catch (e) {
-    setMsg(errText(e), 'err');
-  }
-  btn('lnbtn').disabled = false;
-};
+// Tab switching + a single copy button for the active tab.
+document.querySelectorAll('[data-tab]').forEach((b) => {
+  b.addEventListener('click', () => drawTab((b as HTMLElement).dataset.tab as PayMode));
+});
+btn('copypay').onclick = async () => { if (await copyToClipboard(payCopy[payMode])) flashButton(btn('copypay')); };
 
-btn('copyreq').onclick = async () => { if (await copyToClipboard($('creq').textContent ?? '')) flashButton(btn('copyreq')); };
-btn('copyln').onclick = async () => { if (await copyToClipboard($('lninvoice').textContent ?? '')) flashButton(btn('copyln')); };
+// Apply a ready order's config: store it and, if it's the active order, show it.
+// Shared by the in-browser Lightning delivery and the /order poll (cashu-wallet path).
+function applyReady(id: string, d: { clientConfig?: string; tunnelIp?: string; lease?: { expiresAt?: string } }): void {
+  const rec = loadOrders().find((o) => o.id === id);
+  const conf = injectPriv(String(d.clientConfig ?? ''), rec?.priv ?? '');
+  upsertOrder({ id, status: 'ready', conf, tunnelIp: d.tunnelIp, expiresAt: d.lease?.expiresAt });
+  if (id === currentOrderId) showConfig(conf, id, d.tunnelIp, d.lease?.expiresAt);
+  renderAccess();
+}
 
 // Poll an order until it is ready (or gone). Many can run at once; dedup by id.
+// Catches the cashu-wallet path (a wallet delivers to /pay without this browser).
 async function poll(id: string): Promise<void> {
   if (!id || polling.has(id)) return;
   polling.add(id);
@@ -274,14 +336,7 @@ async function poll(id: string): Promise<void> {
       if (r.status === 404) { dropOrder(id); renderAccess(); return; }
       if (r.ok) {
         const d = await r.json();
-        if (d.status === 'ready') {
-          const rec = loadOrders().find((o) => o.id === id);
-          const conf = injectPriv(String(d.clientConfig ?? ''), rec?.priv ?? '');
-          upsertOrder({ id, status: 'ready', conf, tunnelIp: d.tunnelIp, expiresAt: d.lease?.expiresAt });
-          if (id === currentOrderId) showConfig(conf, id, d.tunnelIp, d.lease?.expiresAt);
-          renderAccess();
-          return;
-        }
+        if (d.status === 'ready') { applyReady(id, d); return; }
       }
       await sleep(2000);
     }

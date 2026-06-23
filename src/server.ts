@@ -692,8 +692,13 @@ function renderPage(config: Config): string {
     .empty { color: var(--muted); border: 1px dashed var(--line); border-radius: 8px; padding: 12px; margin-top: 8px; }
     h3 { font-size: 1rem; margin: 18px 0 4px; color: var(--text); }
     .ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
+    .tabs { display: flex; gap: 6px; margin: 14px 0 8px; }
+    .tab { background: #17202b; border: 1px solid var(--line); color: var(--muted); border-radius: 8px; padding: 8px 14px; font-weight: 600; cursor: pointer; }
+    .tab.is-active { background: var(--accent); color: #03121f; border-color: var(--accent); }
+    .paytip { min-height: 1.4em; margin-bottom: 6px; }
     .qr { margin-top: 10px; }
     .qr img { background: #fff; padding: 8px; border-radius: 8px; display: block; width: 240px; max-width: 100%; height: auto; image-rendering: pixelated; }
+    .qricon { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 44px; height: 44px; background: #fff; border-radius: 8px; padding: 4px; box-sizing: border-box; image-rendering: auto; }
     a { color: var(--accent); }
     .notice { border-color: var(--accent); color: var(--text); white-space: pre-wrap; }
     code { background: #080b10; border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font-size: .85em; }
@@ -730,19 +735,15 @@ ${config.notice ? `
 
   <div class="panel" id="pay" style="display:none">
     <h2>Pay <span id="payamt">${esc(price)}</span></h2>
-
-    <h3>⚡ Pay with Lightning</h3>
-    <p>No Cashu wallet needed! Pay a Lightning invoice and we mint the ecash in your browser and deliver it. Payments in sats using Cashu ecash for privacy.</p>
-    <div class="row" style="margin-top:10px"><button id="lnbtn" type="button">Generate Lightning invoice</button></div>
-    <div id="qrln" class="qr"></div>
-    <pre id="lninvoice"></pre>
-    <button type="button" id="copyln" class="ghost">Copy invoice</button>
-
-    <h3>Or pay with a Cashu wallet</h3>
-    <p>Scan or copy this payment request with a NUT-18 wallet that supports P2PK Locked tokens (NUT-11). It pays and delivers the ecash automatically, and this page updates itself.</p>
-    <div id="qrcreq" class="qr"></div>
-    <pre id="creq"></pre>
-    <button type="button" id="copyreq" class="ghost">Copy request</button>
+    <div class="tabs" role="tablist">
+      <button class="tab is-active" data-tab="unified" role="tab" aria-selected="true" type="button">Auto</button>
+      <button class="tab" data-tab="lightning" role="tab" aria-selected="false" type="button">⚡ Lightning</button>
+      <button class="tab" data-tab="cashu" role="tab" aria-selected="false" type="button">Cashu</button>
+    </div>
+    <p class="paytip" id="paytip"></p>
+    <div id="payqr" class="qr"></div>
+    <pre id="paytext"></pre>
+    <button type="button" id="copypay" class="ghost">Copy</button>
   </div>
 
   <div class="panel">

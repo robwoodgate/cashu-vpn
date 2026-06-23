@@ -409,9 +409,12 @@ test('GET /marketplace returns HTML page', async () => {
     const html = await res.text();
     assert.match(html, /Cashu VPN/);
     assert.match(html, /Get VPN config/);
-    // Pay panel (LN + Cashu) and the bundled client are wired in.
+    // Unified pay panel (Auto / Lightning / Cashu tabs) and the bundled client are wired in.
     assert.match(html, /id="pay"/);
-    assert.match(html, /Generate Lightning invoice/);
+    assert.match(html, /data-tab="unified"/);
+    assert.match(html, /data-tab="lightning"/);
+    assert.match(html, /data-tab="cashu"/);
+    assert.match(html, /id="payqr"/);
     // The paste box is gone; the wallet delivers over the request transport.
     assert.doesNotMatch(html, /Complete &amp; get config/);
     assert.doesNotMatch(html, /id="token"/);
