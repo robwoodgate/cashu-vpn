@@ -201,6 +201,9 @@ function drawTab(mode: PayMode): void {
 
 // Show the pay panel. The Cashu request works immediately; the Auto (BIP-321) and
 // Lightning QRs fill in once the in-browser mint quote is ready (armLightning).
+// NB: the creq stays as creqA (base64url) — it carries the nut10 P2PK lock our
+// verification requires, and creqB (the uppercase-safe form) drops nut10 in
+// cashu-ts. So the cashu/unified QRs are byte-mode; only the bolt11 is uppercased.
 function openPayPanel(orderId: string, creq: string): void {
   currentOrderId = orderId;
   challenge = decodeChallenge(creq);
@@ -224,10 +227,13 @@ async function armLightning(orderId: string, creq: string): Promise<void> {
     const quote = await w.createMintQuoteBolt11(challenge.amount);
     const bolt11 = quote.request ?? '';
     if (currentOrderId !== orderId) return; // a newer order took over while we waited
-    // BIP-321 unified URI carries both rails; uppercased for a denser QR.
-    const unified = 'bitcoin:?lightning=' + bolt11.toUpperCase() + '&creq=' + creq;
+    // BIP-321 unified URI carries both rails. bolt11 is uppercased (bech32, dense);
+    // the creqA can't be (base64url, case-sensitive), so the unified QR is byte-mode.
+    const ln = bolt11.toUpperCase();
+    const unified = 'bitcoin:?lightning=' + ln + '&creq=' + creq;
     payQr.unified = unified; payCopy.unified = unified;
-    payQr.lightning = 'lightning:' + bolt11.toUpperCase(); payCopy.lightning = bolt11;
+    // Uppercase scheme + bolt11 → pure QR-alphanumeric (denser). Copy keeps the raw invoice.
+    payQr.lightning = 'LIGHTNING:' + ln; payCopy.lightning = bolt11;
     drawTab(payMode); // re-render the current tab now that the payloads exist
 
     const paid = await waitForPaid(w, quote.quote, { intervalMs: 2000, tries: 150 });
