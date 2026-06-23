@@ -489,6 +489,12 @@ async function provisionPeer(
 
   if (config.mode === 'live') {
     const exec = ctx.execPlan ?? executePlan;
+    // ponytail: planAddPeer is two commands (`wg set` then `ip route replace`) and
+    // they are not transactional — if the route step fails after `wg set` succeeds
+    // on a FRESH provision, the rollback below expires the lease but leaves a
+    // routeless (unusable) peer on the interface until restart/manual cleanup.
+    // Accepted residual risk (rare; harmless). Upgrade path if it ever bites:
+    // periodic reconciliation of `wg show` against the ledger.
     // Under the shared wg lock so this `wg set` can't interleave with cleanup's
     // `wg ... remove` on the same peer key (see Ctx.wgLock).
     await ctx.wgLock(async () => {
