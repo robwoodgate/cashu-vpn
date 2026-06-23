@@ -450,7 +450,20 @@ async function provisionOrder(ctx: Ctx, orderId: string, verified: Authorized): 
       return { kind: 'error', status: 402, error: 'lock_mismatch' };
     }
 
-    const result = await runProvision(ctx, orderId, order.clientPublicKey, verified.payment, order.lockIndex);
+    let result: { order: Order; alreadyReady: boolean } | undefined;
+    try {
+      result = await runProvision(ctx, orderId, order.clientPublicKey, verified.payment, order.lockIndex);
+    } catch (e) {
+      // Subnet exhaustion: payment was verified and the receipt stored (sweepable,
+      // store-first crash-safety), but we have no IP to hand out. Surface it as a
+      // distinct capacity error so the buyer knows to contact the operator for a
+      // refund rather than reading it as a transient 500.
+      if ((e as { code?: string })?.code === 'SUBNET_EXHAUSTED') {
+        console.error(`[pay] order=${orderId.slice(0, 8)} no_capacity: ${(e as Error).message} (receipt stored, sweepable)`);
+        return { kind: 'error', status: 503, error: 'no_capacity' };
+      }
+      throw e;
+    }
     if (!result) return { kind: 'error', status: 404, error: 'order_not_found' };
     return result.alreadyReady
       ? { kind: 'ready', order: result.order }

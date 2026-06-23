@@ -60,7 +60,7 @@ export function createAllocator(): PeerAllocator {
         const ip = `${SUBNET}.${host}`;
         if (!taken.has(ip)) return ip;
       }
-      throw new Error(`tunnel subnet exhausted (${HOST_COUNT} active leases)`);
+      throw Object.assign(new Error(`tunnel subnet exhausted (${HOST_COUNT} active leases)`), { code: 'SUBNET_EXHAUSTED' });
     }
   };
 }

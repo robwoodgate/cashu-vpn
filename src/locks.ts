@@ -62,14 +62,22 @@ export async function createLockBook(xpub: string, counterPath?: string): Promis
 
 async function readCounter(path?: string): Promise<number> {
   if (!path) return 0;
+  let raw: string;
   try {
-    const parsed = JSON.parse(await readFile(path, 'utf8')) as { next?: unknown };
-    const next = Number(parsed?.next);
-    return Number.isInteger(next) && next >= 0 ? next : 0;
+    raw = await readFile(path, 'utf8');
   } catch (e: unknown) {
+    // Only a MISSING file means "fresh start, child 0". Any other read error
+    // (and below, any unparseable/invalid content) must fail closed: silently
+    // resetting the counter to 0 would reissue child 0 and reopen replay.
     if (e instanceof Error && 'code' in e && (e as NodeJS.ErrnoException).code === 'ENOENT') return 0;
     throw e;
   }
+  const value = (JSON.parse(raw) as { next?: unknown })?.next;
+  const next = Number(value);
+  if (!Number.isInteger(next) || next < 0) {
+    throw new Error(`${path}: invalid lock counter (next=${String(value)}); refusing to reset issuance and reopen replay`);
+  }
+  return next;
 }
 
 async function writeCounter(path: string | undefined, next: number): Promise<void> {

@@ -902,6 +902,21 @@ test('LockBook persists its counter and rebuilds the map across instances', asyn
   }
 });
 
+test('LockBook fails closed on a corrupt counter (never resets issuance to 0)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cvpn-locks-'));
+  const counterPath = join(dir, 'counter.json');
+  try {
+    const xpub = HDKey.fromMasterSeed(new Uint8Array(64).fill(13)).derive("m/1597'/0'").publicExtendedKey;
+    // A present-but-invalid counter must throw, not silently reissue child 0.
+    await writeFile(counterPath, JSON.stringify({ next: 'bad' }));
+    await assert.rejects(createLockBook(xpub, counterPath), /invalid lock counter/);
+    await writeFile(counterPath, 'not json');
+    await assert.rejects(createLockBook(xpub, counterPath));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 // --- Rate limiting ---
 
 test('rate limiter allows up to max then blocks within the window', () => {

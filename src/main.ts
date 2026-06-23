@@ -29,6 +29,13 @@ if (config.mode === 'live' && !config.lockCounterPath) {
   throw new Error('live mode requires LOCK_COUNTER_PATH (durable lock counter prevents payment replay across restarts)');
 }
 
+// Orders+proofs MUST be durable in live mode. A memory store loses unswept
+// receipts (operator can't get paid) and the lease ledger on restart — leaving
+// live WireGuard peers with no record, so cleanup/reconcile no longer owns them.
+if (config.mode === 'live' && (!config.orderStorePath || !config.proofStorePath)) {
+  throw new Error('live mode requires ORDERS_PATH and PROOFS_PATH (durable order+proof stores; a restart must not strand receipts or orphan peers)');
+}
+
 const allocator = createAllocator();
 const proofStore = config.proofStorePath
   ? createFileProofStore(config.proofStorePath)
