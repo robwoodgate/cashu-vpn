@@ -16,13 +16,20 @@ import { getEncodedToken, type Proof } from '@cashu/cashu-ts';
 const MAX_BODY_BYTES = 16 * 1024;
 const ORDER_ID_RE = /^[A-Za-z0-9_-]{16,}$/;
 
-// Reported by /info. Read from package.json (repo root, two levels up from
-// dist/src) so it never drifts from the published version.
-const VERSION = ((): string => {
+// Version + source URL, read from package.json (repo root, two levels up from
+// dist/src) so they never drift and a fork that edits package.json gets its own.
+const { VERSION, REPO_URL } = ((): { VERSION: string; REPO_URL: string } => {
   try {
-    return JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version ?? '0.0.0';
+    const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
+    // Normalize `git+https://…/foo.git` (or `git@github.com:foo.git`) to a browsable URL.
+    const repo = (typeof pkg.repository === 'string' ? pkg.repository : pkg.repository?.url) ?? '';
+    const url = repo
+      .replace(/^git\+/, '')
+      .replace(/^git@github\.com:/, 'https://github.com/')
+      .replace(/\.git$/, '');
+    return { VERSION: pkg.version ?? '0.0.0', REPO_URL: /^https?:\/\//.test(url) ? url : '' };
   } catch {
-    return '0.0.0';
+    return { VERSION: '0.0.0', REPO_URL: '' };
   }
 })();
 
@@ -160,6 +167,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
         lock: ctx.lockBook ? 'xpub-per-tx' : 'none',
         notice: config.notice,
         termsUrl: config.termsUrl,
+        sourceUrl: REPO_URL || undefined,
       });
     }
 
@@ -806,8 +814,11 @@ ${config.notice ? `
     <h2>Your access</h2>
     <div id="access"><div class="empty">No access yet.</div></div>
   </div>
-${config.termsUrl ? `
-  <p style="text-align:center;margin-top:18px"><a href="${esc(config.termsUrl)}" target="_blank" rel="noopener">Terms of use</a></p>` : ''}
+${config.termsUrl || REPO_URL ? `
+  <p style="text-align:center;margin-top:18px">${[
+    config.termsUrl ? `<a href="${esc(config.termsUrl)}" target="_blank" rel="noopener">Terms of use</a>` : '',
+    REPO_URL ? `<a href="${esc(REPO_URL)}" target="_blank" rel="noopener">Source code</a>` : '',
+  ].filter(Boolean).join(' · ')}</p>` : ''}
 </main>
 <script src="/client.js"></script>
 </body></html>`;
