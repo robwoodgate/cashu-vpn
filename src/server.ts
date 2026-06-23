@@ -271,10 +271,13 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
   // Don't quote a payment we can't fulfil: if every tunnel IP is already on a
   // live lease, refuse before issuing the request. Best-effort (capacity can
   // still vanish between this quote and /pay) — the /pay 503 no_capacity stays
-  // the hard backstop — but it stops us selling into a full subnet.
+  // the hard backstop — but it stops us selling into a full subnet. A same-key
+  // renewal reuses its own slot (state.provision), so it's capacity-neutral and
+  // must be let through even when full.
   const now0 = new Date();
-  const liveLeases = (await ctx.store.list(now0)).filter((l) => l.status === 'active').length;
-  if (liveLeases >= ctx.allocator.capacity) {
+  const live = (await ctx.store.list(now0)).filter((l) => l.status === 'active');
+  const ownsSlot = live.some((l) => l.clientPublicKey === clientPublicKey);
+  if (!ownsSlot && live.length >= ctx.allocator.capacity) {
     return json(res, 503, { error: 'sold_out', message: 'All tunnel slots are in use; try again later.' });
   }
 

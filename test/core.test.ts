@@ -739,6 +739,24 @@ test('live POST /purchase refuses with 503 sold_out when every tunnel IP is in u
   }, LIVE_ENV, { store: occupied, allocator: { capacity: 1, allocateTunnelIp: () => '10.77.0.2' } });
 });
 
+test('live POST /purchase lets a same-key renewal through even when the subnet is full', async () => {
+  // The only slot is held by THIS buyer's key; renewal reuses it (capacity-neutral),
+  // so /purchase must still quote (402) rather than refuse with sold_out.
+  const future = new Date(Date.now() + 3600_000).toISOString();
+  const occupied = createMemoryStateStore([orderWithLease({
+    purchaseId: 'p-mine', clientPublicKey: VALID_WG_KEY, tunnelIp: '10.77.0.2',
+    createdAt: new Date().toISOString(), expiresAt: future, status: 'active',
+  })]);
+  await withServer(async (url) => {
+    const res = await fetch(`${url}/purchase`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+    });
+    assert.equal(res.status, 402);
+  }, LIVE_ENV, { store: occupied, allocator: { capacity: 1, allocateTunnelIp: () => '10.77.0.2' } });
+});
+
 test('order lifecycle: pending order, poll, CORS preflight, and /pay validation', async () => {
   await withServer(async (url) => {
     const r = await fetch(`${url}/purchase`, {
