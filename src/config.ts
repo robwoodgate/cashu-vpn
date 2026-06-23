@@ -53,9 +53,7 @@ export interface Config {
    * fee to sweep). See verifyPayment.
    */
   proofCountMargin: number;
-  /** Fixed operator P2PK pubkey to lock proofs to (live mode needs this OR operatorXpub). */
-  operatorPubkey: string;
-  /** Operator xpub for per-transaction lock pubkeys (private; preferred over operatorPubkey). */
+  /** Operator xpub for per-transaction lock pubkeys (required in live mode). */
   operatorXpub?: string;
   /** Where the LockBook persists its index counter (xpub mode). */
   lockCounterPath?: string;
@@ -156,7 +154,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     orderStorePath: env.ORDERS_PATH,
     orderTtlMs: intEnv(env, 'ORDER_TTL_MS', DEFAULT_ORDER_TTL_MS, 1),
     proofCountMargin: intEnv(env, 'PROOF_COUNT_MARGIN', DEFAULT_PROOF_COUNT_MARGIN, 0),
-    operatorPubkey: env.OPERATOR_PUBKEY ?? '',
     operatorXpub: env.OPERATOR_XPUB || undefined,
     lockCounterPath: env.LOCK_COUNTER_PATH,
     proofStorePath: env.PROOFS_PATH,

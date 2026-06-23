@@ -659,12 +659,16 @@ test('verifyPayment accepts a genuine, locked token and returns the lock pubkey'
 
 // --- HTTP server: live-mode 402 flow ---
 
+// Live mode is xpub-only. withServer builds the server's lockBook from this same
+// xpub, so issued order locks line up with what xpubVerifyDeps(TEST_XPUB) returns.
+const TEST_XPUB = HDKey.fromMasterSeed(new Uint8Array(64).fill(42)).derive("m/1597'/0'").publicExtendedKey;
+
 const LIVE_ENV = {
   MODE: 'live',
   SERVER_PUBLIC_KEY: 'nKpu1TI56v6JqS+wxnhMd+hBQJ8X15y7075zpATtJWU=',
   WG_ENDPOINT: '1.2.3.4:51820',
   ACCEPTED_MINTS: 'https://mint.example.com',
-  OPERATOR_PUBKEY: '02' + 'a'.repeat(64),
+  OPERATOR_XPUB: TEST_XPUB,
 } satisfies NodeJS.ProcessEnv;
 
 const VALID_WG_KEY = 'nKpu1TI56v6JqS+wxnhMd+hBQJ8X15y7075zpATtJWU=';
@@ -683,7 +687,7 @@ test('live POST /purchase without payment returns 402 + x-cashu challenge', asyn
     assert.equal(decoded.amount?.toNumber(), 1000);
     assert.deepEqual(decoded.mints, ['https://mint.example.com']);
     assert.equal(decoded.nut10?.kind, 'P2PK');
-    assert.equal(decoded.nut10?.data, '02' + 'a'.repeat(64));
+    assert.equal(decoded.nut10?.data, deriveChildPubkey(TEST_XPUB, 0)); // first issued xpub child
     const body = await res.json();
     assert.equal(body.error, 'payment_required');
     // Per-order: the creqA carries a NUT-18 POST transport to this order's sink.
@@ -1157,6 +1161,9 @@ async function withServer(
   extra: Partial<Parameters<typeof createServer>[0]> = {}
 ): Promise<void> {
   const config = loadConfig(env);
+  // Live mode needs a lockBook (xpub-only). Default to one built from TEST_XPUB so
+  // tests that don't supply their own still issue/resolve per-tx locks.
+  const lockBook = extra.lockBook ?? (config.mode === 'live' ? await createLockBook(TEST_XPUB) : undefined);
   const server = createServer({
     config,
     allocator: createAllocator(),
@@ -1164,6 +1171,7 @@ async function withServer(
     proofStore: createMemoryProofStore(),
     orderStore: createMemoryOrderStore(),
     ...extra,
+    lockBook,
   });
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -1427,68 +1435,113 @@ test('property: sweepAll conserves sats across batch and fallback paths', async 
 
 const slept = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-/** A memory proof store whose add() lingers, widening the reserve->commit window. */
+/** A memory proof store whose add() lingers, widening the provisioning window. */
 function slowProofStore(delayMs: number) {
   const inner = createMemoryProofStore();
   return { ...inner, add: async (p: ReceivedPayment) => { await slept(delayMs); return inner.add(p); } };
 }
 
-// Offline verify that always passes, locked to LIVE_ENV's OPERATOR_PUBKEY, with a
-// FIXED secret so every concurrent delivery looks like the same token (the replay
-// the guards must collapse to one).
-const PASS_VERIFY: VerifyDeps = {
-  getMetadata: () => ({ mint: 'https://mint.example.com', amount: 1000, unit: 'sat' }) as never,
-  // The delay converges all concurrent requests at this await, so they resume and
-  // pile into the reservation together — that's what makes an await-between-check-
-  // and-add regression actually contend (and the test go red). Verified by control.
-  loadMintContext: async () => { await slept(20); return { keysetIds: ['k1'], getKeyset: () => ({ id: 'k1', keys: {} as never }) }; },
-  decode: () => [{ id: 'k1', secret: 'shared-secret', amount: 1000 }] as never,
-  checkDleq: () => true,
-  witnessPubkeys: () => ['02' + 'a'.repeat(64)],
-};
+// A fake token "idx:N" that verifies as 1000 sat locked to xpub child N. The proof
+// secret encodes the index so witnessPubkeys can return the matching child pubkey —
+// so a test can mint a "token" for any order's lock. The loadMintContext delay
+// converges concurrent requests so they actually contend on the per-order guard.
+const fakeToken = (idx: number): string => `idx:${idx}`;
+function xpubVerifyDeps(xpub: string): VerifyDeps {
+  return {
+    getMetadata: () => ({ mint: 'https://mint.example.com', amount: 1000, unit: 'sat' }) as never,
+    loadMintContext: async () => { await slept(20); return { keysetIds: ['k1'], getKeyset: () => ({ id: 'k1', keys: {} as never }) }; },
+    decode: (t) => [{ id: 'k1', secret: `sec-${String(t).split(':')[1]}`, amount: 1000 }] as never,
+    checkDleq: () => true,
+    witnessPubkeys: (secret) => [deriveChildPubkey(xpub, Number(String(secret).split('-')[1]))],
+  };
+}
+
+// POST /purchase with no token: create an order (issues the next xpub child).
+const newOrder = (url: string) => fetch(`${url}/purchase`, {
+  method: 'POST', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+});
+// POST /purchase with X-Cashu: inline-deliver the token for child `idx`.
+const deliverInlineTok = (url: string, idx: number) => fetch(`${url}/purchase`, {
+  method: 'POST', headers: { 'content-type': 'application/json', 'x-cashu': fakeToken(idx) },
+  body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+});
 
 test('concurrent /pay deliveries for one order provision exactly once', async () => {
   const ledger = createMemoryLedger();
   const proofStore = slowProofStore(40);
+  const lockBook = await createLockBook(TEST_XPUB);
   await withServer(async (url) => {
-    const r = await fetch(`${url}/purchase`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
-    });
-    const { orderId } = await r.json();
+    const { orderId } = await (await newOrder(url)).json(); // issues child 0
     const deliver = () => fetch(`${url}/pay/${orderId}`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok' }),
-    });
-    const res = await Promise.all(Array.from({ length: 8 }, deliver));
-    const codes = res.map((x) => x.status);
-
-    // Invariant: one peer, one receipt — no double-provision regardless of interleaving.
-    assert.equal((await ledger.list()).length, 1, 'exactly one lease provisioned');
-    assert.equal((await proofStore.list()).length, 1, 'exactly one receipt stored');
-    assert.ok(codes.includes(200), 'at least one delivery succeeds');
-    // Losers are rejected cleanly: 409 in-progress, or 200 idempotent (order already ready).
-    assert.ok(codes.every((c) => c === 200 || c === 409), `unexpected status: ${codes}`);
-  }, LIVE_ENV, { ledger, proofStore, verifyDeps: PASS_VERIFY, execPlan: async () => [] });
-});
-
-test('concurrent inline X-Cashu deliveries provision exactly once', async () => {
-  const ledger = createMemoryLedger();
-  const proofStore = slowProofStore(40);
-  await withServer(async (url) => {
-    // Same token (same secret) delivered inline 8x at once. The inline path has no
-    // per-order guard — only inflightSecrets stands between it and a double-spend.
-    const deliver = () => fetch(`${url}/purchase`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-cashu': 'tok' },
-      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: fakeToken(0) }),
     });
     const codes = (await Promise.all(Array.from({ length: 8 }, deliver))).map((x) => x.status);
 
-    assert.equal(codes.filter((c) => c === 200).length, 1, 'exactly one inline delivery provisions');
-    assert.ok(codes.filter((c) => c === 402).length >= 1, 'the rest are rejected as already_redeemed');
+    // Invariant: one peer, one receipt — the per-order processing guard collapses
+    // the 8 concurrent deliveries to a single provision regardless of interleaving.
     assert.equal((await ledger.list()).length, 1, 'exactly one lease provisioned');
     assert.equal((await proofStore.list()).length, 1, 'exactly one receipt stored');
-  }, LIVE_ENV, { ledger, proofStore, verifyDeps: PASS_VERIFY, execPlan: async () => [] });
+    assert.ok(codes.includes(200), 'at least one delivery succeeds');
+    assert.ok(codes.every((c) => c === 200 || c === 409), `unexpected status: ${codes}`);
+  }, LIVE_ENV, { ledger, proofStore, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
+});
+
+test('concurrent inline deliveries bind to one order and provision exactly once', async () => {
+  const ledger = createMemoryLedger();
+  const proofStore = slowProofStore(40);
+  const lockBook = await createLockBook(TEST_XPUB);
+  await withServer(async (url) => {
+    await newOrder(url); // order for child 0
+    // 8 concurrent inline deliveries of the same token all resolve to that order.
+    const codes = (await Promise.all(Array.from({ length: 8 }, () => deliverInlineTok(url, 0)))).map((x) => x.status);
+
+    assert.equal((await ledger.list()).length, 1, 'exactly one lease provisioned');
+    assert.equal((await proofStore.list()).length, 1, 'exactly one receipt stored');
+    assert.ok(codes.includes(200), 'at least one delivery succeeds');
+    assert.ok(codes.every((c) => c === 200 || c === 409), `unexpected status: ${codes}`);
+  }, LIVE_ENV, { ledger, proofStore, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
+});
+
+test('inline delivery for an issued lock with no order is rejected (replay after prune)', async () => {
+  // child 0 IS a lock we issued (resolves), but no order exists for it — the state
+  // after a swept order is pruned. Must reject, not provision a free lease.
+  const lockBook = await createLockBook(TEST_XPUB);
+  await lockBook.issue(); // advance the counter so child 0 resolves...
+  await withServer(async (url) => {
+    const res = await deliverInlineTok(url, 0); // ...but no order was ever stored for it
+    assert.equal(res.status, 402);
+    assert.equal((await res.json()).detail, 'no_matching_order');
+  }, LIVE_ENV, { verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
+});
+
+test('/pay rejects a token locked to a different order (per-order binding)', async () => {
+  // The binding is the replay defense: a token can only satisfy the order whose
+  // unique lock it carries — so an old/foreign token can't redeem a fresh order.
+  const lockBook = await createLockBook(TEST_XPUB);
+  await withServer(async (url) => {
+    await newOrder(url);                            // order A (child 0)
+    const b = await (await newOrder(url)).json();   // order B (child 1)
+    const res = await fetch(`${url}/pay/${b.orderId}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: fakeToken(0) }),
+    });
+    assert.equal(res.status, 402);
+    assert.equal((await res.json()).detail, 'lock_mismatch');
+  }, LIVE_ENV, { verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
+});
+
+test('inline delivery to an already-ready order returns the config (idempotent)', async () => {
+  const lockBook = await createLockBook(TEST_XPUB);
+  await withServer(async (url) => {
+    await newOrder(url);                          // child 0
+    const first = await deliverInlineTok(url, 0); // provisions
+    assert.equal(first.status, 200);
+    const firstBody = await first.json();
+    const again = await deliverInlineTok(url, 0); // same token again
+    assert.equal(again.status, 200);
+    const againBody = await again.json();
+    assert.equal(againBody.tunnelIp, firstBody.tunnelIp, 'idempotent: same config returned, not a second lease');
+  }, LIVE_ENV, { verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
 });
 
 test('malformed JSON returns 400 and an oversized body 413 (not 500)', async () => {
@@ -1512,45 +1565,36 @@ test('re-buying with an already-active key replaces the old lease (no early disc
   // moves the peer to a new IP; the old lease must be expired (not left active),
   // or its cleanup later runs `wg ... peer remove` and cuts the new buyer.
   const ledger = createMemoryLedger();
-  let n = 0;
-  const verifyDeps: VerifyDeps = { ...PASS_VERIFY, decode: () => [{ id: 'k1', secret: `uniq-${n++}`, amount: 1000 }] as never };
+  const lockBook = await createLockBook(TEST_XPUB);
   await withServer(async (url) => {
-    const buy = () => fetch(`${url}/purchase`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-cashu': 'tok' },
-      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
-    });
-    assert.equal((await buy()).status, 200);
-    assert.equal((await buy()).status, 200);
+    await newOrder(url); await deliverInlineTok(url, 0); // order child 0 → lease 1
+    await newOrder(url); await deliverInlineTok(url, 1); // order child 1 → lease 2 (same key)
 
     const all = await ledger.list();
     assert.equal(all.length, 2, 'both purchases recorded a lease');
     const active = all.filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
     assert.equal(active.length, 1, 'one key holds exactly one active lease (old one expired, not removed)');
-  }, LIVE_ENV, { ledger, verifyDeps, execPlan: async () => [] });
+  }, LIVE_ENV, { ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
 });
 
 test('a failed wg renewal keeps the original lease active (no orphaned peer)', async () => {
   // Renewal expires the prior lease atomically; if `wg set` then fails, the prior
   // lease must be re-activated, or cleanup (active-only) never reaps its live peer.
   const ledger = createMemoryLedger();
-  let n = 0;
-  const verifyDeps: VerifyDeps = { ...PASS_VERIFY, decode: () => [{ id: 'k1', secret: `u${n++}`, amount: 1000 }] as never };
+  const lockBook = await createLockBook(TEST_XPUB);
   let calls = 0;
   const execPlan = async () => { calls += 1; if (calls === 2) throw new Error('wg down'); return []; };
   await withServer(async (url) => {
-    const buy = () => fetch(`${url}/purchase`, {
-      method: 'POST', headers: { 'content-type': 'application/json', 'x-cashu': 'tok' },
-      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
-    });
-    assert.equal((await buy()).status, 200);            // first lease provisioned
-    assert.equal((await buy()).status, 500);            // renewal: wg fails mid-provision → rolled back
+    await newOrder(url);
+    assert.equal((await deliverInlineTok(url, 0)).status, 200); // first lease provisioned
+    await newOrder(url);
+    assert.equal((await deliverInlineTok(url, 1)).status, 500); // renewal: wg fails mid-provision → rolled back
 
     const all = await ledger.list();
     assert.equal(all.length, 2, 'both leases recorded');
     const active = all.filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
     assert.equal(active.length, 1, 'the original lease is active again — its peer stays reapable, not orphaned');
-  }, LIVE_ENV, { ledger, verifyDeps, execPlan: execPlan as never });
+  }, LIVE_ENV, { ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: execPlan as never, lockBook });
 });
 
 // --- Real P2PK secret parsing through verifyPayment (offline, no mint) ---

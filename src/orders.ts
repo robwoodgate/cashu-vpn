@@ -19,6 +19,7 @@
 import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { normalizePubkey } from './cashu.js';
 import type { PeerLease } from './peers.js';
 
 export type OrderStatus = 'pending' | 'ready';
@@ -57,6 +58,14 @@ export interface OrderStore {
    * already minted proofs to this order's lock; 404-ing would strand them).
    */
   get(id: string, now?: Date, opts?: { includeExpired?: boolean }): Promise<Order | undefined>;
+  /**
+   * Find the order whose lock pubkey matches `lockPubkey` (normalized compare).
+   * The inline X-Cashu route uses this to bind a delivered token to the order we
+   * issued its lock for — so an unexpected/replayed token (no matching order)
+   * is rejected, exactly as /pay rejects a lock_mismatch. Each order has a unique
+   * lock, so at most one matches. Returns it whatever its status (caller checks).
+   */
+  findByLock(lockPubkey: string): Promise<Order | undefined>;
   /** Atomically transition pending -> ready. Returns the updated order, or undefined if the id is unknown / not pending. */
   markReady(id: string, patch: ReadyPatch): Promise<Order | undefined>;
   /**
@@ -107,6 +116,14 @@ function makeStore(records: Map<string, Order>, persist: (recs: Order[]) => Prom
       // so the record survives long enough for a late /pay to still find it.
       if (!opts?.includeExpired && isExpiredPending(order, now)) return undefined;
       return { ...order };
+    },
+
+    async findByLock(lockPubkey) {
+      const want = normalizePubkey(lockPubkey);
+      for (const order of records.values()) {
+        if (normalizePubkey(order.lockPubkey) === want) return { ...order };
+      }
+      return undefined;
     },
 
     markReady(id, patch) {

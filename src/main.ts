@@ -13,6 +13,12 @@ if (config.mode === 'live' && (!config.serverPublicKey || !config.endpoint)) {
   throw new Error('live mode requires SERVER_PUBLIC_KEY and WG_ENDPOINT (run `npm run discover`)');
 }
 
+// Live mode locks every payment to a fresh per-transaction xpub child (privacy +
+// single-use replay protection). There is no fixed-pubkey fallback.
+if (config.mode === 'live' && !config.operatorXpub) {
+  throw new Error('live mode requires OPERATOR_XPUB (run `npm run keygen`)');
+}
+
 const allocator = createAllocator();
 const ledger = config.peerLedgerPath
   ? createFileLedger(config.peerLedgerPath)

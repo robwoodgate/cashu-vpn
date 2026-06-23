@@ -42,16 +42,13 @@ export interface ServerDeps {
 // Everything a request handler needs, assembled once in createServer.
 interface Ctx extends ServerDeps {
   limiter?: RateLimiter;
-  /** Order ids currently being provisioned, to serialize concurrent /pay hits. */
-  processing: Set<string>;
   /**
-   * Proof secrets currently mid-provision. The persistent replay check
-   * (proofStore.hasAnyOf) only sees already-committed tokens, so two concurrent
-   * deliveries of the SAME token would both pass it and double-provision (in
-   * fixed-pubkey mode every order shares one lock; the inline X-Cashu path has no
-   * per-order guard at all). Reserving the secrets in-memory closes that window.
+   * Order ids currently being provisioned, to serialize concurrent deliveries to
+   * the same order. Every delivery (both /pay and the inline X-Cashu route) is
+   * bound to exactly one order, so this per-order guard is the whole concurrency
+   * story — no per-secret reservation needed.
    */
-  inflightSecrets: Set<string>;
+  processing: Set<string>;
 }
 
 export function createServer(deps: ServerDeps): http.Server {
@@ -61,7 +58,7 @@ export function createServer(deps: ServerDeps): http.Server {
     ? createRateLimiter({ max: config.rateLimitMax, windowMs: config.rateLimitWindowMs })
     : undefined;
 
-  const ctx: Ctx = { ...deps, limiter, processing: new Set(), inflightSecrets: new Set() };
+  const ctx: Ctx = { ...deps, limiter, processing: new Set() };
 
   // Housekeeping interval: remove expired WireGuard peers, then forget records
   // whose lease expired more than retainExpiredMs ago. Pruning keeps the lease
@@ -140,7 +137,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
         leaseDuration: `${config.leaseDurationMs / 1000}s`,
         dataCapGb: config.leaseDataCapBytes > 0 ? config.leaseDataCapBytes / 1024 ** 3 : null,
         acceptedMints: config.acceptedMints,
-        lock: ctx.lockBook ? 'xpub-per-tx' : config.operatorPubkey ? 'fixed-pubkey' : 'none',
+        lock: ctx.lockBook ? 'xpub-per-tx' : 'none',
         notice: config.notice,
         termsUrl: config.termsUrl,
       });
@@ -221,9 +218,9 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     return json(res, 200, { ...bundle, mode: config.mode });
   }
 
-  if (!ctx.lockBook && !config.operatorPubkey) {
-    // Misconfiguration: nothing to lock proofs to. Fail loudly, never fall back
-    // to custodial behaviour.
+  if (!ctx.lockBook) {
+    // Misconfiguration: nothing to issue per-tx locks. Fail loudly, never fall
+    // back to custodial behaviour. (main.ts requires OPERATOR_XPUB in live.)
     return json(res, 503, { error: 'operator_lock_not_configured' });
   }
 
@@ -238,22 +235,19 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     });
   }
 
-  // NUT-24 same-client path (agents): proofs delivered inline via X-Cashu. Verify
-  // and provision in this same response, no order/poll round-trip needed.
+  // NUT-24 same-request path (agents): proofs delivered inline via X-Cashu. Bind
+  // the token to the pending order we issued its lock for (so a replayed/unexpected
+  // token with no matching order is rejected), then provision and return the config.
   const headerToken = firstHeader(req.headers['x-cashu']);
   if (headerToken) {
-    const result = await authorizeAndProvision(ctx, clientPublicKey, headerToken);
-    if ('error' in result) {
-      return json(res, 402, { error: 'payment_failed', detail: result.error });
-    }
-    return json(res, 200, { ...result.bundle, mode: config.mode });
+    return await deliverInline(ctx, res, headerToken);
   }
 
   // Otherwise create an order and answer with a 402 + PaymentRequest. The creqA
   // carries a NUT-18 POST transport to /pay/:orderId, so a wallet pays and
   // delivers automatically; the browser polls GET /order/:orderId.
-  const lock = ctx.lockBook ? await ctx.lockBook.issue() : undefined;
-  const lockPubkey = lock ? lock.pubkey : config.operatorPubkey;
+  const lock = await ctx.lockBook.issue();
+  const lockPubkey = lock.pubkey;
   const orderId = newOrderId();
   const now = new Date();
   const order: Order = {
@@ -261,7 +255,7 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     status: 'pending',
     clientPublicKey,
     lockPubkey,
-    lockIndex: lock?.index,
+    lockIndex: lock.index,
     createdAt: now.toISOString(),
     expiresAt: new Date(now.getTime() + config.orderTtlMs).toISOString(),
   };
@@ -300,17 +294,11 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
     return json(res, 404, { error: 'order_not_found' });
   }
 
-  // includeExpired: a wallet may deliver just after the order's TTL; honoring it
-  // still provisions the buyer (who already minted proofs to this lock) instead
-  // of stranding the payment with a 404.
+  // Fast idempotent path: a wallet re-delivering to an already-ready order needn't
+  // re-verify. (includeExpired: a wallet may deliver just after the TTL.)
   const order = await ctx.orderStore.get(orderId, undefined, { includeExpired: true });
-  if (!order) {
-    return json(res, 404, { error: 'order_not_found' });
-  }
-  if (order.status === 'ready') {
-    // Idempotent: the order was already paid and provisioned.
-    return json(res, 200, { ok: true, status: 'ready' });
-  }
+  if (!order) return json(res, 404, { error: 'order_not_found' });
+  if (order.status === 'ready') return json(res, 200, { ok: true, status: 'ready' });
 
   const body = await readBody(req);
   console.log(`[pay] order=${tag} payload=${describePayload(body)}`);
@@ -322,34 +310,51 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
     return json(res, 400, { error: 'invalid_payload', message: 'Expected a NUT-18 payload {mint,unit,proofs} or {token}' });
   }
 
-  // Serialize concurrent deliveries for the same order so we never double-provision.
-  if (ctx.processing.has(orderId)) {
-    return json(res, 409, { error: 'order_in_progress' });
+  const verified = await verifyAndAuthorize(ctx, encodedToken);
+  if ('error' in verified) {
+    console.log(`[pay] order=${tag} rejected: ${verified.error}`);
+    return json(res, 402, { error: 'payment_failed', detail: verified.error });
   }
-  ctx.processing.add(orderId);
-  try {
-    // Re-check after acquiring the guard (a racing request may have finished).
-    const fresh = await ctx.orderStore.get(orderId, undefined, { includeExpired: true });
-    if (!fresh) return json(res, 404, { error: 'order_not_found' });
-    if (fresh.status === 'ready') return json(res, 200, { ok: true, status: 'ready' });
 
-    // Bind the payment to THIS order's challenge: the proofs must be locked to the
-    // exact pubkey we issued for it, not merely some key we control.
-    const result = await authorizeAndProvision(ctx, fresh.clientPublicKey, encodedToken, {
-      expectedLockPubkey: fresh.lockPubkey,
-      lockIndex: fresh.lockIndex,
-    });
-    if ('error' in result) {
-      console.log(`[pay] order=${tag} rejected: ${result.error}`);
-      return json(res, 402, { error: 'payment_failed', detail: result.error });
-    }
-
-    await ctx.orderStore.markReady(orderId, result.bundle);
-    console.log(`[pay] order=${tag} ready: ${result.payment.amountSats} sat`);
-    return json(res, 200, { ok: true, status: 'ready' });
-  } finally {
-    ctx.processing.delete(orderId);
+  const r = await provisionOrder(ctx, orderId, verified);
+  if (r.kind === 'error') {
+    if (r.status === 402) console.log(`[pay] order=${tag} rejected: ${r.error}`);
+    return json(res, r.status, r.status === 402 ? { error: 'payment_failed', detail: r.error } : { error: r.error });
   }
+  if (r.kind === 'provisioned') console.log(`[pay] order=${tag} ready: ${r.payment.amountSats} sat`);
+  return json(res, 200, { ok: true, status: 'ready' });
+}
+
+// --- POST /purchase with X-Cashu (inline NUT-24 delivery) ---
+
+// Bind an inline token to the pending order we issued its lock for, then provision
+// (or return the existing config if already ready). A token with no matching order
+// — a replay of a swept token whose order is gone, or a never-ordered token — is
+// rejected, exactly as /pay rejects a lock_mismatch.
+async function deliverInline(ctx: Ctx, res: ServerResponse, encodedToken: string): Promise<void> {
+  const verified = await verifyAndAuthorize(ctx, encodedToken);
+  if ('error' in verified) return json(res, 402, { error: 'payment_failed', detail: verified.error });
+
+  const order = await ctx.orderStore.findByLock(verified.payment.lockPubkey!);
+  if (!order) return json(res, 402, { error: 'payment_failed', detail: 'no_matching_order' });
+
+  const r = await provisionOrder(ctx, order.id, verified);
+  if (r.kind === 'error') {
+    return json(res, r.status, r.status === 402 ? { error: 'payment_failed', detail: r.error } : { error: r.error });
+  }
+  // Provisioned now, or already ready (idempotent) — either way return the config.
+  return json(res, 200, { ...readyBundleOf(r.order), mode: ctx.config.mode });
+}
+
+/** The buyer-facing config bundle for a ready order. */
+function readyBundleOf(order: Order): ProvisionBundle {
+  return {
+    purchaseId: order.purchaseId!,
+    tunnelIp: order.tunnelIp!,
+    amountSats: order.amountSats,
+    clientConfig: order.clientConfig!,
+    lease: order.lease!,
+  };
 }
 
 // --- GET /order/:orderId (browser poll) ---
@@ -378,12 +383,14 @@ async function handleOrderStatus(res: ServerResponse, ctx: Ctx, orderId: string)
 
 // --- Payment verification + lock authorization ---
 
-interface Authorized { payment: VerifyResult; lockIndex?: number; }
+interface Authorized { payment: VerifyResult; lockIndex: number; }
 
 /**
- * Verify a delivered token offline (DLEQ + P2PK + amount + proof cap + replay)
- * and authorize its lock against a key the operator controls. Returns the
- * verified payment plus the xpub child index to record for sweeping, or `{error}`.
+ * Verify a delivered token offline (DLEQ + P2PK + amount + proof cap) and confirm
+ * its lock is an xpub child we issued. Returns the verified payment plus that
+ * child index (for sweeping), or `{error}`. Replay protection is NOT here — it's
+ * the order binding: a token's lock maps to exactly one order, which provisions
+ * at most once (see provisionOrder).
  */
 async function verifyAndAuthorize(ctx: Ctx, encodedToken: string): Promise<Authorized | { error: string }> {
   const { config } = ctx;
@@ -397,65 +404,46 @@ async function verifyAndAuthorize(ctx: Ctx, encodedToken: string): Promise<Autho
     return { error: payment.error ?? 'unverified' };
   }
 
-  // The lock must be a pubkey WE control, or the operator can't sweep it.
-  let lockIndex: number | undefined;
-  if (ctx.lockBook) {
-    lockIndex = ctx.lockBook.resolve(payment.lockPubkey);
-    if (lockIndex === undefined) return { error: 'lock_not_recognized' };
-  } else if (payment.lockPubkey !== normalizePubkey(config.operatorPubkey)) {
-    return { error: 'not_locked_to_operator' };
-  }
-
-  // Reject replays of an already-redeemed token.
-  if (payment.secrets && (await ctx.proofStore.hasAnyOf(payment.secrets))) {
-    return { error: 'already_redeemed' };
-  }
+  // The lock must be an xpub child WE issued, or the operator can't sweep it.
+  if (!ctx.lockBook) return { error: 'operator_lock_not_configured' };
+  const lockIndex = ctx.lockBook.resolve(payment.lockPubkey);
+  if (lockIndex === undefined) return { error: 'lock_not_recognized' };
 
   return { payment, lockIndex };
 }
 
+type DeliverResult =
+  | { kind: 'ready'; order: Order }
+  | { kind: 'provisioned'; order: Order; payment: VerifyResult }
+  | { kind: 'error'; status: number; error: string };
+
 /**
- * Verify a delivered token, then provision under a per-token reservation so two
- * concurrent deliveries of the same proofs can't both pass the replay check and
- * double-provision. Shared by the per-order /pay sink and the inline X-Cashu path.
- *
- * `expectedLockPubkey` (per-order) binds the payment to that order's challenge.
- * `lockIndex` overrides the swept index (the order records the index it issued).
+ * Provision a verified payment against THE order it's bound to, under the per-order
+ * `processing` guard. The order is the single-use record: it provisions once
+ * (pending -> ready), then every later delivery is idempotent ('ready'); once it's
+ * pruned, deliveries 404. That binding — a token's lock maps to exactly one order —
+ * is what makes replays (even of a swept token) and concurrent double-spends
+ * impossible, with no per-secret bookkeeping. A failed provision leaves the order
+ * pending, so a retry resumes (proofStore.add is idempotent on the token).
  */
-async function authorizeAndProvision(
-  ctx: Ctx,
-  clientPublicKey: string,
-  encodedToken: string,
-  opts: { expectedLockPubkey?: string; lockIndex?: number } = {},
-): Promise<{ bundle: ProvisionBundle; payment: VerifyResult } | { error: string }> {
-  const verified = await verifyAndAuthorize(ctx, encodedToken);
-  if ('error' in verified) return verified;
-
-  if (
-    opts.expectedLockPubkey !== undefined &&
-    verified.payment.lockPubkey !== normalizePubkey(opts.expectedLockPubkey)
-  ) {
-    return { error: 'lock_mismatch' };
-  }
-
-  const secrets = verified.payment.secrets ?? [];
-  // Reserve the secrets atomically (no await between the check and the adds), so a
-  // racing delivery of the same token is rejected here instead of double-spending.
-  if (secrets.some((s) => ctx.inflightSecrets.has(s))) {
-    return { error: 'already_redeemed' };
-  }
-  for (const s of secrets) ctx.inflightSecrets.add(s);
+async function provisionOrder(ctx: Ctx, orderId: string, verified: Authorized): Promise<DeliverResult> {
+  if (ctx.processing.has(orderId)) return { kind: 'error', status: 409, error: 'order_in_progress' };
+  ctx.processing.add(orderId);
   try {
-    // Re-check the persistent store now that we hold the reservation: a racer may
-    // have committed (and released its reservation) between our verify and here.
-    if (secrets.length && (await ctx.proofStore.hasAnyOf(secrets))) {
-      return { error: 'already_redeemed' };
+    const fresh = await ctx.orderStore.get(orderId, undefined, { includeExpired: true });
+    if (!fresh) return { kind: 'error', status: 404, error: 'order_not_found' };
+    if (fresh.status === 'ready') return { kind: 'ready', order: fresh };
+
+    // Bind: the proofs must be locked to the exact pubkey we issued for THIS order.
+    if (verified.payment.lockPubkey !== normalizePubkey(fresh.lockPubkey)) {
+      return { kind: 'error', status: 402, error: 'lock_mismatch' };
     }
-    const lockIndex = opts.lockIndex ?? verified.lockIndex;
-    const bundle = await provisionPeer(ctx, clientPublicKey, verified.payment, lockIndex);
-    return { bundle, payment: verified.payment };
+
+    const bundle = await provisionPeer(ctx, fresh.clientPublicKey, verified.payment, fresh.lockIndex);
+    const ready = await ctx.orderStore.markReady(orderId, bundle);
+    return { kind: 'provisioned', order: ready ?? { ...fresh, ...bundle, status: 'ready' }, payment: verified.payment };
   } finally {
-    for (const s of secrets) ctx.inflightSecrets.delete(s);
+    ctx.processing.delete(orderId);
   }
 }
 

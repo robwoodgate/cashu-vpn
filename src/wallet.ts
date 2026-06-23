@@ -54,6 +54,9 @@ export function createMemoryProofStore(initial: ReceivedPayment[] = []): ProofSt
   const records = [...initial];
   return {
     async add(payment) {
+      // Idempotent: a provision that failed mid-way and is retried (resumed) must
+      // not store the same token twice (which would double the sweep attempt).
+      if (payment.secrets?.length && anySeen(records, payment.secrets)) return;
       records.push(payment);
     },
     async list() {
@@ -129,6 +132,8 @@ export function createFileProofStore(path: string): ProofStore {
     add(payment) {
       return locked(async () => {
         const records = await readStoreFile(path);
+        // Idempotent (see memory store): a resumed provision must not re-store the token.
+        if (payment.secrets?.length && anySeen(records, payment.secrets)) return;
         records.push(payment);
         await writeStoreFile(path, records);
       });
