@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -7,9 +7,9 @@ import type { AddressInfo } from 'node:net';
 
 import { decodePaymentRequest } from '@cashu/cashu-ts';
 import { loadConfig } from '../src/config.js';
-import { createAllocator, createMemoryLedger, createFileLedger } from '../src/peers.js';
+import { createAllocator } from '../src/peers.js';
 import { createMemoryProofStore, createFileProofStore } from '../src/wallet.js';
-import { createMemoryOrderStore, newOrderId } from '../src/orders.js';
+import { createMemoryStateStore, createFileStateStore, newOrderId, newPurchaseId, type Order, type ProvisionArgs, type StateStore } from '../src/state.js';
 import {
   validateInterface,
   validatePublicKey,
@@ -19,6 +19,7 @@ import {
   generateClientConfig,
   leasesOverCap,
   cleanupExpiredPeers,
+  reconcileActivePeers,
 } from '../src/wireguard.js';
 import { serialize } from '../src/serialize.js';
 import type { PeerLease } from '../src/peers.js';
@@ -141,75 +142,79 @@ test('allocator avoids IPs already in use', () => {
 
 // --- Ledger ---
 
-test('memory ledger records and lists with expiry', async () => {
-  const ledger = createMemoryLedger();
+// --- State-store helpers (a lease is the provisioned half of an order) ---
 
-  await ledger.record({
+// Allocate the lowest free host; if `taken` isn't updated atomically per provision,
+// two concurrent calls collide on the same IP.
+const lowestFree = (taken: Set<string>): string => {
+  for (let h = 2; h < 255; h++) { const ip = `10.77.0.${h}`; if (!taken.has(ip)) return ip; }
+  throw new Error('subnet exhausted');
+};
+
+// A ready order wrapping a lease, so lease-view tests can seed leases the way the
+// old ledger did (leases now live inside their order).
+function orderWithLease(lease: PeerLease, id = `o-${lease.purchaseId}`): Order {
+  return {
+    id, status: 'ready', clientPublicKey: lease.clientPublicKey, lockPubkey: '',
+    createdAt: lease.createdAt, expiresAt: lease.expiresAt,
+    purchaseId: lease.purchaseId, tunnelIp: lease.tunnelIp, lease,
+  };
+}
+const seedStore = (leases: PeerLease[]) => createMemoryStateStore(leases.map((l) => orderWithLease(l)));
+
+// Drive store.provision with trivial callbacks (fresh lowest-free IP, no wg, CONF).
+function provisionStore(store: StateStore, orderId: string, clientPublicKey: string, over: Partial<ProvisionArgs> = {}) {
+  return store.provision(orderId, {
+    purchaseId: newPurchaseId(), clientPublicKey, amountSats: 250, leaseDurationMs: 60_000,
+    now: new Date(), allocate: lowestFree, readPeerCounter: async () => 0, renderConfig: () => 'CONF',
+    ...over,
+  });
+}
+
+test('state store lease view: expiry, listExpiredActive, markExpired', async () => {
+  const store = seedStore([{
     purchaseId: 'p1', clientPublicKey: 'k1', tunnelIp: '10.77.0.10',
     createdAt: '2026-01-01T00:00:00Z', expiresAt: '2026-01-01T01:00:00Z', status: 'active',
-  });
-
-  // Before expiry
-  const before = await ledger.list(new Date('2026-01-01T00:30:00Z'));
-  assert.equal(before[0]?.status, 'active');
-
-  // After expiry
-  const after = await ledger.list(new Date('2026-01-01T01:00:01Z'));
-  assert.equal(after[0]?.status, 'expired');
-
-  // listExpiredActive
-  const expired = await ledger.listExpiredActive(new Date('2026-01-01T01:00:01Z'));
-  assert.equal(expired.length, 1);
-
-  // markExpired
-  await ledger.markExpired('p1');
-  const marked = await ledger.listExpiredActive(new Date('2026-01-01T01:00:01Z'));
-  assert.equal(marked.length, 0); // already marked
+  }]);
+  assert.equal((await store.list(new Date('2026-01-01T00:30:00Z')))[0]?.status, 'active');
+  assert.equal((await store.list(new Date('2026-01-01T01:00:01Z')))[0]?.status, 'expired');
+  assert.equal((await store.listExpiredActive(new Date('2026-01-01T01:00:01Z'))).length, 1);
+  await store.markExpired('p1');
+  assert.equal((await store.listExpiredActive(new Date('2026-01-01T01:00:01Z'))).length, 0);
 });
 
-test('file-backed ledger persists across instances', async () => {
+test('file state store persists orders + embedded leases across instances', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'nvpn-test-'));
-  const path = join(dir, 'ledger.json');
-
+  const path = join(dir, 'state.json');
   try {
-    const l1 = createFileLedger(path);
-    await l1.record({
+    await writeFile(path, JSON.stringify([orderWithLease({
       purchaseId: 'fp1', clientPublicKey: 'fk1', tunnelIp: '10.77.0.20',
       createdAt: '2026-01-01T00:00:00Z', expiresAt: '2026-01-01T00:01:00Z', status: 'active',
-    });
-
-    // New instance reads same file
-    const l2 = createFileLedger(path);
-    const list = await l2.list(new Date('2026-01-01T00:01:01Z'));
+    })]));
+    const s2 = await createFileStateStore(path);
+    const list = await s2.list(new Date('2026-01-01T00:01:01Z'));
     assert.equal(list.length, 1);
     assert.equal(list[0]?.purchaseId, 'fp1');
     assert.equal(list[0]?.status, 'expired');
-
-    // Verify file content
-    const raw = JSON.parse(await readFile(path, 'utf8'));
-    assert.equal(raw.length, 1);
+    assert.equal(JSON.parse(await readFile(path, 'utf8')).length, 1);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test('concurrent file-ledger records do not clobber each other', async () => {
+test('concurrent createOrder do not clobber each other', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'nvpn-test-'));
-  const path = join(dir, 'ledger.json');
+  const path = join(dir, 'state.json');
   try {
-    const ledger = createFileLedger(path);
-    // Fire 25 appends at once; without serialization the read-modify-write race
+    const store = await createFileStateStore(path);
+    // Fire 25 creates at once; without serialization the read-modify-write race
     // would drop most of them (last writer wins).
-    await Promise.all(
-      Array.from({ length: 25 }, (_, i) =>
-        ledger.record({
-          purchaseId: `p${i}`, clientPublicKey: `k${i}`, tunnelIp: `10.77.0.${i + 2}`,
-          createdAt: '2026-01-01T00:00:00Z', expiresAt: '2999-01-01T00:00:00Z', status: 'active',
-        })
-      )
-    );
-    const list = await ledger.list();
-    assert.equal(list.length, 25);
+    await Promise.all(Array.from({ length: 25 }, (_, i) =>
+      store.createOrder({
+        id: `o${i}`, status: 'pending', clientPublicKey: `k${i}`, lockPubkey: '',
+        createdAt: '2026-01-01T00:00:00Z', expiresAt: '2999-01-01T00:00:00Z',
+      })));
+    assert.equal(JSON.parse(await readFile(path, 'utf8')).length, 25);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -231,19 +236,16 @@ test('concurrent file proof-store adds do not lose receipts', async () => {
   }
 });
 
-test('ledger pruneExpiredBefore forgets old leases, keeps recent/active', async () => {
-  const ledger = createMemoryLedger();
-  await ledger.record({
-    purchaseId: 'old', clientPublicKey: 'k', tunnelIp: '10.77.0.2',
-    createdAt: '2026-01-01T00:00:00Z', expiresAt: '2026-01-01T01:00:00Z', status: 'active',
-  });
-  await ledger.record({
-    purchaseId: 'recent', clientPublicKey: 'k', tunnelIp: '10.77.0.3',
-    createdAt: '2026-06-01T00:00:00Z', expiresAt: '2999-01-01T00:00:00Z', status: 'active',
-  });
-  const removed = await ledger.pruneExpiredBefore(new Date('2026-02-01T00:00:00Z'));
+test('pruneExpiredBefore forgets old leases, keeps recent/active', async () => {
+  const store = seedStore([
+    { purchaseId: 'old', clientPublicKey: 'k', tunnelIp: '10.77.0.2',
+      createdAt: '2026-01-01T00:00:00Z', expiresAt: '2026-01-01T01:00:00Z', status: 'active' },
+    { purchaseId: 'recent', clientPublicKey: 'k', tunnelIp: '10.77.0.3',
+      createdAt: '2026-06-01T00:00:00Z', expiresAt: '2999-01-01T00:00:00Z', status: 'active' },
+  ]);
+  const removed = await store.pruneExpiredBefore(new Date('2026-02-01T00:00:00Z'));
   assert.equal(removed, 1);
-  const list = await ledger.list(new Date('2026-06-02T00:00:00Z'));
+  const list = await store.list(new Date('2026-06-02T00:00:00Z'));
   assert.equal(list.length, 1);
   assert.equal(list[0]?.purchaseId, 'recent');
 });
@@ -982,64 +984,71 @@ test('waitForPaid falls back to polling if the WS drops early', async () => {
 
 // --- Order store (per-order delivery) ---
 
-test('order store: create, poll, markReady once, and prune expired pending', async () => {
-  const store = createMemoryOrderStore();
+test('state store: create, poll, provision once (idempotent), and delivery-grace bound', async () => {
+  const store = createMemoryStateStore();
   const id = newOrderId();
   const future = new Date(Date.now() + 60_000).toISOString();
-  await store.create({
+  await store.createOrder({
     id, status: 'pending', clientPublicKey: 'k', lockPubkey: OP_PUBKEY,
     lockIndex: 3, createdAt: new Date().toISOString(), expiresAt: future,
   });
 
-  assert.equal((await store.get(id))?.status, 'pending');
+  assert.equal((await store.getOrder(id))?.status, 'pending');
 
-  const lease = {
-    purchaseId: 'p1', clientPublicKey: 'k', tunnelIp: '10.77.0.9',
-    createdAt: 't', expiresAt: 't', status: 'active' as const,
-  };
-  const ready = await store.markReady(id, {
-    purchaseId: 'p1', tunnelIp: '10.77.0.9', amountSats: 250, clientConfig: 'CONF', lease,
-  });
-  assert.equal(ready?.status, 'ready');
-  assert.equal((await store.get(id))?.clientConfig, 'CONF');
+  const r = await provisionStore(store, id, 'k');
+  assert.equal(r?.order.status, 'ready');
+  assert.equal(r?.alreadyReady, false);
+  assert.equal((await store.getOrder(id))?.clientConfig, 'CONF');
 
-  // Second markReady is a no-op (no longer pending).
-  assert.equal(await store.markReady(id, { purchaseId: 'p2', tunnelIp: 'x', amountSats: 1, clientConfig: 'X', lease }), undefined);
+  // Second provision is idempotent: already ready, no second lease.
+  const again = await provisionStore(store, id, 'k');
+  assert.equal(again?.alreadyReady, true);
 
-  // Expired pending orders read as gone.
+  // Unknown order id -> undefined.
+  assert.equal(await provisionStore(store, newOrderId(), 'k'), undefined);
+
+  // Expired pending orders read as gone...
   const expiredId = newOrderId();
   const past = new Date(Date.now() - 1000).toISOString();
-  await store.create({
-    id: expiredId, status: 'pending', clientPublicKey: 'k', lockPubkey: OP_PUBKEY,
+  await store.createOrder({
+    id: expiredId, status: 'pending', clientPublicKey: 'k-exp', lockPubkey: OP_PUBKEY,
     createdAt: past, expiresAt: past,
   });
-  assert.equal(await store.get(expiredId), undefined);
-  // ...but a late /pay can still fetch + provision it (no stranded payment).
-  assert.equal((await store.get(expiredId, undefined, { includeExpired: true }))?.id, expiredId);
-  assert.equal((await store.markReady(expiredId, {
-    purchaseId: 'p9', tunnelIp: '10.77.0.9', amountSats: 1, clientConfig: 'C', lease,
-  }))?.status, 'ready');
+  assert.equal(await store.getOrder(expiredId), undefined);
+  // ...but a late /pay within the delivery grace can still fetch + provision it.
+  assert.equal((await store.getOrder(expiredId, undefined, { includeExpired: true }))?.id, expiredId);
+  assert.equal((await provisionStore(store, expiredId, 'k-exp'))?.order.status, 'ready');
+
+  // includeExpired is bounded: past the delivery grace the order is gone for
+  // everyone, so the TTL actually limits how long a payment can land.
+  const staleId = newOrderId();
+  const longAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString(); // 1h past TTL
+  await store.createOrder({
+    id: staleId, status: 'pending', clientPublicKey: 'k', lockPubkey: OP_PUBKEY,
+    createdAt: longAgo, expiresAt: longAgo,
+  });
+  assert.equal(await store.getOrder(staleId, undefined, { includeExpired: true }), undefined);
 });
 
-test('order store pruneExpiredBefore forgets ready leases past cutoff, keeps live', async () => {
-  const store = createMemoryOrderStore();
+test('pruneExpiredBefore forgets ready orders whose lease expired, keeps live pending', async () => {
+  const store = createMemoryStateStore();
   const past = new Date(Date.now() - 1000).toISOString();
   const future = new Date(Date.now() + 3600_000).toISOString();
   // ready order whose lease already expired
-  await store.create({
+  await store.createOrder({
     id: newOrderId(), status: 'ready', clientPublicKey: 'k', lockPubkey: OP_PUBKEY,
     createdAt: past, expiresAt: past,
     lease: { purchaseId: 'p', clientPublicKey: 'k', tunnelIp: '10.77.0.2', createdAt: past, expiresAt: past, status: 'active' },
   });
   // pending order still within its request window
   const live = newOrderId();
-  await store.create({
+  await store.createOrder({
     id: live, status: 'pending', clientPublicKey: 'k', lockPubkey: OP_PUBKEY,
     createdAt: new Date().toISOString(), expiresAt: future,
   });
   const removed = await store.pruneExpiredBefore(new Date());
   assert.equal(removed, 1);
-  assert.ok(await store.get(live)); // the live pending order survived
+  assert.ok(await store.getOrder(live)); // the live pending order survived
 });
 
 // --- Sweep (operator claims locked proofs offline) ---
@@ -1208,9 +1217,8 @@ async function withServer(
   const server = createServer({
     config,
     allocator: createAllocator(),
-    ledger: createMemoryLedger(),
+    store: createMemoryStateStore(),
     proofStore: createMemoryProofStore(),
-    orderStore: createMemoryOrderStore(),
     ...extra,
     lockBook,
   });
@@ -1352,41 +1360,22 @@ test('property: planSweep partitions every receipt exactly once', () => {
 
 // --- Atomic provisioning + cross-process prune lock ---
 
-// Allocate the lowest free host; if `taken` isn't updated atomically per record,
-// two concurrent calls collide on the same IP.
-const lowestFree = (taken: Set<string>): string => {
-  for (let h = 2; h < 255; h++) { const ip = `10.77.0.${h}`; if (!taken.has(ip)) return ip; }
-  throw new Error('subnet exhausted');
-};
-
-test('allocateAndRecord expires a prior active lease for the same key (one key, one lease)', async () => {
-  const ledger = createMemoryLedger();
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + 60_000).toISOString();
-  const first = await ledger.allocateAndRecord({ purchaseId: 'a', clientPublicKey: 'K', now, expiresAt, allocate: lowestFree });
-  const second = await ledger.allocateAndRecord({ purchaseId: 'b', clientPublicKey: 'K', now, expiresAt, allocate: lowestFree });
-  assert.deepEqual(second.expiredPriorIds, ['a'], 'the prior same-key lease is reported as expired');
-  assert.deepEqual(first.expiredPriorIds, [], 'the first lease expired nothing');
-  const active = (await ledger.list()).filter((l) => l.status === 'active');
-  assert.equal(active.length, 1, 'the prior lease for this key is expired');
-  assert.equal(active[0]!.purchaseId, 'b', 'the newest lease wins');
-  assert.equal((await ledger.list()).length, 2, 'the old lease is expired, not deleted');
-  assert.ok(second.lease.tunnelIp.startsWith('10.77.0.'));
-});
-
-test('reactivate restores an expired lease (rollback of a failed renewal)', async () => {
-  const ledger = createMemoryLedger();
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + 60_000).toISOString();
-  const first = await ledger.allocateAndRecord({ purchaseId: 'a', clientPublicKey: 'K', now, expiresAt, allocate: lowestFree });
-  const second = await ledger.allocateAndRecord({ purchaseId: 'b', clientPublicKey: 'K', now, expiresAt, allocate: lowestFree });
-  // Simulate provisionPeer's wg-failure rollback: expire the new, re-activate the prior.
-  await ledger.markExpired('b');
-  await ledger.reactivate(second.expiredPriorIds);
-  const active = (await ledger.list()).filter((l) => l.status === 'active');
-  assert.equal(active.length, 1, 'exactly one active lease after rollback');
-  assert.equal(active[0]!.purchaseId, 'a', 'the original lease is live again, so cleanup still reaps its peer');
-  assert.ok(first.lease.tunnelIp.startsWith('10.77.0.'));
+test('provision renews a same-key lease in place: keeps the IP, expires the prior', async () => {
+  // One key holds one active lease. A second order for the same key is a renewal: it
+  // REUSES the live peer's IP (no route churn / counter reset) and rebases the data
+  // cap to the live counter, expiring the prior lease — all in one atomic write.
+  const store = createMemoryStateStore();
+  const future = new Date(Date.now() + 60_000).toISOString();
+  await store.createOrder({ id: 'oa', status: 'pending', clientPublicKey: 'K', lockPubkey: '', createdAt: new Date().toISOString(), expiresAt: future });
+  await store.createOrder({ id: 'ob', status: 'pending', clientPublicKey: 'K', lockPubkey: '', createdAt: new Date().toISOString(), expiresAt: future });
+  const a = await provisionStore(store, 'oa', 'K');
+  const b = await provisionStore(store, 'ob', 'K', { readPeerCounter: async () => 4242 });
+  assert.equal(b!.order.lease!.tunnelIp, a!.order.lease!.tunnelIp, 'renewal keeps the live peer IP');
+  assert.equal(b!.order.lease!.capBaseline, 4242, 'renewal rebases the data cap to the live counter');
+  const active = (await store.list()).filter((l) => l.status === 'active');
+  assert.equal(active.length, 1, 'one key, one active lease');
+  assert.equal(active[0]!.purchaseId, b!.order.purchaseId, 'the newest lease wins');
+  assert.equal((await store.list()).length, 2, 'the prior lease is expired, not deleted');
 });
 
 test('cleanup skips removing a peer whose key a concurrent re-buy now owns', async () => {
@@ -1401,7 +1390,7 @@ test('cleanup skips removing a peer whose key a concurrent re-buy now owns', asy
 
   // Post-renewal state: old lease expired-by-time but still status 'active', plus a
   // fresh live lease for the same key.
-  const renewed = createMemoryLedger([mk('old', past, '10.77.0.2'), mk('new', future, '10.77.0.3')]);
+  const renewed = seedStore([mk('old', past, '10.77.0.2'), mk('new', future, '10.77.0.3')]);
   let execCalls = 0;
   const fakeExec = async () => { execCalls += 1; return []; };
   const r1 = await cleanupExpiredPeers(renewed, 'wg0', false, now, serialize(), fakeExec as never);
@@ -1411,24 +1400,45 @@ test('cleanup skips removing a peer whose key a concurrent re-buy now owns', asy
   assert.deepEqual(stillActive.map((l) => l.purchaseId), ['new'], 'the renewal stays active');
 
   // Control: with no renewal, the same expired lease IS removed.
-  const orphan = createMemoryLedger([mk('old', past, '10.77.0.2')]);
+  const orphan = seedStore([mk('old', past, '10.77.0.2')]);
   execCalls = 0;
   const r2 = await cleanupExpiredPeers(orphan, 'wg0', false, now, serialize(), fakeExec as never);
   assert.equal(execCalls, 1, 'expired peer removed when no live lease claims its key');
   assert.deepEqual(r2.cleaned.map((l) => l.purchaseId), ['old']);
 });
 
-test('file ledger allocateAndRecord serializes allocation — no IP collisions under concurrency', async () => {
+test('reconcileActivePeers re-adds only active leases at startup', async () => {
+  const now = new Date();
+  const past = new Date(now.getTime() - 1000).toISOString();
+  const future = new Date(now.getTime() + 60_000).toISOString();
+  const mk = (purchaseId: string, expiresAt: string, tunnelIp: string): PeerLease =>
+    ({ purchaseId, clientPublicKey: `K-${purchaseId}`, tunnelIp, createdAt: past, expiresAt, status: 'active' });
+
+  // live and expired-by-time — only the live one restores.
+  const store = seedStore([mk('live', future, '10.77.0.2'), mk('gone', past, '10.77.0.3')]);
+  const added: string[] = [];
+  const exec = async (plan: { steps: { argv: string[] }[] }) => {
+    added.push(plan.steps[0]!.argv[4]!); // the peer pubkey from `wg set ... peer <key>`
+    return [];
+  };
+  const r = await reconcileActivePeers(store, 'wg0', now, exec as never);
+  assert.deepEqual(r, { restored: 1, failed: 0 });
+  assert.deepEqual(added, ['K-live']);
+});
+
+test('concurrent provisions serialize allocation — no IP collisions', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'cvpn-alloc-'));
-  const path = join(dir, 'ledger.json');
+  const path = join(dir, 'state.json');
   try {
-    const ledger = createFileLedger(path);
-    const expiresAt = new Date(Date.now() + 60_000).toISOString();
+    const store = await createFileStateStore(path);
+    const future = new Date(Date.now() + 60_000).toISOString();
+    await Promise.all(Array.from({ length: 20 }, (_, i) =>
+      store.createOrder({ id: `o${i}`, status: 'pending', clientPublicKey: `key-${i}`, lockPubkey: '', createdAt: new Date().toISOString(), expiresAt: future })));
     // 20 distinct keys provisioning at once: if the read-allocate-write weren't
     // serialized, they'd read the same free-IP snapshot and pick duplicate /32s.
-    const results = await Promise.all(Array.from({ length: 20 }, (_, i) =>
-      ledger.allocateAndRecord({ purchaseId: `p${i}`, clientPublicKey: `key-${i}`, now: new Date(), expiresAt, allocate: lowestFree })));
-    assert.equal(new Set(results.map((r) => r.lease.tunnelIp)).size, 20, 'every concurrent allocation got a distinct IP');
+    const results = await Promise.all(Array.from({ length: 20 }, (_, i) => provisionStore(store, `o${i}`, `key-${i}`)));
+    const ips = results.map((r) => r!.order.lease!.tunnelIp);
+    assert.equal(new Set(ips).size, 20, 'every concurrent provision got a distinct IP');
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -1542,7 +1552,7 @@ async function buyViaPay(url: string, idx: number): Promise<Response> {
 }
 
 test('concurrent /pay deliveries for one order provision exactly once', async () => {
-  const ledger = createMemoryLedger();
+  const store = createMemoryStateStore();
   const proofStore = slowProofStore(40);
   const lockBook = await createLockBook(TEST_XPUB);
   await withServer(async (url) => {
@@ -1554,11 +1564,11 @@ test('concurrent /pay deliveries for one order provision exactly once', async ()
 
     // Invariant: one peer, one receipt — the per-order processing guard collapses
     // the 8 concurrent deliveries to a single provision regardless of interleaving.
-    assert.equal((await ledger.list()).length, 1, 'exactly one lease provisioned');
+    assert.equal((await store.list()).length, 1, 'exactly one lease provisioned');
     assert.equal((await proofStore.list()).length, 1, 'exactly one receipt stored');
     assert.ok(codes.includes(200), 'at least one delivery succeeds');
     assert.ok(codes.every((c) => c === 200 || c === 409), `unexpected status: ${codes}`);
-  }, LIVE_ENV, { ledger, proofStore, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
+  }, LIVE_ENV, { store, proofStore, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
 });
 
 test('/pay rejects a token locked to a different order (per-order binding)', async () => {
@@ -1577,7 +1587,7 @@ test('/pay rejects a token locked to a different order (per-order binding)', asy
 });
 
 test('/pay returns the config bundle, and a repeat delivery is idempotent', async () => {
-  const ledger = createMemoryLedger();
+  const store = createMemoryStateStore();
   const lockBook = await createLockBook(TEST_XPUB);
   await withServer(async (url) => {
     const { orderId } = await (await newOrder(url)).json(); // child 0
@@ -1590,8 +1600,37 @@ test('/pay returns the config bundle, and a repeat delivery is idempotent', asyn
     const again = await payOrder(url, orderId, 0); // same token again
     assert.equal(again.status, 200);
     assert.equal((await again.json()).tunnelIp, firstBody.tunnelIp, 'idempotent: same config, not a second lease');
-    assert.equal((await ledger.list()).length, 1, 'exactly one lease');
-  }, LIVE_ENV, { ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
+    assert.equal((await store.list()).length, 1, 'exactly one lease');
+  }, LIVE_ENV, { store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
+});
+
+test('a resumed delivery after a crash provisions exactly one lease (write-first + atomic commit)', async () => {
+  // Crash model: the token receipt was persisted (write-first) but the process died
+  // before the order+lease commit, so the order reloads pending with NO lease. The
+  // retry must produce exactly one lease and not double-store the receipt — the
+  // order+lease commit is atomic, so there's no "lease without a ready order" state.
+  const store = createMemoryStateStore();
+  const lockBook = await createLockBook(TEST_XPUB);
+  const { index, pubkey } = await lockBook.issue(); // child 0
+  const orderId = newOrderId();
+  await store.createOrder({
+    id: orderId, status: 'pending', clientPublicKey: VALID_WG_KEY,
+    lockPubkey: pubkey, lockIndex: index,
+    createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+  });
+  // The receipt the pre-crash attempt already wrote (idempotent on its secret).
+  const proofStore = createMemoryProofStore([{
+    purchaseId: 'p-precrash', mint: 'https://mint.example.com', amountSats: 1000,
+    token: fakeToken(index), secrets: [`sec-${index}`], lockPubkey: normalizePubkey(pubkey),
+    index, receivedAt: new Date().toISOString(),
+  }]);
+  await withServer(async (url) => {
+    const res = await payOrder(url, orderId, index);
+    assert.equal(res.status, 200);
+    assert.equal((await store.list()).length, 1, 'exactly one lease after the resumed delivery');
+    assert.equal((await proofStore.list()).length, 1, 'receipt not double-stored (idempotent on the secret)');
+    assert.equal((await store.getOrder(orderId))?.status, 'ready', 'order committed ready');
+  }, LIVE_ENV, { store, proofStore, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
 });
 
 test('malformed JSON returns 400 and an oversized body 413 (not 500)', async () => {
@@ -1610,93 +1649,98 @@ test('malformed JSON returns 400 and an oversized body 413 (not 500)', async () 
   }, LIVE_ENV);
 });
 
-test('re-buying with an already-active key replaces the old lease (no early disconnect)', async () => {
-  // WireGuard keys a peer by its pubkey, so a second purchase with the same key
-  // moves the peer to a new IP; the old lease must be expired (not left active),
-  // or its cleanup later runs `wg ... peer remove` and cuts the new buyer.
-  const ledger = createMemoryLedger();
+test('re-buying with an already-active key renews the lease in place (no early disconnect)', async () => {
+  // A second purchase with the same key is a renewal: the prior lease is expired and
+  // the new one reuses the SAME peer IP (one key, one active lease) — so cleanup never
+  // runs `wg ... peer remove` on a key the live buyer still holds.
+  const store = createMemoryStateStore();
   const lockBook = await createLockBook(TEST_XPUB);
   await withServer(async (url) => {
     await buyViaPay(url, 0); // order child 0 → lease 1
-    await buyViaPay(url, 1); // order child 1 → lease 2 (same key)
+    await buyViaPay(url, 1); // order child 1 → renewal (same key)
 
-    const all = await ledger.list();
+    const all = await store.list();
     assert.equal(all.length, 2, 'both purchases recorded a lease');
     const active = all.filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
     assert.equal(active.length, 1, 'one key holds exactly one active lease (old one expired, not removed)');
-  }, LIVE_ENV, { ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], readTransfers: async () => new Map(), lockBook });
+    assert.equal(active[0]!.tunnelIp, all.find((l) => l.status === 'expired')!.tunnelIp, 'renewal kept the same IP');
+  }, LIVE_ENV, { store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], readTransfers: async () => new Map(), lockBook });
 });
 
-test('a failed wg renewal keeps the original lease active (no orphaned peer)', async () => {
-  // Renewal expires the prior lease atomically; if `wg set` then fails, the prior
-  // lease must be re-activated, or cleanup (active-only) never reaps its live peer.
-  const ledger = createMemoryLedger();
+test('a renewal whose wg apply fails still commits (converges, never rolls back)', async () => {
+  // New model: desired state commits first, WireGuard converges. A failed `wg set` on
+  // a renewal is logged, not rolled back — and since a renewal reuses the live peer's
+  // key+IP, the buyer was never cut; housekeep's reconcile re-asserts the peer.
+  const store = createMemoryStateStore();
   const lockBook = await createLockBook(TEST_XPUB);
   let calls = 0;
   const execPlan = async () => { calls += 1; if (calls === 2) throw new Error('wg down'); return []; };
   await withServer(async (url) => {
-    assert.equal((await buyViaPay(url, 0)).status, 200); // first lease provisioned
-    assert.equal((await buyViaPay(url, 1)).status, 500); // renewal: wg fails mid-provision → rolled back
+    assert.equal((await buyViaPay(url, 0)).status, 200); // first lease + peer
+    assert.equal((await buyViaPay(url, 1)).status, 200); // renewal commits; wg apply fails but isn't fatal
 
-    const all = await ledger.list();
-    assert.equal(all.length, 2, 'both leases recorded');
+    const all = await store.list();
     const active = all.filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
-    assert.equal(active.length, 1, 'the original lease is active again — its peer stays reapable, not orphaned');
-  }, LIVE_ENV, { ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: execPlan as never, readTransfers: async () => new Map(), lockBook });
+    assert.equal(active.length, 1, 'one active lease (the renewal); the prior is expired');
+    assert.equal(active[0]!.tunnelIp, all.find((l) => l.status === 'expired')!.tunnelIp, 'renewal kept the same IP');
+  }, LIVE_ENV, { store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: execPlan as never, readTransfers: async () => new Map(), lockBook });
 });
 
 test('a same-key renewal baselines the cap to the peer\'s current counter', async () => {
   // The renewal's lease must record the peer's cumulative counter as its baseline,
   // so cap enforcement later charges it only for traffic beyond the prior lease.
-  const ledger = createMemoryLedger();
+  const store = createMemoryStateStore();
   const lockBook = await createLockBook(TEST_XPUB);
   await withServer(async (url) => {
     assert.equal((await buyViaPay(url, 0)).status, 200); // fresh: baseline 0
     assert.equal((await buyViaPay(url, 1)).status, 200); // renewal: baseline = counter below
   }, LIVE_ENV, {
-    ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [],
+    store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [],
     readTransfers: async () => new Map([[VALID_WG_KEY, { rx: 700, tx: 300 }]]), lockBook,
   });
-  const leases = await ledger.list();
+  const leases = await store.list();
   assert.equal(leases.find((l) => l.status === 'active')!.capBaseline, 1000, 'renewal baselined to rx+tx');
   assert.equal(leases.find((l) => l.status === 'expired')!.capBaseline ?? 0, 0, 'first lease was fresh (no baseline)');
 });
 
 test('a same-key renewal fails (not insta-caps) when the counter read fails', async () => {
-  // A transient `wg show transfer` failure on a renewal must roll back, not baseline
-  // to 0 — else the paid replacement inherits the prior usage and is insta-capped.
-  const ledger = createMemoryLedger();
+  // A transient `wg show transfer` failure on a renewal must abort the commit, not
+  // baseline to 0 — else the paid replacement inherits the prior usage and is
+  // insta-capped. The order stays pending (no lease committed), so a retry resumes.
+  const store = createMemoryStateStore();
   const lockBook = await createLockBook(TEST_XPUB);
   await withServer(async (url) => {
     assert.equal((await buyViaPay(url, 0)).status, 200); // fresh provision succeeds
-    assert.equal((await buyViaPay(url, 1)).status, 500); // renewal: counter read throws → rolled back
-    const active = (await ledger.list()).filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
+    assert.equal((await buyViaPay(url, 1)).status, 500); // renewal: counter read throws → no commit
+    const active = (await store.list()).filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
     assert.equal(active.length, 1, 'the original lease stays active; the renewal did not record');
   }, LIVE_ENV, {
-    ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [],
+    store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [],
     readTransfers: async () => { throw new Error('wg show failed'); }, lockBook,
   });
 });
 
-test('a failed FRESH provision removes the peer wg set may have added', async () => {
-  // No prior lease for this key, so rollback can't re-activate anything — it must
-  // best-effort remove the just-added peer instead of orphaning it on the interface.
-  const ledger = createMemoryLedger();
+test('a fresh provision whose wg apply fails still commits; reconcile adds the peer', async () => {
+  // New model: the order+lease commit first, WireGuard converges. A failed `wg set`
+  // doesn't roll back — the lease stays active (desired state) and housekeep's
+  // reconcile re-adds the peer. The buyer gets a ready order; the peer appears next tick.
+  const store = createMemoryStateStore();
   const lockBook = await createLockBook(TEST_XPUB);
-  const plans: string[][] = [];
-  const execPlan = async (plan: { steps: { argv: string[] }[] }) => {
-    plans.push(plan.steps.map((s) => s.argv.join(' ')));
-    if (plans.length === 1) throw new Error('wg down'); // the add fails
-    return []; // the rollback remove succeeds
+  let applyCalls = 0;
+  const execPlan = async () => {
+    applyCalls += 1;
+    if (applyCalls === 1) throw new Error('wg down'); // the provision-time apply fails
+    return []; // a later reconcile apply succeeds
   };
   await withServer(async (url) => {
-    assert.equal((await buyViaPay(url, 0)).status, 500); // fresh provision fails mid-wg
-    const active = (await ledger.list()).filter((l) => l.status === 'active');
-    assert.equal(active.length, 0, 'no active lease left holding an IP');
-  }, LIVE_ENV, { ledger, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: execPlan as never, lockBook });
-
-  assert.equal(plans.length, 2, 'rollback attempted a second wg op (the remove)');
-  assert.ok(plans[1]!.some((c) => c.includes('peer') && c.includes('remove')), 'second op removes the peer');
+    assert.equal((await buyViaPay(url, 0)).status, 200, 'commit succeeds even though wg apply failed');
+    const active = (await store.list()).filter((l) => l.status === 'active');
+    assert.equal(active.length, 1, 'the lease is committed and active (desired state); peer converges later');
+    // Reconcile re-applies the missing peer (idempotent).
+    const r = await reconcileActivePeers(store, 'wg0', new Date(), execPlan as never);
+    assert.equal(r.restored, 1, 'reconcile re-adds the peer the failed apply left missing');
+    assert.ok(applyCalls >= 2, 'a second wg apply happened (the reconcile)');
+  }, LIVE_ENV, { store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: execPlan as never, lockBook });
 });
 
 // --- Real P2PK secret parsing through verifyPayment (offline, no mint) ---

@@ -3,12 +3,12 @@ import { readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type { Config } from './config.js';
-import type { PeerAllocator, PeerLedger, PeerLease } from './peers.js';
+import type { PeerAllocator, PeerLease } from './peers.js';
 import type { ProofStore } from './wallet.js';
 import type { LockBook } from './locks.js';
-import { newOrderId, type Order, type OrderStore } from './orders.js';
+import { newOrderId, newPurchaseId, type Order, type StateStore } from './state.js';
 import { createRateLimiter, type RateLimiter } from './ratelimit.js';
-import { generateClientConfig, planAddPeer, planRemovePeer, executePlan, cleanupExpiredPeers, enforceDataCaps, readPeerTransfers, validatePublicKey, type WgLock } from './wireguard.js';
+import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, enforceDataCaps, readPeerTransfers, reconcileActivePeers, validatePublicKey, type WgLock } from './wireguard.js';
 import { serialize } from './serialize.js';
 import { buildPaymentRequest, verifyPayment, normalizePubkey, type VerifyResult, type VerifyDeps } from './cashu.js';
 import { getEncodedToken, type Proof } from '@cashu/cashu-ts';
@@ -29,9 +29,9 @@ const VERSION = ((): string => {
 export interface ServerDeps {
   config: Config;
   allocator: PeerAllocator;
-  ledger: PeerLedger;
+  /** Unified order+lease state (one atomic store). Also the lease view for cleanup. */
+  store: StateStore;
   proofStore: ProofStore;
-  orderStore: OrderStore;
   /** Present in xpub mode: issues per-transaction lock pubkeys. */
   lockBook?: LockBook;
   /** Test seam: override offline payment verification (defaults to the real mint/DLEQ/P2PK path). */
@@ -99,16 +99,27 @@ export function createServer(deps: ServerDeps): http.Server {
 // One housekeeping pass: remove expired peers, then forget records older than the
 // retention window so the lease ledger and order store don't grow unbounded.
 async function housekeep(ctx: Ctx): Promise<void> {
-  const { config, ledger, orderStore } = ctx;
+  const { config, store } = ctx;
   try {
-    await cleanupExpiredPeers(ledger, config.wgInterface, config.mode === 'dry-run', new Date(), ctx.wgLock);
+    await cleanupExpiredPeers(store, config.wgInterface, config.mode === 'dry-run', new Date(), ctx.wgLock);
   } catch (e) {
     console.error('peer cleanup failed:', e instanceof Error ? e.message : e);
+  }
+  // Continuously make WireGuard match desired state: (re)add a peer for any active
+  // lease missing from the interface — a `wg set` that failed right after its order
+  // committed, or peers dropped by a host/interface restart between ticks. Idempotent;
+  // a present peer is a no-op. This is why provisioning never rolls WireGuard back.
+  if (config.mode === 'live') {
+    try {
+      await reconcileActivePeers(store, config.wgInterface, new Date(), ctx.execPlan ?? executePlan, ctx.wgLock);
+    } catch (e) {
+      console.error('peer reconcile failed:', e instanceof Error ? e.message : e);
+    }
   }
   if (config.leaseDataCapBytes > 0) {
     try {
       const capped = await enforceDataCaps(
-        ledger, config.wgInterface, config.leaseDataCapBytes, config.mode === 'dry-run', new Date(), ctx.wgLock
+        store, config.wgInterface, config.leaseDataCapBytes, config.mode === 'dry-run', new Date(), ctx.wgLock
       );
       for (const lease of capped.cleaned) {
         console.log(`disconnected ${lease.purchaseId} (${lease.tunnelIp}): data cap reached`);
@@ -120,11 +131,8 @@ async function housekeep(ctx: Ctx): Promise<void> {
   if (config.retainExpiredMs > 0) {
     const cutoff = new Date(Date.now() - config.retainExpiredMs);
     try {
-      const [peers, orders] = await Promise.all([
-        ledger.pruneExpiredBefore(cutoff),
-        orderStore.pruneExpiredBefore(cutoff),
-      ]);
-      if (peers || orders) console.log(`pruned ${peers} expired lease(s), ${orders} order(s)`);
+      const pruned = await store.pruneExpiredBefore(cutoff);
+      if (pruned) console.log(`pruned ${pruned} expired order(s)`);
     } catch (e) {
       console.error('retention prune failed:', e instanceof Error ? e.message : e);
     }
@@ -224,10 +232,16 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     return json(res, 400, { error: 'missing_client_public_key' });
   }
 
-  // Dry-run skips payment entirely and provisions immediately.
+  // Dry-run skips payment entirely: create an order and provision it immediately.
   if (config.mode !== 'live') {
-    const bundle = await provisionPeer(ctx, clientPublicKey, undefined, undefined);
-    return json(res, 200, { ...bundle, mode: config.mode });
+    const orderId = newOrderId();
+    const now = new Date();
+    await ctx.store.createOrder({
+      id: orderId, status: 'pending', clientPublicKey, lockPubkey: '',
+      createdAt: now.toISOString(), expiresAt: new Date(now.getTime() + config.orderTtlMs).toISOString(),
+    });
+    const result = await runProvision(ctx, orderId, clientPublicKey, undefined, undefined);
+    return json(res, 200, { ...readyBundleOf(result!.order), mode: config.mode });
   }
 
   if (!ctx.lockBook) {
@@ -263,7 +277,7 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     createdAt: now.toISOString(),
     expiresAt: new Date(now.getTime() + config.orderTtlMs).toISOString(),
   };
-  await ctx.orderStore.create(order);
+  await ctx.store.createOrder(order);
 
   const creq = buildPaymentRequest({
     paymentId: orderId,
@@ -300,7 +314,7 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
 
   // Fast idempotent path: a wallet re-delivering to an already-ready order needn't
   // re-verify. (includeExpired: a wallet may deliver just after the TTL.)
-  const order = await ctx.orderStore.get(orderId, undefined, { includeExpired: true });
+  const order = await ctx.store.getOrder(orderId, undefined, { includeExpired: true });
   if (!order) return json(res, 404, { error: 'order_not_found' });
   // Idempotent: already provisioned. Return the config too, so an agent that POSTs
   // here itself gets the .conf in one shot (a wallet just ignores the extra fields).
@@ -352,7 +366,7 @@ async function handleOrderStatus(res: ServerResponse, ctx: Ctx, orderId: string)
   if (!ORDER_ID_RE.test(orderId)) {
     return json(res, 404, { error: 'order_not_found' });
   }
-  const order = await ctx.orderStore.get(orderId);
+  const order = await ctx.store.getOrder(orderId);
   if (!order) {
     return json(res, 404, { error: 'order_not_found' });
   }
@@ -409,34 +423,37 @@ type DeliverResult =
 /**
  * Provision a verified payment against THE order it's bound to, under the per-order
  * `processing` guard. The order is the single-use record: it provisions once
- * (pending -> ready), then every later delivery is idempotent ('ready'); once it's
- * pruned, deliveries 404. That binding — a token's lock maps to exactly one order —
- * is what makes replays (even of a swept token) and concurrent double-spends
- * impossible, with no per-secret bookkeeping. A failed provision leaves the order
- * pending, so a retry resumes (proofStore.add is idempotent on the token).
+ * (pending -> ready) in ONE atomic store write, then every later delivery is
+ * idempotent ('ready'); once pruned, deliveries 404. That binding — a token's lock
+ * maps to exactly one order — is what makes replays (even of a swept token) and
+ * concurrent double-spends impossible, with no per-secret bookkeeping. A failed or
+ * crashed attempt leaves the order pending with NO lease (order+lease commit
+ * together), so a retry simply re-runs (proofStore.add is idempotent on the token).
  */
 async function provisionOrder(ctx: Ctx, orderId: string, verified: Authorized): Promise<DeliverResult> {
   if (ctx.processing.has(orderId)) return { kind: 'error', status: 409, error: 'order_in_progress' };
   ctx.processing.add(orderId);
   try {
-    const fresh = await ctx.orderStore.get(orderId, undefined, { includeExpired: true });
-    if (!fresh) return { kind: 'error', status: 404, error: 'order_not_found' };
-    if (fresh.status === 'ready') return { kind: 'ready', order: fresh };
+    const order = await ctx.store.getOrder(orderId, undefined, { includeExpired: true });
+    if (!order) return { kind: 'error', status: 404, error: 'order_not_found' };
+    if (order.status === 'ready') return { kind: 'ready', order };
 
     // Bind: the proofs must be locked to the exact pubkey we issued for THIS order.
-    if (verified.payment.lockPubkey !== normalizePubkey(fresh.lockPubkey)) {
+    if (verified.payment.lockPubkey !== normalizePubkey(order.lockPubkey)) {
       return { kind: 'error', status: 402, error: 'lock_mismatch' };
     }
 
-    const bundle = await provisionPeer(ctx, fresh.clientPublicKey, verified.payment, fresh.lockIndex);
-    const ready = await ctx.orderStore.markReady(orderId, bundle);
-    return { kind: 'provisioned', order: ready ?? { ...fresh, ...bundle, status: 'ready' }, payment: verified.payment };
+    const result = await runProvision(ctx, orderId, order.clientPublicKey, verified.payment, order.lockIndex);
+    if (!result) return { kind: 'error', status: 404, error: 'order_not_found' };
+    return result.alreadyReady
+      ? { kind: 'ready', order: result.order }
+      : { kind: 'provisioned', order: result.order, payment: verified.payment };
   } finally {
     ctx.processing.delete(orderId);
   }
 }
 
-// --- Provisioning (shared by every delivery path) ---
+// --- Provisioning (shared by /pay and dry-run /purchase) ---
 
 interface ProvisionBundle {
   purchaseId: string;
@@ -446,40 +463,30 @@ interface ProvisionBundle {
   clientConfig: string;
 }
 
-async function provisionPeer(
+/**
+ * Commit a provision for `orderId`, then make WireGuard match. Desired state — the
+ * order going ready plus its lease — is written FIRST, in one atomic store write;
+ * the `wg set` is applied AFTER and is NEVER rolled back on failure: housekeep's
+ * periodic reconcile re-adds any peer a failed/interrupted apply left missing. The
+ * locked token is persisted before the commit so a crash keeps it sweepable. Returns
+ * the ready order (alreadyReady=true if it was already provisioned), or undefined if
+ * the order vanished.
+ */
+async function runProvision(
   ctx: Ctx,
+  orderId: string,
   clientPublicKey: string,
   payment: VerifyResult | undefined,
   lockIndex: number | undefined,
-): Promise<ProvisionBundle> {
-  const { config, allocator, ledger, proofStore } = ctx;
-
-  const purchaseId = newPurchaseId();
+): Promise<{ order: Order; alreadyReady: boolean } | undefined> {
+  const { config, store, proofStore, allocator } = ctx;
   const now = new Date();
+  const purchaseId = newPurchaseId();
 
-  // Cap baseline: `wg` transfer counters are cumulative and only reset when a peer
-  // is removed and re-added. A same-key renewal reuses the peer, so snapshot its
-  // current counter now and charge this lease only for usage beyond it — else the
-  // renewal inherits the prior lease's usage and can be insta-capped.
-  let capBaseline = 0;
-  if (config.mode === 'live' && config.leaseDataCapBytes > 0) {
-    // A key we've never recorded has no peer on the interface, so its counter is 0
-    // and no read is needed. For a key we HAVE seen, the peer may still carry prior
-    // traffic, so we MUST read its counter — and a read failure must fail the
-    // provision (it rolls back, the buyer retries) rather than silently baseline to
-    // 0, which would inherit the prior usage and insta-cap the paid renewal.
-    const seen = (await ledger.list()).some((l) => l.clientPublicKey === clientPublicKey);
-    if (seen) {
-      const readTransfers = ctx.readTransfers ?? readPeerTransfers;
-      const t = (await readTransfers(config.wgInterface)).get(clientPublicKey);
-      capBaseline = t ? t.rx + t.tx : 0;
-    }
-  }
-
-  // Persist the operator-locked token BEFORE touching the ledger/WireGuard. The
-  // buyer already minted these proofs to our lock, so if provisioning below fails
-  // we must keep them (sweepable offline) rather than drop them and strand the
-  // payment. Not spendable from the box; only the operator's offline key claims it.
+  // Persist the operator-locked token BEFORE committing state, so a crash mid-commit
+  // keeps it (sweepable offline) rather than stranding the payment. Idempotent on the
+  // token's secrets, so a resumed retry doesn't double-store it. Not spendable from
+  // the box; only the operator's offline key claims it.
   if (payment?.valid && payment.token && payment.mint) {
     await proofStore.add({
       purchaseId,
@@ -493,74 +500,47 @@ async function provisionPeer(
     });
   }
 
-  // Allocate the tunnel IP and record the lease in ONE serialized ledger
-  // transaction: two concurrent provisions can't read the same free-IP snapshot
-  // and grab the same /32, and any prior active lease for this key is expired in
-  // the same step (a WireGuard peer is keyed by pubkey, so one key holds one
-  // active lease — else the old lease's cleanup would `wg ... remove` the shared
-  // peer and cut this buyer).
-  const { lease, expiredPriorIds } = await ledger.allocateAndRecord({
+  const result = await store.provision(orderId, {
     purchaseId,
     clientPublicKey,
+    amountSats: payment?.amountSats,
+    leaseDurationMs: config.leaseDurationMs,
     now,
-    expiresAt: new Date(now.getTime() + config.leaseDurationMs).toISOString(),
-    capBaseline,
     allocate: (taken) => allocator.allocateTunnelIp(purchaseId, clientPublicKey, taken),
+    // Called by provision() only on a same-key renewal of a still-live lease (peer
+    // present, so cleanup can't be removing it). A read failure aborts the commit —
+    // the buyer retries — rather than baselining to 0 and insta-capping the renewal.
+    readPeerCounter: async () => {
+      if (config.mode !== 'live' || !(config.leaseDataCapBytes > 0)) return 0;
+      const readTransfers = ctx.readTransfers ?? readPeerTransfers;
+      const t = (await readTransfers(config.wgInterface)).get(clientPublicKey);
+      return t ? t.rx + t.tx : 0;
+    },
+    renderConfig: (tunnelIp, pid) => generateClientConfig({
+      tunnelIp,
+      serverPublicKey: config.serverPublicKey,
+      endpoint: config.endpoint,
+      purchaseId: pid,
+      dryRun: config.mode === 'dry-run',
+      dns: config.dns,
+    }),
   });
-  const { tunnelIp } = lease;
+  if (!result) return undefined;
 
-  if (config.mode === 'live') {
+  // Make WireGuard match the just-committed lease. Best-effort, under the shared wg
+  // lock (so it can't interleave with cleanup's remove on the same key). A failure is
+  // logged, not rolled back — housekeep's reconcile re-adds the peer. A renewal reuses
+  // the live peer's key+IP, so this `wg set` is a harmless no-op there.
+  if (config.mode === 'live' && !result.alreadyReady && result.order.lease) {
     const exec = ctx.execPlan ?? executePlan;
-    // planAddPeer is two commands (`wg set` then `ip route replace`) and they are
-    // not transactional — `wg set` can succeed before the route step fails. The
-    // rollback below undoes whichever case we're in. Under the shared wg lock so
-    // this `wg set` can't interleave with cleanup's `wg ... remove` on the same
-    // peer key (see Ctx.wgLock).
-    await ctx.wgLock(async () => {
-      try {
-        await exec(planAddPeer(config.wgInterface, clientPublicKey, tunnelIp));
-      } catch (e) {
-        // Roll back the reservation so a failed `wg set` doesn't leave an active
-        // lease holding an IP for a peer that was never added — AND re-activate any
-        // prior same-key lease we expired, so its still-live peer keeps getting
-        // reaped by cleanup instead of being orphaned on the interface forever.
-        await ledger.markExpired(purchaseId).catch(() => {});
-        if (expiredPriorIds.length) {
-          await ledger.reactivate(expiredPriorIds).catch(() => {});
-          // A renewal's `wg set` may have already clobbered the prior peer's
-          // allowed-ips/route to this (failed) lease's IP before failing. Re-apply
-          // each reactivated lease's own config so the previously-paid buyer keeps
-          // working — cleanup only ever removes peers, it never re-adds them.
-          const priorIds = new Set(expiredPriorIds);
-          const priors = (await ledger.list().catch(() => [])).filter((l) => priorIds.has(l.purchaseId));
-          for (const p of priors) {
-            await exec(planAddPeer(config.wgInterface, p.clientPublicKey, p.tunnelIp)).catch(() => {});
-          }
-        } else {
-          // Fresh provision: `wg set` may have added the peer before the route step
-          // failed. Best-effort remove it so a routeless peer isn't orphaned on the
-          // interface (no prior lease owns this key, so removal can't cut anyone).
-          await exec(planRemovePeer(config.wgInterface, clientPublicKey, tunnelIp)).catch(() => {});
-        }
-        throw e;
-      }
-    });
+    const { clientPublicKey: key, tunnelIp } = result.order.lease;
+    try {
+      await ctx.wgLock(() => exec(planAddPeer(config.wgInterface, key, tunnelIp)));
+    } catch (e) {
+      console.error(`wg apply failed for ${result.order.purchaseId} (${tunnelIp}); reconcile will retry:`, e instanceof Error ? e.message : e);
+    }
   }
-
-  const clientConfig = generateClientConfig({
-    tunnelIp,
-    serverPublicKey: config.serverPublicKey,
-    endpoint: config.endpoint,
-    purchaseId,
-    dryRun: config.mode === 'dry-run',
-    dns: config.dns,
-  });
-
-  return { purchaseId, tunnelIp, amountSats: payment?.amountSats, lease, clientConfig };
-}
-
-function newPurchaseId(): string {
-  return `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return result;
 }
 
 // --- NUT-18 payload handling ---

@@ -1,7 +1,4 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
-import { serialize } from './serialize.js';
 
 // --- Types ---
 
@@ -28,37 +25,13 @@ export interface PeerAllocator {
   allocateTunnelIp(purchaseId: string, clientPublicKey: string, taken?: Set<string>): string;
 }
 
-/** Args for an atomic allocate-and-record provisioning transaction. */
-export interface AllocateAndRecordArgs {
-  purchaseId: string;
-  clientPublicKey: string;
-  now: Date;
-  expiresAt: string;
-  /** Cumulative `wg` counter for this key at provision time; see PeerLease.capBaseline. */
-  capBaseline?: number;
-  /** Picks a tunnel IP given the set already in use; the ledger supplies `taken`. */
-  allocate: (taken: Set<string>) => string;
-}
-
+/**
+ * The lease view the WireGuard cleanup / data-cap / reconcile code reads. The
+ * unified state store (state.ts) implements it over its orders — leases are not a
+ * separate file. Leases are CREATED only through StateStore.provision (atomic with
+ * the order going ready), so there is no standalone allocate/record here.
+ */
 export interface PeerLedger {
-  record(lease: PeerLease): Promise<void>;
-  /**
-   * Atomically allocate a tunnel IP and record the lease in one serialized
-   * transaction, so concurrent provisions can't read the same free-IP snapshot
-   * and grab the same /32. Reads the currently-active IPs, calls `allocate` with
-   * them, expires any prior active lease for the same client key (a WireGuard peer
-   * is keyed by pubkey — one key, one active lease), records the new active lease,
-   * and returns it plus the ids of the prior leases it expired (so a failed
-   * provision can re-activate them — see reactivate).
-   */
-  allocateAndRecord(args: AllocateAndRecordArgs): Promise<{ lease: PeerLease; expiredPriorIds: string[] }>;
-  /**
-   * Restore leases to active. Used to roll back allocateAndRecord's prior-lease
-   * expiry when provisioning then fails: without this a failed renewal leaves the
-   * old peer live on the interface but its lease `expired`, so cleanup (which only
-   * reaps `active` leases) never removes it — an orphaned, free peer.
-   */
-  reactivate(purchaseIds: string[]): Promise<void>;
   list(now?: Date): Promise<PeerLease[]>;
   listExpiredActive(now: Date): Promise<PeerLease[]>;
   markExpired(purchaseId: string): Promise<void>;
@@ -90,171 +63,4 @@ export function createAllocator(): PeerAllocator {
       throw new Error(`tunnel subnet exhausted (${HOST_COUNT} active leases)`);
     }
   };
-}
-
-// --- In-memory ledger ---
-
-export function createMemoryLedger(initial: PeerLease[] = []): PeerLedger {
-  const records = [...initial];
-
-  // Active for allocation/collision purposes = status active AND not yet expired.
-  const isLive = (r: PeerLease, now: Date) =>
-    r.status === 'active' && new Date(r.expiresAt).getTime() > now.getTime();
-
-  return {
-    async record(lease) { records.push(lease); },
-
-    async allocateAndRecord({ purchaseId, clientPublicKey, now, expiresAt, capBaseline, allocate }) {
-      // No await before the push → atomic in single-threaded JS (memory ledger).
-      const taken = new Set(records.filter((r) => isLive(r, now)).map((r) => r.tunnelIp));
-      const tunnelIp = allocate(taken);
-      const expiredPriorIds: string[] = [];
-      for (let i = 0; i < records.length; i++) {
-        const r = records[i]!;
-        if (r.clientPublicKey === clientPublicKey && isLive(r, now)) {
-          records[i] = { ...r, status: 'expired' };
-          expiredPriorIds.push(r.purchaseId);
-        }
-      }
-      const lease: PeerLease = { purchaseId, clientPublicKey, tunnelIp, createdAt: now.toISOString(), expiresAt, status: 'active', capBaseline };
-      records.push(lease);
-      return { lease, expiredPriorIds };
-    },
-
-    async reactivate(purchaseIds) {
-      const ids = new Set(purchaseIds);
-      for (let i = 0; i < records.length; i++) {
-        const r = records[i]!;
-        if (ids.has(r.purchaseId)) records[i] = { ...r, status: 'active' };
-      }
-    },
-
-    async list(now = new Date()) {
-      return records.map((r) => ({
-        ...r,
-        status: new Date(r.expiresAt).getTime() <= now.getTime() ? 'expired' as const : r.status
-      }));
-    },
-
-    async listExpiredActive(now) {
-      return records
-        .filter((r) => r.status === 'active' && new Date(r.expiresAt).getTime() <= now.getTime())
-        .map((r) => ({ ...r }));
-    },
-
-    async markExpired(purchaseId) {
-      for (let i = 0; i < records.length; i++) {
-        if (records[i]?.purchaseId === purchaseId) {
-          records[i] = { ...records[i], status: 'expired' };
-        }
-      }
-    },
-
-    async pruneExpiredBefore(cutoff) {
-      const before = records.length;
-      const kept = records.filter((r) => new Date(r.expiresAt).getTime() > cutoff.getTime());
-      records.length = 0;
-      records.push(...kept);
-      return before - records.length;
-    }
-  };
-}
-
-// --- File-backed ledger ---
-
-export function createFileLedger(path: string): PeerLedger {
-  // Serialize every read-modify-write so concurrent provisions can't clobber each
-  // other's appends (last-writer-wins would silently drop a lease record).
-  const mutate = serialize();
-  const isLive = (r: PeerLease, now: Date) =>
-    r.status === 'active' && new Date(r.expiresAt).getTime() > now.getTime();
-  return {
-    record(lease) {
-      return mutate(async () => {
-        const records = await readLedgerFile(path);
-        records.push(lease);
-        await writeLedgerFile(path, records);
-      });
-    },
-
-    allocateAndRecord({ purchaseId, clientPublicKey, now, expiresAt, capBaseline, allocate }) {
-      return mutate(async () => {
-        const records = await readLedgerFile(path);
-        const taken = new Set(records.filter((r) => isLive(r, now)).map((r) => r.tunnelIp));
-        const tunnelIp = allocate(taken);
-        const expiredPriorIds: string[] = [];
-        const updated = records.map((r) => {
-          if (r.clientPublicKey === clientPublicKey && isLive(r, now)) {
-            expiredPriorIds.push(r.purchaseId);
-            return { ...r, status: 'expired' as const };
-          }
-          return r;
-        });
-        const lease: PeerLease = { purchaseId, clientPublicKey, tunnelIp, createdAt: now.toISOString(), expiresAt, status: 'active', capBaseline };
-        updated.push(lease);
-        await writeLedgerFile(path, updated);
-        return { lease, expiredPriorIds };
-      });
-    },
-
-    reactivate(purchaseIds) {
-      return mutate(async () => {
-        const ids = new Set(purchaseIds);
-        const records = await readLedgerFile(path);
-        await writeLedgerFile(path, records.map((r) => (ids.has(r.purchaseId) ? { ...r, status: 'active' as const } : r)));
-      });
-    },
-
-    async list(now = new Date()) {
-      return (await readLedgerFile(path)).map((r) => ({
-        ...r,
-        status: new Date(r.expiresAt).getTime() <= now.getTime() ? 'expired' as const : r.status
-      }));
-    },
-
-    async listExpiredActive(now) {
-      return (await readLedgerFile(path))
-        .filter((r) => r.status === 'active' && new Date(r.expiresAt).getTime() <= now.getTime())
-        .map((r) => ({ ...r }));
-    },
-
-    markExpired(purchaseId) {
-      return mutate(async () => {
-        const records = await readLedgerFile(path);
-        await writeLedgerFile(path, records.map((r) =>
-          r.purchaseId === purchaseId ? { ...r, status: 'expired' as const } : r
-        ));
-      });
-    },
-
-    pruneExpiredBefore(cutoff) {
-      return mutate(async () => {
-        const records = await readLedgerFile(path);
-        const kept = records.filter((r) => new Date(r.expiresAt).getTime() > cutoff.getTime());
-        if (kept.length !== records.length) await writeLedgerFile(path, kept);
-        return records.length - kept.length;
-      });
-    }
-  };
-}
-
-async function readLedgerFile(path: string): Promise<PeerLease[]> {
-  try {
-    const data = await readFile(path, 'utf8');
-    const parsed = JSON.parse(data);
-    if (!Array.isArray(parsed)) throw new Error('peer ledger must be a JSON array');
-    return parsed as PeerLease[];
-  } catch (e: unknown) {
-    if (e instanceof Error && 'code' in e && (e as NodeJS.ErrnoException).code === 'ENOENT') {
-      return [];
-    }
-    throw e;
-  }
-}
-
-async function writeLedgerFile(path: string, records: PeerLease[]): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  const tmp = `${path}.${process.pid}.tmp`;
-  await writeFile(tmp, JSON.stringify(records, null, 2) + '\n', 'utf8');
-  await rename(tmp, path);
 }

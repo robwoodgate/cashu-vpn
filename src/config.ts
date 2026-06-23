@@ -13,7 +13,6 @@ export interface Config {
    * to a public privacy-respecting resolver; override with WG_DNS.
    */
   dns: string[];
-  peerLedgerPath?: string;
   leaseDurationMs: number;
   /**
    * Per-lease cumulative data cap in bytes (rx + tx). Once a buyer reaches it the
@@ -42,7 +41,7 @@ export interface Config {
    * is derived per-request from the forwarded proto + host headers.
    */
   publicBaseUrl?: string;
-  /** Where the pending-order store persists (per-order delivery model). */
+  /** Where the unified order+lease state persists (ORDERS_PATH). */
   orderStorePath?: string;
   /** How long an unpaid order's PaymentRequest stays valid. */
   orderTtlMs: number;
@@ -140,7 +139,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     serverPublicKey: env.SERVER_PUBLIC_KEY ?? '',
     endpoint: env.WG_ENDPOINT ?? '',
     dns,
-    peerLedgerPath: env.PEER_LEDGER_PATH,
     leaseDurationMs: intEnv(env, 'LEASE_DURATION_MS', DEFAULT_LEASE_MS, 1),
     leaseDataCapBytes,
     cleanupIntervalMs,

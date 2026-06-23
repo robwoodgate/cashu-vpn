@@ -163,8 +163,7 @@ Everything is configured with environment variables.
 | `ORDER_TTL_MS` | `1800000` | how long an unpaid order stays valid, 30 minutes by default |
 | `PROOF_COUNT_MARGIN` | `4` | dust-payment guard, explained in [Under the hood](#under-the-hood) |
 | `PROOFS_PATH` | memory | file for the locked receipts you will sweep |
-| `PEER_LEDGER_PATH` | memory | file for the lease ledger |
-| `ORDERS_PATH` | memory | file for pending orders |
+| `ORDERS_PATH` | memory | file for orders and their leases (one atomic store) |
 | `LOCK_COUNTER_PATH` | memory | file for the xpub lock counter |
 
 Leave the file path settings unset to keep state in memory, which is handy for development but lost on restart.

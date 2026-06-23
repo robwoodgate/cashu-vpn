@@ -325,6 +325,41 @@ export async function enforceDataCaps(
   return { inspected: active.length, cleaned, skipped };
 }
 
+// --- Startup reconciliation ---
+
+/**
+ * Re-add every active lease's peer to the interface. Runtime peers are added with
+ * `wg set` and deliberately kept OUT of wg0.conf, so a host or wg-interface
+ * restart brings wg0 up without them — paid buyers silently dropped while their
+ * order still reads `ready` and lease `active`. Run once at startup (before
+ * serving) to restore them so cleanup keeps owning their lifecycle. Best-effort
+ * per lease: one bad peer doesn't block the rest.
+ */
+export async function reconcileActivePeers(
+  ledger: PeerLedger,
+  iface: string,
+  now = new Date(),
+  exec: typeof executePlan = executePlan,
+  wgLock: WgLock = runDirect
+): Promise<{ restored: number; failed: number }> {
+  const active = (await ledger.list(now)).filter((l) => l.status === 'active');
+  let restored = 0;
+  let failed = 0;
+  for (const lease of active) {
+    try {
+      // Under the shared wg lock so a periodic reconcile can't interleave with
+      // cleanup's `wg ... remove` on the same key (startup passes no lock — nothing
+      // else is mutating the interface yet).
+      await wgLock(() => exec(planAddPeer(iface, lease.clientPublicKey, lease.tunnelIp)));
+      restored++;
+    } catch (e) {
+      failed++;
+      console.error(`failed to restore peer ${lease.purchaseId} (${lease.tunnelIp}):`, e instanceof Error ? e.message : e);
+    }
+  }
+  return { restored, failed };
+}
+
 // --- Expired peer cleanup ---
 
 export async function cleanupExpiredPeers(
