@@ -164,7 +164,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
         leaseDuration: `${config.leaseDurationMs / 1000}s`,
         dataCapGb: config.leaseDataCapBytes > 0 ? config.leaseDataCapBytes / 1024 ** 3 : null,
         acceptedMints: config.acceptedMints,
-        lock: ctx.lockBook ? 'xpub-per-tx' : 'none',
         notice: config.notice,
         termsUrl: config.termsUrl,
         sourceUrl: REPO_URL || undefined,
