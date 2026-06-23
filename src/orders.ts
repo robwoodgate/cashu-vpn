@@ -32,7 +32,7 @@ export interface Order {
   clientPublicKey: string;
   /** P2PK pubkey the creqA demands proofs be locked to (operator key or xpub child). */
   lockPubkey: string;
-  /** xpub child index this order's lock was issued at (xpub mode); absent for fixed-pubkey mode. */
+  /** xpub child index this order's lock was issued at (recorded on the receipt for sweeping). */
   lockIndex?: number;
   createdAt: string;
   /** Pending orders past this are treated as gone. */

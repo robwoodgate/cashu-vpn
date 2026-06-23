@@ -77,7 +77,7 @@ export function renderEnvBlock(d: Discovery): string {
     `SERVER_PUBLIC_KEY=${d.serverPublicKey || '<wg show ' + d.interfaceName + ' public-key>'}`,
     `WG_ENDPOINT=${endpoint}`,
     '# Still required — set these yourself:',
-    'OPERATOR_PUBKEY=<your cashu P2PK pubkey; private key stays OFF this box>',
+    'OPERATOR_XPUB=<your account xpub; the xprv stays OFF this box> (run `npm run keygen`)',
     'ACCEPTED_MINTS=https://mint.minibits.cash/Bitcoin',
     'PRICE_SATS=250',
   ].join('\n');

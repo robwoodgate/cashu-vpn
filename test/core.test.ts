@@ -764,7 +764,7 @@ test('live xpub mode issues a fresh per-tx lock pubkey on each 402', async () =>
     SERVER_PUBLIC_KEY: VALID_WG_KEY,
     WG_ENDPOINT: '1.2.3.4:51820',
     ACCEPTED_MINTS: 'https://mint.example.com',
-  } satisfies NodeJS.ProcessEnv; // no OPERATOR_PUBKEY — lockBook provides the lock
+  } satisfies NodeJS.ProcessEnv; // this test supplies its own lockBook (overrides withServer's default)
   await withServer(async (url) => {
     const get402Lock = async () => {
       const res = await fetch(`${url}/purchase`, {

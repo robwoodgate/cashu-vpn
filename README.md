@@ -148,8 +148,7 @@ Everything is configured with environment variables.
 | `WG_INTERFACE` | `wg0` | the WireGuard interface to manage |
 | `SERVER_PUBLIC_KEY` | — | your server's WireGuard public key, included in the buyer's config |
 | `WG_ENDPOINT` | — | the `host:port` buyers connect to |
-| `OPERATOR_XPUB` | — | your BIP32 xpub, used to lock each sale to a fresh key (recommended) |
-| `OPERATOR_PUBKEY` | — | a single fixed lock key, used if you have no xpub; live mode needs one of these |
+| `OPERATOR_XPUB` | — | your BIP32 xpub; every sale is locked to a fresh derived key. Required in live mode (run `npm run keygen`) |
 | `ACCEPTED_MINTS` | minibits | comma-separated list of mint URLs you accept |
 | `PRICE_SATS` | `1000` | price per lease, roughly one US dollar a day at recent prices |
 | `MINT_UNIT` | `sat` | the Cashu unit |
@@ -193,7 +192,7 @@ The design is non-custodial by construction. The payment request demands proofs 
 
 Payments are verified entirely offline, with no swap and no per-sale call to the mint. When proofs arrive cashu-vpn checks, against a cached copy of the mint's public keys, that the mint genuinely signed them (NUT-12 DLEQ), that they are locked to your key, that the amount covers the price, that the mint is one you accept, and that they are not a replay. Because the buyer's wallet does the minting, your server never generates mint traffic of its own.
 
-Privacy comes from the xpub. With `OPERATOR_XPUB` set, every sale is locked to a fresh derived key, so the mint cannot tie your sales together, and you sweep them all with the matching offline key. A single fixed `OPERATOR_PUBKEY` also works but lets the mint correlate your income.
+Privacy comes from the xpub. With `OPERATOR_XPUB` set, every sale is locked to a fresh derived key, so the mint cannot tie your sales together, and you sweep them all with the matching offline key. The fresh-per-sale lock is also what makes each payment single-use: a token is bound to the one order it was issued for, so a spent token can't be replayed for another lease.
 
 A dust guard protects you from griefing. Someone could try to pay in hundreds of tiny proofs that would each cost you a fee to claim, so cashu-vpn rejects any payment with more proofs than a normal split needs, which is the number of set bits in the amount plus `PROOF_COUNT_MARGIN`. The rejected payment simply stays locked to you and useless to the sender.
 

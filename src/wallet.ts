@@ -23,7 +23,7 @@ export interface ReceivedPayment {
   secrets: string[];
   /** Normalized P2PK pubkey the proofs are locked to. */
   lockPubkey: string;
-  /** xpub child index this lock was derived at (xpub mode); absent for fixed-pubkey mode. */
+  /** xpub child index this lock was derived at (for the operator's sweep). Absent only on legacy/dry-run records. */
   index?: number;
   receivedAt: string;
 }
