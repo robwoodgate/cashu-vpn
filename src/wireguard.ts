@@ -261,10 +261,13 @@ async function removeStalePeer(
 
 /**
  * Pure selection: of the given active leases, which have reached `capBytes` of
- * cumulative usage (rx + tx)? Both directions count — buyer downloads (tx) and
- * uploads (rx) both leave the box on its public NIC, so both bill against the
- * host's egress allowance. Leases with no transfer entry (peer not on the
- * interface) are skipped. `capBytes <= 0` selects nothing (cap disabled).
+ * usage (rx + tx)? Both directions count — buyer downloads (tx) and uploads (rx)
+ * both leave the box on its public NIC, so both bill against the host's egress
+ * allowance. The raw `wg` counter is cumulative across the peer's life, so we
+ * subtract the lease's `capBaseline` (the counter when it was provisioned) — a
+ * same-key renewal that reuses the peer is then charged only for its own traffic.
+ * Leases with no transfer entry (peer not on the interface) are skipped.
+ * `capBytes <= 0` selects nothing (cap disabled).
  */
 export function leasesOverCap(
   active: PeerLease[],
@@ -274,7 +277,7 @@ export function leasesOverCap(
   if (!(capBytes > 0)) return [];
   return active.filter((lease) => {
     const usage = transfers.get(lease.clientPublicKey);
-    return usage !== undefined && usage.rx + usage.tx >= capBytes;
+    return usage !== undefined && usage.rx + usage.tx - (lease.capBaseline ?? 0) >= capBytes;
   });
 }
 

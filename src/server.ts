@@ -8,7 +8,7 @@ import type { ProofStore } from './wallet.js';
 import type { LockBook } from './locks.js';
 import { newOrderId, type Order, type OrderStore } from './orders.js';
 import { createRateLimiter, type RateLimiter } from './ratelimit.js';
-import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, enforceDataCaps, validatePublicKey, type WgLock } from './wireguard.js';
+import { generateClientConfig, planAddPeer, planRemovePeer, executePlan, cleanupExpiredPeers, enforceDataCaps, readPeerTransfers, validatePublicKey, type WgLock } from './wireguard.js';
 import { serialize } from './serialize.js';
 import { buildPaymentRequest, verifyPayment, normalizePubkey, type VerifyResult, type VerifyDeps } from './cashu.js';
 import { getEncodedToken, type Proof } from '@cashu/cashu-ts';
@@ -455,6 +455,17 @@ async function provisionPeer(
   const purchaseId = newPurchaseId();
   const now = new Date();
 
+  // Cap baseline: `wg` transfer counters are cumulative and only reset when a peer
+  // is removed and re-added. A same-key renewal reuses the peer, so snapshot its
+  // current counter now and charge this lease only for usage beyond it — else the
+  // renewal inherits the prior lease's usage and can be insta-capped. Fresh key →
+  // no peer → 0. (Read directly, not via the exec seam; live mode only.)
+  let capBaseline = 0;
+  if (config.mode === 'live' && config.leaseDataCapBytes > 0) {
+    const t = (await readPeerTransfers(config.wgInterface).catch(() => new Map())).get(clientPublicKey);
+    if (t) capBaseline = t.rx + t.tx;
+  }
+
   // Persist the operator-locked token BEFORE touching the ledger/WireGuard. The
   // buyer already minted these proofs to our lock, so if provisioning below fails
   // we must keep them (sweepable offline) rather than drop them and strand the
@@ -483,20 +494,18 @@ async function provisionPeer(
     clientPublicKey,
     now,
     expiresAt: new Date(now.getTime() + config.leaseDurationMs).toISOString(),
+    capBaseline,
     allocate: (taken) => allocator.allocateTunnelIp(purchaseId, clientPublicKey, taken),
   });
   const { tunnelIp } = lease;
 
   if (config.mode === 'live') {
     const exec = ctx.execPlan ?? executePlan;
-    // ponytail: planAddPeer is two commands (`wg set` then `ip route replace`) and
-    // they are not transactional — if the route step fails after `wg set` succeeds
-    // on a FRESH provision, the rollback below expires the lease but leaves a
-    // routeless (unusable) peer on the interface until restart/manual cleanup.
-    // Accepted residual risk (rare; harmless). Upgrade path if it ever bites:
-    // periodic reconciliation of `wg show` against the ledger.
-    // Under the shared wg lock so this `wg set` can't interleave with cleanup's
-    // `wg ... remove` on the same peer key (see Ctx.wgLock).
+    // planAddPeer is two commands (`wg set` then `ip route replace`) and they are
+    // not transactional — `wg set` can succeed before the route step fails. The
+    // rollback below undoes whichever case we're in. Under the shared wg lock so
+    // this `wg set` can't interleave with cleanup's `wg ... remove` on the same
+    // peer key (see Ctx.wgLock).
     await ctx.wgLock(async () => {
       try {
         await exec(planAddPeer(config.wgInterface, clientPublicKey, tunnelIp));
@@ -517,6 +526,11 @@ async function provisionPeer(
           for (const p of priors) {
             await exec(planAddPeer(config.wgInterface, p.clientPublicKey, p.tunnelIp)).catch(() => {});
           }
+        } else {
+          // Fresh provision: `wg set` may have added the peer before the route step
+          // failed. Best-effort remove it so a routeless peer isn't orphaned on the
+          // interface (no prior lease owns this key, so removal can't cut anyone).
+          await exec(planRemovePeer(config.wgInterface, clientPublicKey, tunnelIp)).catch(() => {});
         }
         throw e;
       }

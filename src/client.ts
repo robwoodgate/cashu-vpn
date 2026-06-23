@@ -17,7 +17,7 @@
 
 import { Wallet } from '@cashu/cashu-ts';
 import qrcode from 'qrcode-generator';
-import { decodeChallenge, waitForPaid, mintLockedPayload, type MintWallet, type Challenge } from './buyer.js';
+import { decodeChallenge, waitForPaid, mintLockedPayload, type MintWallet, type MintQuote, type Challenge } from './buyer.js';
 // Inlined as data-URIs by esbuild (--loader:.svg=dataurl). Centre-overlay marks for
 // the Cashu / Lightning QR tabs; the unified (BIP-321) tab shows none.
 import cashuIcon from './icons/cashu.svg';
@@ -35,6 +35,11 @@ interface OrderRec {
   pub: string;
   status: 'pending' | 'ready';
   creq?: string; // the payment request, kept so a pending order can be resumed after a reload
+  // The in-browser Lightning mint quote, persisted so a reload reuses it instead of
+  // minting a fresh invoice — which would orphan a paid-but-unminted quote (lost
+  // sats) and leave any already-shown invoice unwatched.
+  mintQuote?: string;
+  mintInvoice?: string;
   conf?: string;
   tunnelIp?: string;
   createdAt?: string;
@@ -222,7 +227,18 @@ async function armLightning(orderId: string, creq: string): Promise<void> {
     const wallet = new Wallet(challenge.mintUrl, { unit: challenge.unit });
     await wallet.loadMint();
     const w = wallet as unknown as MintWallet;
-    const quote = await w.createMintQuoteBolt11(challenge.amount);
+    // Reuse a persisted quote across reloads; only mint a fresh one for a new order.
+    // A reused quote that's already PAID is reclaimed below (mint the proofs we paid
+    // for) instead of stranded behind a brand-new invoice.
+    const rec = loadOrders().find((o) => o.id === orderId);
+    let quote: MintQuote;
+    if (rec?.mintQuote) {
+      const { state } = await w.checkMintQuoteBolt11(rec.mintQuote);
+      quote = { quote: rec.mintQuote, request: rec.mintInvoice, state };
+    } else {
+      quote = await w.createMintQuoteBolt11(challenge.amount);
+      upsertOrder({ id: orderId, mintQuote: quote.quote, mintInvoice: quote.request });
+    }
     const bolt11 = quote.request ?? '';
     if (currentOrderId !== orderId) return; // a newer order took over while we waited
     // BIP-321 unified URI carries both rails. bolt11 is uppercased (bech32, dense);
@@ -234,7 +250,10 @@ async function armLightning(orderId: string, creq: string): Promise<void> {
     payQr.lightning = 'LIGHTNING:' + ln; payCopy.lightning = bolt11;
     drawTab(payMode); // re-render the current tab now that the payloads exist
 
-    const paid = await waitForPaid(w, quote.quote, { intervalMs: 2000, tries: 150 });
+    // A reclaimed quote may already be paid — mint immediately rather than wait.
+    const paid = quote.state === 'PAID' || quote.state === 'ISSUED'
+      ? true
+      : await waitForPaid(w, quote.quote, { intervalMs: 2000, tries: 150 });
     if (!paid || currentOrderId !== orderId) return;
     setMsg('Minting & delivering…');
     const payload = await mintLockedPayload(w, challenge, quote);

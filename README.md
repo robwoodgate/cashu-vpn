@@ -171,7 +171,7 @@ Leave the file path settings unset to keep state in memory, which is handy for d
 
 ## The HTTP endpoints
 
-The buyer page is served at `/`, with its script at `/client.js`. `GET /health` and `GET /info` report status, price, and accepted mints. A buyer starts with `POST /purchase`, sending their WireGuard public key, and gets back a `402` response carrying an order id and a payment request. Their wallet then delivers the paid ecash to `POST /pay/:orderId`, and the browser watches `GET /order/:orderId` until the config is ready. An automated client can skip the back-and-forth by retrying `POST /purchase` with an `X-Cashu` header to pay and receive the config in one request.
+The buyer page is served at `/`, with its script at `/client.js`. `GET /health` and `GET /info` report status, price, and accepted mints. A buyer starts with `POST /purchase`, sending their WireGuard public key, and gets back a `402` response carrying an order id and a payment request. Their wallet then delivers the paid ecash to `POST /pay/:orderId`, and the browser watches `GET /order/:orderId` until the config is ready. An automated client can skip the poll by POSTing the paid NUT-18 payload straight to `POST /pay/:orderId`, which returns the config in the same response.
 
 There is deliberately no endpoint that lists everyone's leases. Each order is private to whoever holds its order id.
 

@@ -14,6 +14,13 @@ export interface PeerLease {
   createdAt: string;
   expiresAt: string;
   status: LeaseStatus;
+  /**
+   * The peer's cumulative `wg` transfer counter at the moment this lease was
+   * provisioned. Data-cap usage for this lease is (current counter − baseline),
+   * so a same-key renewal that reuses the peer doesn't inherit the prior lease's
+   * traffic. Absent/0 for fresh peers (counter starts at 0).
+   */
+  capBaseline?: number;
 }
 
 export interface PeerAllocator {
@@ -27,6 +34,8 @@ export interface AllocateAndRecordArgs {
   clientPublicKey: string;
   now: Date;
   expiresAt: string;
+  /** Cumulative `wg` counter for this key at provision time; see PeerLease.capBaseline. */
+  capBaseline?: number;
   /** Picks a tunnel IP given the set already in use; the ledger supplies `taken`. */
   allocate: (taken: Set<string>) => string;
 }
@@ -95,7 +104,7 @@ export function createMemoryLedger(initial: PeerLease[] = []): PeerLedger {
   return {
     async record(lease) { records.push(lease); },
 
-    async allocateAndRecord({ purchaseId, clientPublicKey, now, expiresAt, allocate }) {
+    async allocateAndRecord({ purchaseId, clientPublicKey, now, expiresAt, capBaseline, allocate }) {
       // No await before the push → atomic in single-threaded JS (memory ledger).
       const taken = new Set(records.filter((r) => isLive(r, now)).map((r) => r.tunnelIp));
       const tunnelIp = allocate(taken);
@@ -107,7 +116,7 @@ export function createMemoryLedger(initial: PeerLease[] = []): PeerLedger {
           expiredPriorIds.push(r.purchaseId);
         }
       }
-      const lease: PeerLease = { purchaseId, clientPublicKey, tunnelIp, createdAt: now.toISOString(), expiresAt, status: 'active' };
+      const lease: PeerLease = { purchaseId, clientPublicKey, tunnelIp, createdAt: now.toISOString(), expiresAt, status: 'active', capBaseline };
       records.push(lease);
       return { lease, expiredPriorIds };
     },
@@ -168,7 +177,7 @@ export function createFileLedger(path: string): PeerLedger {
       });
     },
 
-    allocateAndRecord({ purchaseId, clientPublicKey, now, expiresAt, allocate }) {
+    allocateAndRecord({ purchaseId, clientPublicKey, now, expiresAt, capBaseline, allocate }) {
       return mutate(async () => {
         const records = await readLedgerFile(path);
         const taken = new Set(records.filter((r) => isLive(r, now)).map((r) => r.tunnelIp));
@@ -181,7 +190,7 @@ export function createFileLedger(path: string): PeerLedger {
           }
           return r;
         });
-        const lease: PeerLease = { purchaseId, clientPublicKey, tunnelIp, createdAt: now.toISOString(), expiresAt, status: 'active' };
+        const lease: PeerLease = { purchaseId, clientPublicKey, tunnelIp, createdAt: now.toISOString(), expiresAt, status: 'active', capBaseline };
         updated.push(lease);
         await writeLedgerFile(path, updated);
         return { lease, expiredPriorIds };

@@ -335,6 +335,20 @@ test('leasesOverCap selects only leases at/over the cap (rx + tx)', () => {
   assert.deepEqual(leasesOverCap(active, transfers, 0), []);
 });
 
+test('leasesOverCap charges a renewal only for usage beyond its capBaseline', () => {
+  const renew: PeerLease = {
+    purchaseId: 'renew', clientPublicKey: 'kR', tunnelIp: '10.77.0.6',
+    createdAt: '2026-01-01T00:00:00Z', expiresAt: '2999-01-01T00:00:00Z', status: 'active',
+    capBaseline: 1800, // prior lease left the cumulative counter here
+  };
+  // Cumulative counter 2000 → 200 of new-lease usage, under the 1000 cap.
+  const transfers = new Map([['kR', { rx: 1500, tx: 500 }]]);
+  assert.deepEqual(leasesOverCap([renew], transfers, 1000), []);
+  // Once 1000 beyond the baseline is reached, it's over cap.
+  const transfers2 = new Map([['kR', { rx: 2000, tx: 800 }]]); // 2800 - 1800 = 1000
+  assert.deepEqual(leasesOverCap([renew], transfers2, 1000).map((l) => l.purchaseId), ['renew']);
+});
+
 // --- HTTP server ---
 
 test('GET /health returns ok', async () => {
