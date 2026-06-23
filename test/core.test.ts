@@ -942,6 +942,28 @@ test('waitForPaid times out if never paid', async () => {
   assert.equal(ok, false);
 });
 
+test('waitForPaid uses the WS subscription when available (no polling)', async () => {
+  let polled = false;
+  const wallet = {
+    on: { onceMintPaid: async () => ({ amount: 1000 }) }, // WS resolves PAID
+    checkMintQuoteBolt11: async () => { polled = true; return { state: 'UNPAID' }; },
+  };
+  const ok = await waitForPaid(wallet as never, 'q', { tries: 5, sleep: async () => {} });
+  assert.equal(ok, true);
+  assert.equal(polled, false, 'a working WS must not fall back to polling');
+});
+
+test('waitForPaid falls back to polling if the WS drops early', async () => {
+  let n = 0;
+  const wallet = {
+    on: { onceMintPaid: async () => { throw new Error('ws connection refused'); } }, // drops immediately
+    checkMintQuoteBolt11: async () => ({ state: n++ < 1 ? 'UNPAID' : 'PAID' }),
+  };
+  const ok = await waitForPaid(wallet as never, 'q', { tries: 5, sleep: async () => {} });
+  assert.equal(ok, true);
+  assert.ok(n >= 1, 'polling fallback ran after the early WS drop');
+});
+
 // --- Order store (per-order delivery) ---
 
 test('order store: create, poll, markReady once, and prune expired pending', async () => {

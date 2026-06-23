@@ -40,12 +40,22 @@ export interface MintWallet {
   createMintQuoteBolt11(amount: number): Promise<MintQuote>;
   checkMintQuoteBolt11(quote: string): Promise<{ state: string }>;
   getKeyset(): unknown;
+  /** NUT-17 WebSocket events (present on a real cashu-ts Wallet); used by waitForPaid. */
+  on?: { onceMintPaid(id: string, opts?: { signal?: AbortSignal; timeoutMs?: number }): Promise<unknown> };
   ops: {
     mintBolt11(amount: number, quote: MintQuote): { asCustom(outputs: unknown): { run(): Promise<Proof[]> } };
   };
 }
 
-/** Poll a mint quote until it is paid. Resolves true on PAID/ISSUED, false on timeout. */
+/**
+ * Wait until a mint quote is paid. Resolves true on PAID/ISSUED, false on timeout.
+ *
+ * Primary: a NUT-17 WebSocket subscription (wallet.on.onceMintPaid) — event-driven,
+ * so it's far lighter on the mint's rate limits than polling. If the WS isn't
+ * available, or drops EARLY (a connection failure rather than a genuine timeout),
+ * fall back to polling for whatever budget remains. The polling path is unchanged
+ * and is what the unit tests exercise (their fake wallet has no `on`).
+ */
 export async function waitForPaid(
   wallet: MintWallet,
   quoteId: string,
@@ -54,6 +64,32 @@ export async function waitForPaid(
   const tries = opts.tries ?? 90;
   const intervalMs = opts.intervalMs ?? 2000;
   const sleep = opts.sleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
+  const budgetMs = tries * intervalMs;
+
+  if (wallet.on?.onceMintPaid) {
+    const start = Date.now();
+    try {
+      await wallet.on.onceMintPaid(quoteId, { timeoutMs: budgetMs });
+      return true;
+    } catch {
+      // Burned most of the budget → it was a real timeout (not paid in time).
+      if (Date.now() - start >= budgetMs - intervalMs) return false;
+      // Dropped early → poll the remaining budget as a safety net.
+    }
+    const remainingTries = Math.ceil(Math.max(0, budgetMs - (Date.now() - start)) / intervalMs);
+    return pollPaid(wallet, quoteId, remainingTries, intervalMs, sleep);
+  }
+
+  return pollPaid(wallet, quoteId, tries, intervalMs, sleep);
+}
+
+async function pollPaid(
+  wallet: MintWallet,
+  quoteId: string,
+  tries: number,
+  intervalMs: number,
+  sleep: (ms: number) => Promise<void>,
+): Promise<boolean> {
   for (let i = 0; i < tries; i++) {
     const { state } = await wallet.checkMintQuoteBolt11(quoteId);
     if (state === 'PAID' || state === 'ISSUED') return true;
