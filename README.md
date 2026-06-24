@@ -159,6 +159,7 @@ Everything is configured with environment variables.
 | `CLEANUP_INTERVAL_MS` | `60000` | how often to remove expired peers and run retention; set `0` to disable |
 | `RETAIN_EXPIRED_MS` | `86400000` (1 day) | how long expired leases/orders are kept before they are forgotten; `0` keeps everything |
 | `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | `30` / `60000` | per-IP limit on `/purchase`; set max to 0 to disable |
+| `NOTIFY_WEBHOOK` | — | optional URL POSTed a one-line text body on each new sale; point it at an [ntfy](https://ntfy.sh) topic for a phone push. Best-effort and PII-free (order-id prefix + amount + expiry only) |
 | `PUBLIC_BASE_URL` | from request | your public URL, used to tell wallets where to deliver payment |
 | `ORDER_TTL_MS` | `1800000` | how long an unpaid order stays valid, 30 minutes by default |
 | `PROOF_COUNT_MARGIN` | `4` | dust-payment guard, explained in [Under the hood](#under-the-hood) |

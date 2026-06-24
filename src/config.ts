@@ -60,6 +60,11 @@ export interface Config {
   /** Max /purchase requests per IP per window (0 disables). */
   rateLimitMax: number;
   rateLimitWindowMs: number;
+  /**
+   * Optional operator webhook fired (best-effort, text body) on each new sale.
+   * Point it at an ntfy.sh topic for a phone push; unset disables notifications.
+   */
+  notifyWebhook?: string;
 }
 
 const DEFAULT_LEASE_MS = 24 * 60 * 60 * 1000; // 1 day — short leases get eaten by client setup time
@@ -157,5 +162,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     proofStorePath: env.PROOFS_PATH,
     rateLimitMax: intEnv(env, 'RATE_LIMIT_MAX', 30, 0),
     rateLimitWindowMs: intEnv(env, 'RATE_LIMIT_WINDOW_MS', 60000, 1),
+    notifyWebhook: env.NOTIFY_WEBHOOK || undefined,
   };
 }

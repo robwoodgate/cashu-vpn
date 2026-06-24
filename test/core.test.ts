@@ -35,6 +35,7 @@ import { decodeChallenge, waitForPaid } from '../src/buyer.js';
 import { createRateLimiter } from '../src/ratelimit.js';
 import type { ReceivedPayment } from '../src/wallet.js';
 import { createServer } from '../src/server.js';
+import { createNotifier } from '../src/notify.js';
 
 // --- Config ---
 
@@ -351,6 +352,42 @@ test('leasesOverCap charges a renewal only for usage beyond its capBaseline', ()
   assert.deepEqual(leasesOverCap([renew], transfers2, 1000).map((l) => l.purchaseId), ['renew']);
 });
 
+// --- Operator notifications ---
+
+test('loadConfig reads NOTIFY_WEBHOOK (empty → unset)', () => {
+  assert.equal(loadConfig({}).notifyWebhook, undefined);
+  assert.equal(loadConfig({ NOTIFY_WEBHOOK: '' }).notifyWebhook, undefined);
+  assert.equal(loadConfig({ NOTIFY_WEBHOOK: 'https://ntfy.sh/abc' }).notifyWebhook, 'https://ntfy.sh/abc');
+});
+
+test('createNotifier is a no-op without a webhook url', () => {
+  const calls: string[] = [];
+  const n = createNotifier(undefined, async (_u, b) => { calls.push(b); });
+  n.saleProvisioned({ orderId: 'abcdef0123456789', amountSats: 1500, expiresAt: '2999-01-01T00:00:00Z' });
+  assert.equal(calls.length, 0);
+});
+
+test('createNotifier posts a PII-free one-liner to the webhook', async () => {
+  const calls: Array<{ url: string; body: string }> = [];
+  let resolve!: () => void;
+  const done = new Promise<void>((r) => { resolve = r; });
+  const n = createNotifier('https://ntfy.sh/topic', async (url, body) => { calls.push({ url, body }); resolve(); });
+  n.saleProvisioned({ orderId: 'abcdef0123456789', amountSats: 1500, expiresAt: '2999-01-01T00:00:00Z' });
+  await done;
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://ntfy.sh/topic');
+  assert.match(calls[0].body, /cashu-vpn: new sale abcdef01 — 1500 sat, expires 2999-01-01/);
+  // Only the order-id PREFIX leaks, never the full id.
+  assert.doesNotMatch(calls[0].body, /abcdef0123456789/);
+});
+
+test('createNotifier swallows a failing webhook (never throws into the caller)', async () => {
+  const n = createNotifier('https://ntfy.sh/topic', async () => { throw new Error('boom'); });
+  // Must not reject or throw synchronously; the order path must be unaffected.
+  assert.doesNotThrow(() => n.saleProvisioned({ orderId: 'x', expiresAt: 'y' }));
+  await new Promise((r) => setTimeout(r, 10)); // let the detached rejection settle
+});
+
 // --- HTTP server ---
 
 test('GET /health returns ok', async () => {
@@ -390,6 +427,25 @@ test('POST /purchase dry-run creates lease without payment', async () => {
     assert.ok(body.clientConfig);
     assert.equal(body.lease.status, 'active');
   });
+});
+
+test('NOTIFY_WEBHOOK fires once on a new provision, wired through /purchase', async () => {
+  const calls: Array<{ url: string; body: string }> = [];
+  let resolve!: () => void;
+  const fired = new Promise<void>((r) => { resolve = r; });
+  const notifyPost = async (url: string, body: string) => { calls.push({ url, body }); resolve(); };
+  await withServer(async (url) => {
+    const res = await fetch(`${url}/purchase`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPublicKey: 'test-key-123' }),
+    });
+    assert.equal(res.status, 200);
+    await fired; // delivery is detached from the response, so wait for it
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'https://ntfy.sh/test-topic');
+    assert.match(calls[0].body, /cashu-vpn: new sale/);
+  }, { NOTIFY_WEBHOOK: 'https://ntfy.sh/test-topic' }, { notifyPost });
 });
 
 test('POST /purchase rejects missing clientPublicKey', async () => {

@@ -11,6 +11,7 @@ import { createRateLimiter, type RateLimiter } from './ratelimit.js';
 import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, enforceDataCaps, readPeerTransfers, reconcileActivePeers, validatePublicKey, type WgLock } from './wireguard.js';
 import { serialize } from './serialize.js';
 import { buildPaymentRequest, verifyPayment, normalizePubkey, type VerifyResult, type VerifyDeps } from './cashu.js';
+import { createNotifier, type Notifier, type WebhookPost } from './notify.js';
 import { getEncodedToken, type Proof } from '@cashu/cashu-ts';
 
 const MAX_BODY_BYTES = 16 * 1024;
@@ -47,6 +48,8 @@ export interface ServerDeps {
   execPlan?: typeof executePlan;
   /** Test seam: override the per-peer transfer reader (defaults to `wg show transfer`). */
   readTransfers?: typeof readPeerTransfers;
+  /** Test seam: override the notification POST (defaults to the real fetch path). */
+  notifyPost?: WebhookPost;
 }
 
 // Everything a request handler needs, assembled once in createServer.
@@ -66,6 +69,8 @@ interface Ctx extends ServerDeps {
    * cut by cleanup acting on a stale snapshot).
    */
   wgLock: WgLock;
+  /** Best-effort operator notification on each new sale (no-op unless NOTIFY_WEBHOOK is set). */
+  notifier: Notifier;
 }
 
 export function createServer(deps: ServerDeps): http.Server {
@@ -77,7 +82,8 @@ export function createServer(deps: ServerDeps): http.Server {
 
   // ponytail: one global wg lock; switch to per-pubkey locks only if provisioning
   // throughput ever makes a global serializer the bottleneck.
-  const ctx: Ctx = { ...deps, limiter, processing: new Set(), wgLock: serialize() };
+  const notifier = createNotifier(config.notifyWebhook, deps.notifyPost);
+  const ctx: Ctx = { ...deps, limiter, processing: new Set(), wgLock: serialize(), notifier };
 
   // Housekeeping interval: remove expired WireGuard peers, then forget records
   // whose lease expired more than retainExpiredMs ago. Pruning keeps the lease
@@ -572,6 +578,17 @@ async function runProvision(
     } catch (e) {
       console.error(`wg apply failed for ${result.order.purchaseId} (${tunnelIp}); reconcile will retry:`, e instanceof Error ? e.message : e);
     }
+  }
+
+  // Tell the operator about a genuinely new sale. alreadyReady filters out the
+  // idempotent re-deliveries (a wallet re-POSTing to a ready order), so a sale is
+  // announced exactly once; a same-key renewal mints a new lease and counts as one.
+  if (!result.alreadyReady && result.order.lease) {
+    ctx.notifier.saleProvisioned({
+      orderId: result.order.id,
+      amountSats: result.order.amountSats,
+      expiresAt: result.order.lease.expiresAt,
+    });
   }
   return result;
 }
