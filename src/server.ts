@@ -184,6 +184,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
           leaseDuration: `${t.durationMs / 1000}s`,
           dataCapGb: t.capBytes > 0 ? t.capBytes / 1024 ** 3 : null,
         })),
+        renewal: 'POST /purchase with the same clientPublicKey while its lease is live: keeps the tunnel IP, extends from the current expiry, resets the data cap',
         acceptedMints: config.acceptedMints,
         notice: config.notice,
         termsUrl: config.termsUrl,

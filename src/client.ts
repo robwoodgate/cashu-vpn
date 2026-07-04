@@ -359,11 +359,12 @@ async function startPurchase(keys?: { priv: string; pub: string; tier?: string }
   try {
     if (keys) {
       priv = keys.priv; pubKey = keys.pub;
+      setMsg('Renewing: extends your time and restarts your data allowance from today.');
     } else {
       setMsg('Generating keys…');
       await genKeys();
+      setMsg('Requesting access…');
     }
-    setMsg('Requesting access…');
     const r = await purchase(tier);
     if (r.status === 402) {
       const d = await r.json();
