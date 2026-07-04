@@ -359,7 +359,6 @@ async function startPurchase(keys?: { priv: string; pub: string; tier?: string }
   try {
     if (keys) {
       priv = keys.priv; pubKey = keys.pub;
-      setMsg('Renewing: extends your time and restarts your data allowance from today.');
     } else {
       setMsg('Generating keys…');
       await genKeys();
@@ -372,7 +371,9 @@ async function startPurchase(keys?: { priv: string; pub: string; tier?: string }
       const orderId = String(d.orderId ?? '');
       upsertOrder({ id: orderId, priv, pub: pubKey, status: 'pending', creq, tier: String(d.tier ?? tier ?? '') || undefined });
       openPayPanel(orderId, creq);
-      setMsg('Payment required — pay below.');
+      setMsg(keys
+        ? 'Renewal — pay below. It extends your time and restarts your data allowance from today.'
+        : 'Payment required — pay below.');
       renderAccess();
       void poll(orderId);
     } else if (r.ok) {
