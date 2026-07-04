@@ -739,7 +739,10 @@ function esc(s: string): string {
 // --- Marketplace page ---
 
 function renderPage(config: Config): string {
-  const price = `${config.priceSats} sats / ${config.leaseDurationMs / 3600000}h`;
+  const hours = config.leaseDurationMs / 3600000;
+  // ponytail: whole multiples of 24h read as days, anything else stays in hours
+  const duration = hours >= 24 && hours % 24 === 0 ? `${hours / 24}d` : `${hours}h`;
+  const price = `${config.priceSats} sats / ${duration}`;
   // Subheader carries the cap so it isn't just a duplicate of the Price fact.
   const capGb = config.leaseDataCapBytes > 0 ? config.leaseDataCapBytes / 1024 ** 3 : 0;
   const headline = capGb ? `${price} (${+capGb.toFixed(1)} GB max)` : price;
