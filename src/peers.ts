@@ -18,6 +18,8 @@ export interface PeerLease {
    * traffic. Absent/0 for fresh peers (counter starts at 0).
    */
   capBaseline?: number;
+  /** This lease's data cap in bytes (from its tier). Absent = the global default applies. */
+  capBytes?: number;
 }
 
 export interface PeerAllocator {

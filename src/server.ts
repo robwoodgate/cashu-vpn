@@ -2,7 +2,7 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import type { Config } from './config.js';
+import type { Config, Tier } from './config.js';
 import type { PeerAllocator, PeerLease } from './peers.js';
 import type { ProofStore } from './wallet.js';
 import type { LockBook } from './locks.js';
@@ -129,7 +129,7 @@ async function housekeep(ctx: Ctx): Promise<void> {
       console.error('peer reconcile failed:', e instanceof Error ? e.message : e);
     }
   }
-  if (config.leaseDataCapBytes > 0) {
+  if (config.tiers.some((t) => t.capBytes > 0)) {
     try {
       const capped = await enforceDataCaps(
         store, config.wgInterface, config.leaseDataCapBytes, config.mode === 'dry-run', new Date(), ctx.wgLock
@@ -169,6 +169,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
         unit: config.unit,
         leaseDuration: `${config.leaseDurationMs / 1000}s`,
         dataCapGb: config.leaseDataCapBytes > 0 ? config.leaseDataCapBytes / 1024 ** 3 : null,
+        // All purchasable plans; the scalar fields above describe tiers[0] (the
+        // default when POST /purchase names no tier).
+        tiers: config.tiers.map((t) => ({
+          name: t.name,
+          priceSats: t.priceSats,
+          leaseDuration: `${t.durationMs / 1000}s`,
+          dataCapGb: t.capBytes > 0 ? t.capBytes / 1024 ** 3 : null,
+        })),
         acceptedMints: config.acceptedMints,
         notice: config.notice,
         termsUrl: config.termsUrl,
@@ -245,15 +253,28 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     return json(res, 400, { error: 'missing_client_public_key' });
   }
 
+  // Which plan is being bought. Omitted = the first (default) tier; an unknown
+  // name is a client error, never silently the default.
+  const tierName = body.tier;
+  if (tierName !== undefined && typeof tierName !== 'string') {
+    return json(res, 400, { error: 'invalid_tier' });
+  }
+  const tier = tierName === undefined
+    ? config.tiers[0]!
+    : config.tiers.find((t) => t.name === tierName);
+  if (!tier) {
+    return json(res, 400, { error: 'unknown_tier', tiers: config.tiers.map((t) => t.name) });
+  }
+
   // Dry-run skips payment entirely: create an order and provision it immediately.
   if (config.mode !== 'live') {
     const orderId = newOrderId();
     const now = new Date();
     await ctx.store.createOrder({
-      id: orderId, status: 'pending', clientPublicKey, lockPubkey: '',
+      id: orderId, status: 'pending', clientPublicKey, lockPubkey: '', tier,
       createdAt: now.toISOString(), expiresAt: new Date(now.getTime() + config.orderTtlMs).toISOString(),
     });
-    const result = await runProvision(ctx, orderId, clientPublicKey, undefined, undefined);
+    const result = await runProvision(ctx, orderId, clientPublicKey, undefined, undefined, tier);
     return json(res, 200, { ...readyBundleOf(result!.order), mode: config.mode });
   }
 
@@ -300,6 +321,7 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     clientPublicKey,
     lockPubkey,
     lockIndex: lock.index,
+    tier,
     createdAt: now.toISOString(),
     expiresAt: new Date(now.getTime() + config.orderTtlMs).toISOString(),
   };
@@ -307,7 +329,7 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
 
   const creq = buildPaymentRequest({
     paymentId: orderId,
-    amountSats: config.priceSats,
+    amountSats: tier.priceSats,
     mints: config.acceptedMints,
     lockPubkey,
     unit: config.unit,
@@ -320,7 +342,8 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     error: 'payment_required',
     orderId,
     creq,
-    quotedSats: config.priceSats,
+    tier: tier.name,
+    quotedSats: tier.priceSats,
     unit: config.unit,
     acceptedMints: config.acceptedMints,
     hint: 'Pay the request; a NUT-18 wallet delivers automatically, then poll GET /order/:orderId.',
@@ -358,7 +381,7 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
     return json(res, 400, { error: 'invalid_payload', message: 'Expected a NUT-18 payload {mint,unit,proofs} or {token}' });
   }
 
-  const verified = await verifyAndAuthorize(ctx, encodedToken);
+  const verified = await verifyAndAuthorize(ctx, encodedToken, order.tier?.priceSats ?? ctx.config.priceSats);
   if ('error' in verified) {
     console.log(`[pay] order=${tag} rejected: ${verified.error}`);
     return json(res, 402, { error: 'payment_failed', detail: verified.error });
@@ -416,16 +439,17 @@ interface Authorized { payment: VerifyResult; lockIndex: number; }
 
 /**
  * Verify a delivered token offline (DLEQ + P2PK + amount + proof cap) and confirm
- * its lock is an xpub child we issued. Returns the verified payment plus that
- * child index (for sweeping), or `{error}`. Replay protection is NOT here — it's
- * the order binding: a token's lock maps to exactly one order, which provisions
- * at most once (see provisionOrder).
+ * its lock is an xpub child we issued. `requiredSats` is the ORDER's quoted
+ * price (tiers price per order, not globally). Returns the verified payment plus
+ * that child index (for sweeping), or `{error}`. Replay protection is NOT here —
+ * it's the order binding: a token's lock maps to exactly one order, which
+ * provisions at most once (see provisionOrder).
  */
-async function verifyAndAuthorize(ctx: Ctx, encodedToken: string): Promise<Authorized | { error: string }> {
+async function verifyAndAuthorize(ctx: Ctx, encodedToken: string, requiredSats: number): Promise<Authorized | { error: string }> {
   const { config } = ctx;
   const payment = await verifyPayment(encodedToken, {
     acceptedMints: config.acceptedMints,
-    requiredSats: config.priceSats,
+    requiredSats,
     unit: config.unit,
     proofCountMargin: config.proofCountMargin,
   }, ctx.verifyDeps);
@@ -471,7 +495,7 @@ async function provisionOrder(ctx: Ctx, orderId: string, verified: Authorized): 
 
     let result: { order: Order; alreadyReady: boolean } | undefined;
     try {
-      result = await runProvision(ctx, orderId, order.clientPublicKey, verified.payment, order.lockIndex);
+      result = await runProvision(ctx, orderId, order.clientPublicKey, verified.payment, order.lockIndex, order.tier);
     } catch (e) {
       // Subnet exhaustion: payment was verified and the receipt stored (sweepable,
       // store-first crash-safety), but we have no IP to hand out. Surface it as a
@@ -517,6 +541,7 @@ async function runProvision(
   clientPublicKey: string,
   payment: VerifyResult | undefined,
   lockIndex: number | undefined,
+  tier: Tier | undefined, // the order's quoted plan; undefined (pre-tier order) = config defaults
 ): Promise<{ order: Order; alreadyReady: boolean } | undefined> {
   const { config, store, proofStore, allocator } = ctx;
   const now = new Date();
@@ -543,14 +568,15 @@ async function runProvision(
     purchaseId,
     clientPublicKey,
     amountSats: payment?.amountSats,
-    leaseDurationMs: config.leaseDurationMs,
+    leaseDurationMs: tier?.durationMs ?? config.leaseDurationMs,
+    capBytes: tier?.capBytes,
     now,
     allocate: (taken) => allocator.allocateTunnelIp(purchaseId, clientPublicKey, taken),
     // Called by provision() only on a same-key renewal of a still-live lease (peer
     // present, so cleanup can't be removing it). A read failure aborts the commit —
     // the buyer retries — rather than baselining to 0 and insta-capping the renewal.
     readPeerCounter: async () => {
-      if (config.mode !== 'live' || !(config.leaseDataCapBytes > 0)) return 0;
+      if (config.mode !== 'live' || !config.tiers.some((t) => t.capBytes > 0)) return 0;
       const readTransfers = ctx.readTransfers ?? readPeerTransfers;
       const t = (await readTransfers(config.wgInterface)).get(clientPublicKey);
       return t ? t.rx + t.tx : 0;
@@ -738,14 +764,32 @@ function esc(s: string): string {
 
 // --- Marketplace page ---
 
-function renderPage(config: Config): string {
-  const hours = config.leaseDurationMs / 3600000;
-  // ponytail: whole multiples of 24h read as days, anything else stays in hours
+// "1500 sats / 30d" — whole multiples of 24h read as days, anything else stays in hours.
+function tierPrice(t: Tier): string {
+  const hours = t.durationMs / 3600000;
   const duration = hours >= 24 && hours % 24 === 0 ? `${hours / 24}d` : `${hours}h`;
-  const price = `${config.priceSats} sats / ${duration}`;
+  return `${t.priceSats} sats / ${duration}`;
+}
+
+function tierCap(t: Tier): string {
+  return t.capBytes > 0 ? `${+(t.capBytes / 1024 ** 3).toFixed(1)} GB max` : 'no data cap';
+}
+
+function renderPage(config: Config): string {
+  const tiers = config.tiers;
+  const multi = tiers.length > 1;
+  const price = tierPrice(tiers[0]!);
   // Subheader carries the cap so it isn't just a duplicate of the Price fact.
-  const capGb = config.leaseDataCapBytes > 0 ? config.leaseDataCapBytes / 1024 ** 3 : 0;
-  const headline = capGb ? `${price} (${+capGb.toFixed(1)} GB max)` : price;
+  const headline = multi
+    ? `Plans from ${Math.min(...tiers.map((t) => t.priceSats))} sats`
+    : `${price} (${tierCap(tiers[0]!)})`;
+  const priceFact = multi ? `from ${Math.min(...tiers.map((t) => t.priceSats))} sats` : price;
+  // The plan picker, shown only when there's a choice to make.
+  const picker = multi ? `
+    <div class="tiers">${tiers.map((t, i) => `
+      <label class="tier"><input type="radio" name="tier" value="${esc(t.name)}"${i === 0 ? ' checked' : ''}>
+        <span><strong>${esc(t.name)}</strong><br><small>${esc(tierPrice(t))}<br>${esc(tierCap(t))}</small></span></label>`).join('')}
+    </div>` : '';
   const isDryRun = config.mode === 'dry-run';
 
   return `<!doctype html>
@@ -801,6 +845,11 @@ function renderPage(config: Config): string {
     .notice { border-color: var(--accent); color: var(--text); white-space: pre-wrap; }
     code { background: #080b10; border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font-size: .85em; }
     .acc small.expired { color: var(--warn); }
+    .tiers { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    .tier { flex: 1; min-width: 130px; background: #17202b; border: 1px solid var(--line); border-radius: 8px; padding: 10px; cursor: pointer; color: var(--text); }
+    .tier:has(input:checked) { border-color: var(--accent); }
+    .tier input { margin: 0 6px 0 0; accent-color: var(--accent); }
+    .tier small { color: var(--muted); }
     @media (max-width: 600px) { .facts { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -812,7 +861,7 @@ function renderPage(config: Config): string {
   </div>
 
   <div class="facts">
-    <div class="fact"><span>Price</span><strong>${esc(price)}</strong></div>
+    <div class="fact"><span>Price</span><strong>${esc(priceFact)}</strong></div>
     <div class="fact"><span>Payment</span><strong>Cashu ecash</strong></div>
     <div class="fact"><span>Protocol</span><strong>WireGuard</strong></div>
   </div>
@@ -823,7 +872,7 @@ ${config.notice ? `
     <h2>Get connected</h2>
     ${isDryRun
       ? '<p>Dry-run mode: no payment required, no real WireGuard peer created. A keypair is still generated in your browser.</p>'
-      : '<p>Pay privately in Bitcoin using Cashu ecash. Your WireGuard keypair is generated in your browser. The private key never leaves this page.</p>'}
+      : '<p>Pay privately in Bitcoin using Cashu ecash. Your WireGuard keypair is generated in your browser. The private key never leaves this page.</p>'}${picker}
     <div class="row" style="margin-top:10px">
       <button id="buy" type="button">Get VPN config</button>
       <button type="button" id="dl" disabled class="ghost">Download .conf</button>

@@ -95,6 +95,28 @@ test('LEASE_DATA_CAP_GB defaults to 50 GiB; 0 disables; invalid rejected', () =>
   assert.throws(() => loadConfig({ LEASE_DATA_CAP_GB: 'lots' }), /non-negative number/);
 });
 
+test('TIERS parses plans, mirrors tiers[0] into the scalars, and rejects junk', () => {
+  const two = '[{"name":"1w","sats":500,"durationMs":604800000,"gb":15},{"name":"30d","sats":1500,"durationMs":2592000000,"gb":50}]';
+  const c = loadConfig({ TIERS: two, PRICE_SATS: '999' });
+  assert.equal(c.tiers.length, 2);
+  assert.deepEqual(c.tiers[0], { name: '1w', priceSats: 500, durationMs: 604800000, capBytes: 15 * 1024 ** 3 });
+  // TIERS overrides the scalar vars; the scalars mirror the default (first) tier.
+  assert.equal(c.priceSats, 500);
+  assert.equal(c.leaseDurationMs, 604800000);
+  assert.equal(c.leaseDataCapBytes, 15 * 1024 ** 3);
+  // No TIERS → one tier built from the scalars.
+  const single = loadConfig({ PRICE_SATS: '750', LEASE_DURATION_MS: '3600000', LEASE_DATA_CAP_GB: '0' });
+  assert.deepEqual(single.tiers, [{ name: 'standard', priceSats: 750, durationMs: 3600000, capBytes: 0 }]);
+  // A mispriced or malformed TIERS must fail at startup, not at /pay time.
+  assert.throws(() => loadConfig({ TIERS: 'not json' }), /valid JSON/);
+  assert.throws(() => loadConfig({ TIERS: '[]' }), /non-empty/);
+  assert.throws(() => loadConfig({ TIERS: '[{"name":"a","sats":0,"durationMs":1}]' }), /sats/);
+  assert.throws(() => loadConfig({ TIERS: '[{"name":"a","sats":1,"durationMs":0}]' }), /durationMs/);
+  assert.throws(() => loadConfig({ TIERS: '[{"name":"","sats":1,"durationMs":1}]' }), /name/);
+  assert.throws(() => loadConfig({ TIERS: '[{"name":"a","sats":1,"durationMs":1},{"name":"a","sats":2,"durationMs":2}]' }), /unique/);
+  assert.throws(() => loadConfig({ TIERS: '[{"name":"a","sats":1,"durationMs":1,"gb":-1}]' }), /gb/);
+});
+
 test('loadConfig rejects non-numeric price/lease/ttl/port (no silent NaN)', () => {
   // A NaN priceSats would make `amount < requiredSats` always false → accept any
   // payment; a NaN duration throws later on new Date(NaN).toISOString().
@@ -812,6 +834,80 @@ test('live POST /purchase lets a same-key renewal through even when the subnet i
   }, LIVE_ENV, { store: occupied, allocator: { capacity: 1, allocateTunnelIp: () => '10.77.0.2' } });
 });
 
+test('POST /purchase quotes the named tier and rejects unknown ones', async () => {
+  const TIERS = '[{"name":"1w","sats":500,"durationMs":604800000,"gb":15},{"name":"30d","sats":1500,"durationMs":2592000000,"gb":50}]';
+  await withServer(async (url) => {
+    // Named tier: quoted at ITS price, not the default's.
+    const r = await fetch(`${url}/purchase`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, tier: '30d' }),
+    });
+    assert.equal(r.status, 402);
+    const body = await r.json();
+    assert.equal(body.quotedSats, 1500);
+    assert.equal(body.tier, '30d');
+    // Omitted tier: the first tier is the default.
+    const r2 = await fetch(`${url}/purchase`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+    });
+    assert.equal((await r2.json()).quotedSats, 500);
+    // Unknown tier: a client error, never silently the default price.
+    const r3 = await fetch(`${url}/purchase`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, tier: 'lifetime' }),
+    });
+    assert.equal(r3.status, 400);
+    assert.equal((await r3.json()).error, 'unknown_tier');
+  }, { ...LIVE_ENV, TIERS });
+});
+
+test('dry-run /purchase provisions with the tier duration and cap', async () => {
+  const TIERS = '[{"name":"1w","sats":500,"durationMs":604800000,"gb":15},{"name":"30d","sats":1500,"durationMs":2592000000,"gb":50}]';
+  await withServer(async (url) => {
+    const before = Date.now();
+    const r = await fetch(`${url}/purchase`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPublicKey: 'k1', tier: '30d' }),
+    });
+    assert.equal(r.status, 200);
+    const d = await r.json();
+    assert.equal(d.lease.capBytes, 50 * 1024 ** 3, 'lease carries its tier cap');
+    const got = new Date(d.lease.expiresAt).getTime() - before;
+    assert.ok(Math.abs(got - 2592000000) < 60_000, `lease runs the tier duration (got ${got}ms)`);
+  }, { TIERS });
+});
+
+test('/info lists tiers alongside the default-plan scalars', async () => {
+  const TIERS = '[{"name":"1w","sats":500,"durationMs":604800000,"gb":15},{"name":"30d","sats":1500,"durationMs":2592000000}]';
+  await withServer(async (url) => {
+    const d = await (await fetch(`${url}/info`)).json();
+    assert.equal(d.priceSats, 500); // scalars mirror the default tier
+    assert.deepEqual(d.tiers, [
+      { name: '1w', priceSats: 500, leaseDuration: '604800s', dataCapGb: 15 },
+      { name: '30d', priceSats: 1500, leaseDuration: '2592000s', dataCapGb: null },
+    ]);
+  }, { TIERS });
+});
+
+test('leasesOverCap honours a per-lease cap over the default', () => {
+  const mk = (purchaseId: string, capBytes?: number): PeerLease => ({
+    purchaseId, clientPublicKey: `K-${purchaseId}`, tunnelIp: '10.77.0.9',
+    createdAt: '2026-01-01T00:00:00Z', expiresAt: '2026-12-31T00:00:00Z', status: 'active',
+    ...(capBytes !== undefined ? { capBytes } : {}),
+  });
+  const transfers = new Map([
+    ['K-small', { rx: 600, tx: 500 }],   // 1100 used, own cap 1000 → over
+    ['K-big', { rx: 600, tx: 500 }],     // 1100 used, own cap 5000 → under
+    ['K-legacy', { rx: 600, tx: 500 }],  // no own cap → default 2000 → under
+    ['K-uncapped', { rx: 9e9, tx: 9e9 }] // own cap 0 = uncapped, default ignored
+  ]);
+  const over = leasesOverCap(
+    [mk('small', 1000), mk('big', 5000), mk('legacy'), mk('uncapped', 0)], transfers, 2000
+  );
+  assert.deepEqual(over.map((l) => l.purchaseId), ['small']);
+});
+
 test('order lifecycle: pending order, poll, CORS preflight, and /pay validation', async () => {
   await withServer(async (url) => {
     const r = await fetch(`${url}/purchase`, {
@@ -1483,6 +1579,11 @@ test('provision renews a same-key lease in place: keeps the IP, expires the prio
   assert.equal(active.length, 1, 'one key, one active lease');
   assert.equal(active[0]!.purchaseId, b!.order.purchaseId, 'the newest lease wins');
   assert.equal((await store.list()).length, 2, 'the prior lease is expired, not deleted');
+  // Early renewal tops up: the new expiry starts where the prior lease ended,
+  // so the remaining time isn't forfeited.
+  const priorExpiry = new Date(a!.order.lease!.expiresAt).getTime();
+  const renewedExpiry = new Date(b!.order.lease!.expiresAt).getTime();
+  assert.equal(renewedExpiry, priorExpiry + 60_000, 'renewal extends from the prior expiry, not from now');
 });
 
 test('cleanup skips removing a peer whose key a concurrent re-buy now owns', async () => {

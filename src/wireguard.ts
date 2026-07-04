@@ -267,24 +267,26 @@ async function removeStalePeer(
  * subtract the lease's `capBaseline` (the counter when it was provisioned) — a
  * same-key renewal that reuses the peer is then charged only for its own traffic.
  * Leases with no transfer entry (peer not on the interface) are skipped.
- * `capBytes <= 0` selects nothing (cap disabled).
+ * A lease's own `capBytes` (its tier) wins; the `capBytes` argument covers
+ * leases without one. An effective cap <= 0 selects nothing (uncapped).
  */
 export function leasesOverCap(
   active: PeerLease[],
   transfers: Map<string, PeerTransfer>,
   capBytes: number
 ): PeerLease[] {
-  if (!(capBytes > 0)) return [];
   return active.filter((lease) => {
+    const cap = lease.capBytes ?? capBytes;
+    if (!(cap > 0)) return false;
     const usage = transfers.get(lease.clientPublicKey);
-    return usage !== undefined && usage.rx + usage.tx - (lease.capBaseline ?? 0) >= capBytes;
+    return usage !== undefined && usage.rx + usage.tx - (lease.capBaseline ?? 0) >= cap;
   });
 }
 
 /**
- * Disconnect any active lease whose cumulative usage has reached `capBytes`.
- * Mirrors expiry: the peer is removed from the interface and the lease marked
- * expired. `capBytes <= 0` disables the cap (no-op).
+ * Disconnect any active lease whose cumulative usage has reached its cap
+ * (the lease's own `capBytes`, falling back to the argument). Mirrors expiry:
+ * the peer is removed from the interface and the lease marked expired.
  */
 export async function enforceDataCaps(
   ledger: PeerLedger,
@@ -295,8 +297,6 @@ export async function enforceDataCaps(
   wgLock: WgLock = runDirect,
   exec: typeof executePlan = executePlan
 ): Promise<CleanupResult> {
-  if (!(capBytes > 0)) return { inspected: 0, cleaned: [], skipped: [] };
-
   const active = (await ledger.list(now)).filter((l) => l.status === 'active');
   if (active.length === 0) return { inspected: 0, cleaned: [], skipped: [] };
 

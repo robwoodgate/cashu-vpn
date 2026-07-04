@@ -48,6 +48,8 @@ interface OrderRec {
   tunnelIp?: string;
   createdAt?: string;
   expiresAt?: string;
+  /** Plan this order was bought at, so Renew re-buys the same one. */
+  tier?: string;
 }
 
 // How long "Your access" keeps entries before pruning them on load.
@@ -318,30 +320,45 @@ function resumeOrder(id: string): void {
   void poll(id);
 }
 
-async function purchase(): Promise<Response> {
+async function purchase(tier?: string): Promise<Response> {
   return fetch('/purchase', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ clientPublicKey: pubKey }),
+    body: JSON.stringify(tier ? { clientPublicKey: pubKey, tier } : { clientPublicKey: pubKey }),
   });
+}
+
+// The plan picked on the page (absent when the operator offers a single tier).
+function selectedTier(): string | undefined {
+  const checked = document.querySelector('input[name="tier"]:checked') as HTMLInputElement | null;
+  return checked?.value || undefined;
 }
 
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-btn('buy').onclick = async () => {
+// One purchase flow for both paths: a fresh buy generates a keypair; a renewal
+// reuses the lease's stored keys, so the server extends the same slot/IP and the
+// already-imported config keeps working.
+async function startPurchase(keys?: { priv: string; pub: string; tier?: string }): Promise<void> {
   btn('buy').disabled = true;
+  // A renewal re-buys its own plan; a fresh buy uses the page's picker.
+  const tier = keys ? keys.tier : selectedTier();
   try {
-    setMsg('Generating keys…');
-    await genKeys();
+    if (keys) {
+      priv = keys.priv; pubKey = keys.pub;
+    } else {
+      setMsg('Generating keys…');
+      await genKeys();
+    }
     setMsg('Requesting access…');
-    const r = await purchase();
+    const r = await purchase(tier);
     if (r.status === 402) {
       const d = await r.json();
       const creq = r.headers.get('x-cashu') ?? d.creq ?? '';
       const orderId = String(d.orderId ?? '');
-      upsertOrder({ id: orderId, priv, pub: pubKey, status: 'pending', creq });
+      upsertOrder({ id: orderId, priv, pub: pubKey, status: 'pending', creq, tier: String(d.tier ?? tier ?? '') || undefined });
       openPayPanel(orderId, creq);
       setMsg('Payment required — pay below.');
       renderAccess();
@@ -351,7 +368,7 @@ btn('buy').onclick = async () => {
       const d = await r.json();
       const conf = injectPriv(String(d.clientConfig ?? ''), priv);
       const id = String(d.purchaseId ?? 'dry-run');
-      upsertOrder({ id, priv, pub: pubKey, status: 'ready', conf, tunnelIp: d.tunnelIp, expiresAt: d.lease?.expiresAt });
+      upsertOrder({ id, priv, pub: pubKey, status: 'ready', conf, tunnelIp: d.tunnelIp, expiresAt: d.lease?.expiresAt, tier });
       showConfig(conf, id, d.tunnelIp, d.lease?.expiresAt);
       renderAccess();
     } else {
@@ -362,7 +379,9 @@ btn('buy').onclick = async () => {
     setMsg(errText(e), 'err');
   }
   btn('buy').disabled = false;
-};
+}
+
+btn('buy').onclick = () => void startPurchase();
 
 // Tab switching + a single copy button for the active tab.
 document.querySelectorAll('[data-tab]').forEach((b) => {
@@ -377,6 +396,8 @@ function applyReady(id: string, d: { clientConfig?: string; tunnelIp?: string; l
   const conf = injectPriv(String(d.clientConfig ?? ''), rec?.priv ?? '');
   // Delivery confirmed — drop the persisted proofs; they've been redeemed.
   upsertOrder({ id, status: 'ready', conf, tunnelIp: d.tunnelIp, expiresAt: d.lease?.expiresAt, payload: undefined });
+  // A renewal supersedes the prior lease for the same key — keep only the newest.
+  if (rec?.pub) saveOrders(loadOrders().filter((o) => !(o.id !== id && o.pub === rec.pub && o.status === 'ready')));
   if (id === currentOrderId) showConfig(conf, id, d.tunnelIp, d.lease?.expiresAt);
   renderAccess();
 }
@@ -432,7 +453,8 @@ function renderAccess(): void {
       action = '<button class="buyagain" type="button">Buy again</button>';
     } else {
       status = '<small>active' + (when ? ' until ' + esc(when.toLocaleString()) : '') + '</small>';
-      action = '<button class="ghost dlacc" data-id="' + esc(o.id) + '" type="button">Download</button>';
+      action = '<span style="display:flex;gap:8px"><button class="renewacc" data-id="' + esc(o.id) + '" type="button">Renew</button>'
+        + '<button class="ghost dlacc" data-id="' + esc(o.id) + '" type="button">Download</button></span>';
     }
     return '<div class="acc"><span><strong>' + label + '</strong> &middot; ' + status + '</span>' + action + '</div>';
   }).join('');
@@ -446,6 +468,16 @@ function renderAccess(): void {
   // "Pay" reopens a still-pending order so it can be paid after a reload.
   el.querySelectorAll('.payacc').forEach((b) => {
     b.addEventListener('click', () => resumeOrder((b as HTMLElement).dataset.id ?? ''));
+  });
+  // "Renew" re-purchases with the lease's own key: the server extends the same
+  // slot/IP, so the config already on the buyer's device keeps working.
+  el.querySelectorAll('.renewacc').forEach((b) => {
+    b.addEventListener('click', () => {
+      const rec = loadOrders().find((o) => o.id === (b as HTMLElement).dataset.id);
+      if (!rec?.priv || !rec.pub) return;
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      void startPurchase({ priv: rec.priv, pub: rec.pub, tier: rec.tier });
+    });
   });
   // "Buy again" starts a brand-new purchase (fresh key + lease), not a renewal.
   el.querySelectorAll('.buyagain').forEach((b) => {

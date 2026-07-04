@@ -24,6 +24,7 @@
 import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import type { Tier } from './config.js';
 import type { PeerLease, PeerLedger } from './peers.js';
 
 export type OrderStatus = 'pending' | 'ready';
@@ -41,6 +42,12 @@ export interface Order {
   createdAt: string;
   /** Pending orders past this are treated as gone. */
   expiresAt: string;
+  /**
+   * Snapshot of the plan quoted at order creation — payment verification and
+   * provisioning read THIS, not live config, so a config change can't reprice
+   * an open order. Absent on pre-tier orders (fall back to config).
+   */
+  tier?: Tier;
   // --- populated when status === 'ready' ---
   purchaseId?: string;
   tunnelIp?: string;
@@ -58,6 +65,8 @@ export interface ProvisionArgs {
   clientPublicKey: string;
   amountSats?: number;
   leaseDurationMs: number;
+  /** Per-lease data cap written onto the lease; 0/absent = the global default applies. */
+  capBytes?: number;
   now: Date;
   /** Allocate a fresh tunnel IP avoiding `taken` (fresh provision only). */
   allocate: (taken: Set<string>) => string;
@@ -161,7 +170,7 @@ function makeStore(records: Map<string, Order>, persist: (recs: Order[]) => Prom
         if (!order) return undefined;
         if (order.status === 'ready') return { order: { ...order }, alreadyReady: true };
 
-        const { purchaseId, clientPublicKey, amountSats, leaseDurationMs, now, allocate, readPeerCounter, renderConfig } = args;
+        const { purchaseId, clientPublicKey, amountSats, leaseDurationMs, capBytes, now, allocate, readPeerCounter, renderConfig } = args;
 
         // Renewal = a still-live lease for the same WireGuard key (necessarily on
         // another order). Reuse its IP and rebase the data cap; expire it here. A
@@ -173,9 +182,13 @@ function makeStore(records: Map<string, Order>, persist: (recs: Order[]) => Prom
 
         let tunnelIp: string;
         let capBaseline: number;
+        // A renewal's clock starts where the prior lease ends: paying early tops
+        // up remaining time instead of forfeiting it.
+        let expiryBase = now.getTime();
         if (priors.length > 0) {
           tunnelIp = priors[0]!.lease!.tunnelIp;
           capBaseline = await readPeerCounter();
+          expiryBase = Math.max(expiryBase, ...priors.map((p) => new Date(p.lease!.expiresAt).getTime()));
           for (const p of priors) records.set(p.id, { ...p, lease: { ...p.lease!, status: 'expired' } });
         } else {
           const taken = new Set(
@@ -190,9 +203,10 @@ function makeStore(records: Map<string, Order>, persist: (recs: Order[]) => Prom
           clientPublicKey,
           tunnelIp,
           createdAt: now.toISOString(),
-          expiresAt: new Date(now.getTime() + leaseDurationMs).toISOString(),
+          expiresAt: new Date(expiryBase + leaseDurationMs).toISOString(),
           status: 'active',
           capBaseline,
+          ...(capBytes !== undefined ? { capBytes } : {}),
         };
         const ready: Order = {
           ...order,

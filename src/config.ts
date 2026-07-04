@@ -1,3 +1,11 @@
+/** One purchasable plan. `capBytes` 0 = uncapped. */
+export interface Tier {
+  name: string;
+  priceSats: number;
+  durationMs: number;
+  capBytes: number;
+}
+
 export interface Config {
   mode: 'dry-run' | 'live';
   host: string;
@@ -29,6 +37,13 @@ export interface Config {
    */
   retainExpiredMs: number;
   acceptedMints: string[];
+  /**
+   * Purchasable plans, at least one. From the TIERS env var (JSON) when set,
+   * else a single tier built from PRICE_SATS / LEASE_DURATION_MS /
+   * LEASE_DATA_CAP_GB. priceSats/leaseDurationMs/leaseDataCapBytes always
+   * mirror tiers[0] (the default plan).
+   */
+  tiers: Tier[];
   priceSats: number;
   unit: string;
   /** Optional operator notice (MOTD) shown on the buyer page and in /info. */
@@ -136,6 +151,36 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ? env.ACCEPTED_MINTS.split(',').map((m) => m.trim()).filter(Boolean)
     : ['https://mint.minibits.cash/Bitcoin'];
 
+  // Purchasable plans. TIERS is a JSON array of {name, sats, durationMs, gb};
+  // when unset, the scalar env vars define a single tier. Validated like the
+  // scalars: a malformed value throws at startup rather than mispricing later.
+  let tiers: Tier[];
+  if (env.TIERS !== undefined && env.TIERS !== '') {
+    let raw: unknown;
+    try { raw = JSON.parse(env.TIERS); } catch { throw new Error('TIERS must be valid JSON'); }
+    if (!Array.isArray(raw) || raw.length === 0) throw new Error('TIERS must be a non-empty JSON array');
+    const seen = new Set<string>();
+    tiers = raw.map((t: Record<string, unknown>, i) => {
+      const name = typeof t?.name === 'string' ? t.name.trim() : '';
+      if (!name || seen.has(name)) throw new Error(`TIERS[${i}]: name must be a unique non-empty string`);
+      seen.add(name);
+      const sats = Number(t.sats);
+      const durationMs = Number(t.durationMs);
+      const gb = t.gb === undefined ? 0 : Number(t.gb);
+      if (!Number.isInteger(sats) || sats < 1) throw new Error(`TIERS[${i}]: sats must be an integer >= 1`);
+      if (!Number.isInteger(durationMs) || durationMs < 1) throw new Error(`TIERS[${i}]: durationMs must be an integer >= 1`);
+      if (!Number.isFinite(gb) || gb < 0) throw new Error(`TIERS[${i}]: gb must be a non-negative number (0 = uncapped)`);
+      return { name, priceSats: sats, durationMs, capBytes: Math.round(gb * 1024 ** 3) };
+    });
+  } else {
+    tiers = [{
+      name: 'standard',
+      priceSats: intEnv(env, 'PRICE_SATS', DEFAULT_PRICE_SATS, 1),
+      durationMs: intEnv(env, 'LEASE_DURATION_MS', DEFAULT_LEASE_MS, 1),
+      capBytes: leaseDataCapBytes,
+    }];
+  }
+
   return {
     mode,
     host: env.HOST ?? '127.0.0.1',
@@ -144,12 +189,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     serverPublicKey: env.SERVER_PUBLIC_KEY ?? '',
     endpoint: env.WG_ENDPOINT ?? '',
     dns,
-    leaseDurationMs: intEnv(env, 'LEASE_DURATION_MS', DEFAULT_LEASE_MS, 1),
-    leaseDataCapBytes,
+    leaseDurationMs: tiers[0]!.durationMs,
+    leaseDataCapBytes: tiers[0]!.capBytes,
     cleanupIntervalMs,
     retainExpiredMs,
     acceptedMints,
-    priceSats: intEnv(env, 'PRICE_SATS', DEFAULT_PRICE_SATS, 1),
+    tiers,
+    priceSats: tiers[0]!.priceSats,
     unit: env.MINT_UNIT ?? 'sat',
     notice: env.NOTICE || undefined,
     termsUrl: env.TERMS_URL || undefined,
