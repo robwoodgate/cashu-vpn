@@ -23,4 +23,14 @@ else
   echo "→ no systemd 'cashu-vpn' service found; restart it however you run it"
 fi
 
+# The allocator hands out IPs across 10.77.0.0/16; a wg0 still configured /24
+# (older installs, some provider WireGuard images) NATs only the first 253
+# leases and silently blackholes the rest.
+WG_CONF="/etc/wireguard/${WG_INTERFACE:-wg0}.conf"
+if [ -f "$WG_CONF" ] && grep -q '10\.77\.0\.1/24' "$WG_CONF"; then
+  echo "⚠ $WG_CONF still uses 10.77.0.1/24 — widen it (and any /24 MASQUERADE rule) to /16:"
+  echo "    Address = 10.77.0.1/16"
+  echo "    iptables -t nat -A POSTROUTING -s 10.77.0.0/16 -o <public-iface> -j MASQUERADE"
+fi
+
 echo "✓ updated to $(git rev-parse --short HEAD)"
