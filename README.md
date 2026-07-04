@@ -48,7 +48,7 @@ wg genkey | tee /etc/wireguard/server.key | wg pubkey > /etc/wireguard/server.pu
 # Write a minimal interface config
 cat > /etc/wireguard/wg0.conf <<EOF
 [Interface]
-Address = 10.77.0.1/24
+Address = 10.77.0.1/16
 ListenPort = 51820
 PrivateKey = $(cat /etc/wireguard/server.key)
 EOF
@@ -62,7 +62,7 @@ ufw allow 51820/udp
 
 # Optional: let buyers reach the internet through the box
 sysctl -w net.ipv4.ip_forward=1
-iptables -t nat -A POSTROUTING -s 10.77.0.0/24 -o eth0 -j MASQUERADE   # eth0 = your public interface
+iptables -t nat -A POSTROUTING -s 10.77.0.0/16 -o eth0 -j MASQUERADE   # eth0 = your public interface
 
 # Recommended on any real exit: tune kernel buffers + enable BBR, or throughput
 # is capped to tens of Mbit/s by the small default socket buffers (see Troubleshooting)
@@ -257,7 +257,7 @@ And the obvious thing: when you run an exit, the traffic leaving your server is 
 **Buyer connects but has no internet.** The tunnel hands shakes, but pages won't load. Almost always one of two things, in this order:
 
 - **No DNS in the config.** A full-tunnel config (`AllowedIPs = 0.0.0.0/0`) needs an explicit `DNS =` line, or the client keeps its LAN resolver — which is unreachable through the tunnel — and names silently stop resolving. The daemon writes this line for you from `WG_DNS` (default `1.1.1.1`); only older hand-made configs lack it. Tell-tale sign: on the box, the egress DNS counter stays at zero while 443 still moves — `iptables -L CASHU_EGRESS -v -n` shows `0 packets` on the `dpt:53` rules. Fix a stuck config by adding `DNS = 1.1.1.1` under `[Interface]` and reconnecting.
-- **No NAT / masquerade.** Buyer packets get forwarded out with their private `10.77.0.x` source and the replies never come back. Add the rule from setup: `iptables -t nat -A POSTROUTING -s 10.77.0.0/24 -o eth0 -j MASQUERADE`.
+- **No NAT / masquerade.** Buyer packets get forwarded out with their private `10.77.x.x` source and the replies never come back. Add the rule from setup: `iptables -t nat -A POSTROUTING -s 10.77.0.0/16 -o eth0 -j MASQUERADE`.
 
   Gotcha: if WireGuard was brought up by `wg-quick`/`systemd-networkd`, the masquerade may already exist as a **native nftables** rule (`iifname "wg0" masquerade`) — which is invisible to `iptables -t nat -S`. Always check `nft list ruleset` before concluding NAT is missing, or you'll add a duplicate.
 

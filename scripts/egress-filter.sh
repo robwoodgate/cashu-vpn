@@ -28,7 +28,7 @@ set -euo pipefail
 
 command -v iptables >/dev/null || { echo "iptables not found — on a pure-nft host, translate these rules to nft directly"; exit 1; }
 
-SUBNET="${WG_SUBNET:-10.77.0.0/24}"   # buyer tunnel subnet (matches the daemon's allocator)
+SUBNET="${WG_SUBNET:-10.77.0.0/16}"   # buyer tunnel subnet (matches the daemon's allocator)
 CHAIN="CASHU_EGRESS"
 
 remove() {

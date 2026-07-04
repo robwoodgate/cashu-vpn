@@ -116,15 +116,14 @@ test('allocator produces deterministic IPs in valid range', () => {
   const ip1 = alloc.allocateTunnelIp('p1', 'key1');
   const ip2 = alloc.allocateTunnelIp('p1', 'key1');
   assert.equal(ip1, ip2); // deterministic
-  assert.match(ip1, /^10\.77\.0\.\d+$/);
+  assert.match(ip1, /^10\.77\.\d+\.\d+$/);
 
-  // never reserved
+  // never reserved: 10.77.0.0 (network), 10.77.0.1 (server), 10.77.255.255 (broadcast)
   for (let i = 0; i < 500; i++) {
     const ip = alloc.allocateTunnelIp(`p-${i}`, `k-${i}`);
-    const host = Number(ip.split('.')[3]);
-    assert.notEqual(host, 0);
-    assert.notEqual(host, 1);
-    assert.notEqual(host, 255);
+    const [, , third, fourth] = ip.split('.').map(Number);
+    const host = (third! << 8) | fourth!;
+    assert.ok(host >= 2 && host <= 65534, ip);
   }
 });
 
@@ -134,10 +133,10 @@ test('allocator avoids IPs already in use', () => {
   // Same inputs but that IP is taken → must hand back a different, valid one.
   const second = alloc.allocateTunnelIp('p1', 'key1', new Set([first]));
   assert.notEqual(second, first);
-  assert.match(second, /^10\.77\.0\.\d+$/);
+  assert.match(second, /^10\.77\.\d+\.\d+$/);
   // Subnet exhausted → throws rather than colliding.
   const all = new Set<string>();
-  for (let h = 2; h <= 254; h++) all.add(`10.77.0.${h}`);
+  for (let h = 2; h <= 65534; h++) all.add(`10.77.${h >> 8}.${h & 255}`);
   assert.throws(() => alloc.allocateTunnelIp('p1', 'key1', all), /exhausted/);
 });
 
@@ -422,7 +421,7 @@ test('POST /purchase dry-run creates lease without payment', async () => {
     const body = await res.json();
 
     assert.match(body.purchaseId, /^p-/);
-    assert.match(body.tunnelIp, /^10\.77\.0\./);
+    assert.match(body.tunnelIp, /^10\.77\.\d+\.\d+$/);
     assert.equal(body.mode, 'dry-run');
     assert.ok(body.clientConfig);
     assert.equal(body.lease.status, 'active');

@@ -43,8 +43,10 @@ export interface PeerLedger {
 
 // --- Allocator ---
 
-const SUBNET = '10.77.0';
-const HOST_COUNT = 253; // usable hosts 2..254 (.0/.1/.255 reserved)
+// 10.77.0.0/16. Host index 0 is the network address, 1 is the server
+// (10.77.0.1), 65535 the broadcast — usable hosts are 2..65534.
+const SUBNET = '10.77';
+const HOST_COUNT = 65533;
 
 export function createAllocator(): PeerAllocator {
   return {
@@ -57,10 +59,10 @@ export function createAllocator(): PeerAllocator {
       const digest = createHash('sha256')
         .update(`${purchaseId}:${clientPublicKey}`)
         .digest();
-      const start = digest[0]! % HOST_COUNT;
+      const start = digest.readUInt16BE(0) % HOST_COUNT;
       for (let i = 0; i < HOST_COUNT; i++) {
-        const host = 2 + ((start + i) % HOST_COUNT); // 2..254
-        const ip = `${SUBNET}.${host}`;
+        const host = 2 + ((start + i) % HOST_COUNT); // 2..65534
+        const ip = `${SUBNET}.${host >> 8}.${host & 255}`;
         if (!taken.has(ip)) return ip;
       }
       throw Object.assign(new Error(`tunnel subnet exhausted (${HOST_COUNT} active leases)`), { code: 'SUBNET_EXHAUSTED' });

@@ -33,7 +33,7 @@
 #   PostDown = /root/cashu-vpn/scripts/upstream-egress.sh --remove
 set -euo pipefail
 
-SUBNET="${WG_SUBNET:-10.77.0.0/24}"        # buyer tunnel subnet (matches the daemon's allocator)
+SUBNET="${WG_SUBNET:-10.77.0.0/16}"        # buyer tunnel subnet (matches the daemon's allocator)
 TABLE="${UPSTREAM_TABLE:-1597}"            # dedicated routing table for buyer traffic
 PRIO="${UPSTREAM_RULE_PRIO:-1597}"         # ip rule priority
 
