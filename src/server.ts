@@ -63,6 +63,13 @@ interface Ctx extends ServerDeps {
    */
   processing: Set<string>;
   /**
+   * Last /pay rejection per order, surfaced via the /order poll so the page can
+   * explain a failure the paying wallet only shows as a generic error (e.g.
+   * cashu.me delivering unlocked proofs). In-memory: it matters while the buyer
+   * is watching; a restart just loses the hint, not the order.
+   */
+  payErrors: Map<string, string>;
+  /**
    * Shared serializer for WireGuard mutations, so provisioning's `wg set` and
    * cleanup's `wg ... remove` can't interleave on a peer keyed by the same
    * WireGuard public key (a concurrent re-buy with that key would otherwise be
@@ -83,7 +90,7 @@ export function createServer(deps: ServerDeps): http.Server {
   // ponytail: one global wg lock; switch to per-pubkey locks only if provisioning
   // throughput ever makes a global serializer the bottleneck.
   const notifier = createNotifier(config.notifyWebhook, deps.notifyPost);
-  const ctx: Ctx = { ...deps, limiter, processing: new Set(), wgLock: serialize(), notifier };
+  const ctx: Ctx = { ...deps, limiter, processing: new Set(), payErrors: new Map(), wgLock: serialize(), notifier };
 
   // Housekeeping interval: remove expired WireGuard peers, then forget records
   // whose lease expired more than retainExpiredMs ago. Pruning keeps the lease
@@ -384,14 +391,17 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
   const verified = await verifyAndAuthorize(ctx, encodedToken, order.tier?.priceSats ?? ctx.config.priceSats);
   if ('error' in verified) {
     console.log(`[pay] order=${tag} rejected: ${verified.error}`);
+    ctx.payErrors.set(orderId, verified.error);
     return json(res, 402, { error: 'payment_failed', detail: verified.error });
   }
 
   const r = await provisionOrder(ctx, orderId, verified);
   if (r.kind === 'error') {
     if (r.status === 402) console.log(`[pay] order=${tag} rejected: ${r.error}`);
+    if (r.status === 402 || r.status === 503) ctx.payErrors.set(orderId, r.error);
     return json(res, r.status, r.status === 402 ? { error: 'payment_failed', detail: r.error } : { error: r.error });
   }
+  ctx.payErrors.delete(orderId);
   if (r.kind === 'provisioned') console.log(`[pay] order=${tag} ready: ${r.payment.amountSats} sat`);
   // Return the config bundle: an agent POSTing here gets the .conf synchronously,
   // no /order poll needed. Browser/NUT-18 wallet ignores the extra fields.
@@ -430,7 +440,10 @@ async function handleOrderStatus(res: ServerResponse, ctx: Ctx, orderId: string)
       lease: order.lease,
     });
   }
-  return json(res, 200, { status: 'pending', mode: ctx.config.mode });
+  // Surface the last /pay rejection so the page can explain what the paying
+  // wallet reported only as a generic failure.
+  const payError = ctx.payErrors.get(orderId);
+  return json(res, 200, { status: 'pending', mode: ctx.config.mode, ...(payError ? { payError } : {}) });
 }
 
 // --- Payment verification + lock authorization ---

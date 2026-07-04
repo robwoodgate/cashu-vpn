@@ -306,6 +306,26 @@ test('validatePublicKey accepts WG keys and rejects injection attempts', () => {
   assert.throws(() => validatePublicKey(good.slice(0, -1))); // missing '=' pad
 });
 
+test('executePlan accepts any /16 pool IP and rejects out-of-pool ones', async () => {
+  // Regression: the validator once only matched 10.77.0.x, so the first lease
+  // allocated past the old /24 provisioned in state but never got its wg peer.
+  const key = 'nKpu1TI56v6JqS+wxnhMd+hBQJ8X15y7075zpATtJWU=';
+  const seen: string[][] = [];
+  const fakeRun = (async (argv: string[]) => { seen.push(argv); return { argv, exitCode: 0, stdout: '', stderr: '' }; }) as never;
+  await executePlan({ iface: 'wg0', steps: [
+    { argv: ['wg', 'set', 'wg0', 'peer', key, 'allowed-ips', '10.77.84.136/32'] },
+    { argv: ['ip', 'route', 'replace', '10.77.255.254/32', 'dev', 'wg0'] },
+  ] }, fakeRun);
+  assert.equal(seen.length, 2);
+  // Reserved / out-of-pool addresses stay rejected.
+  for (const bad of ['10.77.0.0/32', '10.77.0.1/32', '10.77.255.255/32', '10.77.1.256/32', '10.78.0.5/32']) {
+    await assert.rejects(
+      executePlan({ iface: 'wg0', steps: [{ argv: ['wg', 'set', 'wg0', 'peer', key, 'allowed-ips', bad] }] }, fakeRun),
+      /Unsafe WireGuard command/, bad
+    );
+  }
+});
+
 test('executePlan rejects unsafe steps before running anything', async () => {
   // A key with no whitespace passed the old regex guard and reached the shell.
   // It must now be rejected at the execution boundary (no wg/ip ever runs).

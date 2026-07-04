@@ -50,7 +50,18 @@ export function validateInterface(name: string): string {
 // chars followed by a single '=' pad. The charset has no shell metacharacters,
 // which (together with execFile) is what closes the command-injection vector.
 const PUBKEY_RE = /^[A-Za-z0-9+/]{43}=$/;
-const TUNNEL_IP_RE = /^10\.77\.0\.(?:[2-9]|[1-9]\d|1\d\d|2[0-4]\d|25[0-4])$/;
+// A host inside the 10.77.0.0/16 tunnel pool, excluding the network address,
+// the server (10.77.0.1) and broadcast — mirrors the allocator's 2..65534.
+const TUNNEL_IP_RE = /^10\.77\.(\d{1,3})\.(\d{1,3})$/;
+
+function isTunnelIp(value: string): boolean {
+  const m = TUNNEL_IP_RE.exec(value);
+  if (!m) return false;
+  const third = Number(m[1]), fourth = Number(m[2]);
+  if (third > 255 || fourth > 255) return false;
+  const host = third * 256 + fourth;
+  return host >= 2 && host <= 65534;
+}
 
 export function validatePublicKey(key: string): string {
   if (!PUBKEY_RE.test(key)) {
@@ -60,7 +71,7 @@ export function validatePublicKey(key: string): string {
 }
 
 function isTunnelCidr(value: string): boolean {
-  return value.endsWith('/32') && TUNNEL_IP_RE.test(value.slice(0, -3));
+  return value.endsWith('/32') && isTunnelIp(value.slice(0, -3));
 }
 
 // --- Command planning ---
@@ -118,13 +129,13 @@ function validateStep(iface: string, argv: string[]): void {
   throw new Error(`Unsafe WireGuard command: ${argv.join(' ')}`);
 }
 
-export async function executePlan(plan: CommandPlan): Promise<CommandResult[]> {
+export async function executePlan(plan: CommandPlan, run: typeof runStep = runStep): Promise<CommandResult[]> {
   validateInterface(plan.iface);
   for (const step of plan.steps) validateStep(plan.iface, step.argv);
 
   const results: CommandResult[] = [];
   for (const step of plan.steps) {
-    const result = await runStep(step.argv);
+    const result = await run(step.argv);
     results.push(result);
     if (result.exitCode !== 0) {
       throw new Error(

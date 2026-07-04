@@ -146,7 +146,9 @@ function renderQR(elId: string, qrText: string, copyText: string = qrText, icon?
     const note = document.createElement('div');
     note.className = 'qrnote';
     note.textContent = ok ? '✓ Copied!' : 'Copy failed — copy it manually';
-    note.style.cssText = 'width:240px;max-width:100%;text-align:center;font-weight:700;font-size:1.05rem;margin-top:8px;color:var(--' + (ok ? 'good' : 'warn') + ')';
+    // Out of layout flow: the centre icon is anchored to 50% of this container,
+    // so an in-flow note would grow it and shift the icon mid-flash.
+    note.style.cssText = 'position:absolute;top:100%;left:50%;transform:translateX(-50%);white-space:nowrap;text-align:center;font-weight:700;font-size:1.05rem;margin-top:8px;color:var(--' + (ok ? 'good' : 'warn') + ')';
     el.appendChild(note);
     setTimeout(() => note.remove(), 1500);
   };
@@ -338,6 +340,15 @@ function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+// Buyer-facing text for a /pay rejection reported via the /order poll.
+function payErrorText(code: string): string {
+  if (code === 'not_locked' || code === 'lock_mismatch') {
+    return 'Your wallet paid without the required P2PK lock, so the payment was refused and your funds stayed in your wallet. Please use the Auto or Lightning tab instead.';
+  }
+  if (code === 'no_capacity') return 'Payment received but no tunnel slots are free — contact the operator for a refund.';
+  return 'Payment was refused (' + code + '). Your funds stayed in your wallet — try the Auto or Lightning tab.';
+}
+
 // One purchase flow for both paths: a fresh buy generates a keypair; a renewal
 // reuses the lease's stored keys, so the server extends the same slot/IP and the
 // already-imported config keeps working.
@@ -415,6 +426,9 @@ async function poll(id: string): Promise<void> {
       if (r.ok) {
         const d = await r.json();
         if (d.status === 'ready') { applyReady(id, d); return; }
+        // A wallet's delivery was refused; the wallet itself only shows a generic
+        // error, so explain here. Keep polling — the buyer can just pay again.
+        if (d.payError && id === currentOrderId) setMsg(payErrorText(String(d.payError)), 'err');
       }
       await sleep(2000);
     }
