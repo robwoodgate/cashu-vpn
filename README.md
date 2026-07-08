@@ -118,6 +118,8 @@ OPERATOR_XPRV=<your xprv> npm run sweep:remote root@your-box
 
 This copies the receipts off the server, claims them locally so your `xprv` never leaves your machine, saves the unlocked tokens to a timestamped file, and tidies the claimed receipts off the server afterwards. Import the saved tokens into any Cashu wallet and you are done.
 
+If typing the xprv each time is a chore, `./sweep.sh user@host` runs the same flow with the key fetched from the OS secret store (macOS Keychain or libsecret; one-time setup instructions are in the script). Set `CASHU_VPN_REMOTE=user@host` in your shell profile and it shortens to `./sweep.sh`.
+
 If you would rather do it by hand, the same thing in two steps is to copy the receipts down and sweep them locally:
 
 ```bash

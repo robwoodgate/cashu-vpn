@@ -7,4 +7,3 @@ dist/
 .env
 state/
 swept-*.json
-sweep.sh
