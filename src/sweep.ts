@@ -14,7 +14,7 @@
  */
 
 import { writeFile } from 'node:fs/promises';
-import { Wallet, getDecodedToken, getEncodedToken, sumProofs, type Proof } from '@cashu/cashu-ts';
+import { Wallet, getEncodedToken, sumProofs, type Proof } from '@cashu/cashu-ts';
 import { pathToFileURL } from 'node:url';
 import { deriveChildKeypair } from './hdkeys.js';
 import { normalizePubkey } from './cashu.js';
@@ -86,15 +86,32 @@ export interface SweepResult {
  */
 export type Claimer = (mint: string, proofs: Proof[], privkeys: string[]) => Promise<Proof[]>;
 
-const defaultClaimer: Claimer = async (mint, proofs, privkeys) => {
-  const wallet = new Wallet(mint, { unit: 'sat' });
-  await wallet.loadMint();
-  return wallet.receive(proofs, { privkey: privkeys });
-};
+// One loaded wallet per mint per run; decode, state checks and claims share it.
+const wallets = new Map<string, Promise<Wallet>>();
+function loadWallet(mint: string): Promise<Wallet> {
+  let w = wallets.get(mint);
+  if (!w) {
+    w = (async () => {
+      const wallet = new Wallet(mint, { unit: 'sat' });
+      await wallet.loadMint();
+      return wallet;
+    })();
+    w.catch(() => wallets.delete(mint));
+    wallets.set(mint, w);
+  }
+  return w;
+}
 
-/** Decode a stored (locked) token into its proofs. */
-export type Decoder = (token: string) => Proof[];
-const defaultDecoder: Decoder = (token) => getDecodedToken(token, []).proofs;
+const defaultClaimer: Claimer = async (mint, proofs, privkeys) =>
+  (await loadWallet(mint)).receive(proofs, { privkey: privkeys });
+
+/**
+ * Decode a stored (locked) token into its proofs. Needs the mint: tokens on
+ * v2 (01…) keysets carry a short keyset id that only the mint's keyset list
+ * can resolve.
+ */
+export type Decoder = (mint: string, token: string) => Proof[] | Promise<Proof[]>;
+const defaultDecoder: Decoder = async (mint, token) => (await loadWallet(mint)).decodeToken(token).proofs;
 
 const sum = (proofs: Proof[]): number =>
   proofs.length ? Number((sumProofs(proofs) as { toNumber: () => number }).toNumber()) : 0;
@@ -122,11 +139,12 @@ export async function sweepAll(
   const results: SweepResult[] = [];
   for (const [mint, entries] of byMint) {
     const keysOf = (es: SweepEntry[]) => [...new Set(es.map((e) => e.privkey))];
-    const proofsOf = (es: SweepEntry[]) => es.flatMap((e) => decode(e.token));
+    const proofsOf = async (es: SweepEntry[]) =>
+      (await Promise.all(es.map((e) => decode(mint, e.token)))).flat();
 
     // Fast path: one swap for the whole mint.
     try {
-      const claimed = await claim(mint, proofsOf(entries), keysOf(entries));
+      const claimed = await claim(mint, await proofsOf(entries), keysOf(entries));
       results.push({
         mint, receipts: entries.length, batched: true,
         claimedSats: sum(claimed), token: claimed.length ? encode(mint, claimed) : undefined, errors: [],
@@ -139,7 +157,7 @@ export async function sweepAll(
       const errors: string[] = [`batch swap failed (${batchErr instanceof Error ? batchErr.message : String(batchErr)}); retried individually`];
       for (const e of entries) {
         try {
-          claimed.push(...(await claim(mint, decode(e.token), [e.privkey])));
+          claimed.push(...(await claim(mint, await decode(mint, e.token), [e.privkey])));
         } catch (err) {
           errors.push(`index ${e.index}: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -168,9 +186,7 @@ export async function sweepAll(
 export type StateChecker = (mint: string, proofs: Array<{ secret: string; id: string }>) => Promise<string[]>;
 
 const defaultStateChecker: StateChecker = async (mint, proofs) => {
-  const wallet = new Wallet(mint, { unit: 'sat' });
-  await wallet.loadMint();
-  const states = await wallet.checkProofsStates(proofs);
+  const states = await (await loadWallet(mint)).checkProofsStates(proofs);
   return states.map((s) => s.state);
 };
 
@@ -192,7 +208,7 @@ async function fullySpentByMint<T extends { mint: string; token: string }>(
     const spans: Array<{ item: T; start: number; len: number }> = [];
     const flat: Array<{ secret: string; id: string }> = [];
     for (const item of group) {
-      const proofs = decode(item.token);
+      const proofs = await decode(mint, item.token);
       spans.push({ item, start: flat.length, len: proofs.length });
       for (const p of proofs) flat.push({ secret: p.secret, id: p.id });
     }

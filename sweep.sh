@@ -37,6 +37,10 @@ if [ -z "${OPERATOR_XPRV:-}" ]; then
   fi
 fi
 
+# Pasted secrets often pick up stray whitespace; base58 never contains any.
+OPERATOR_XPRV="${OPERATOR_XPRV:-}"
+OPERATOR_XPRV="${OPERATOR_XPRV//[[:space:]]/}"
+
 if [ -z "${OPERATOR_XPRV:-}" ]; then
   echo "OPERATOR_XPRV is not set and there is no '$SERVICE' item in the secret store." >&2
   echo "Store it once (you will be prompted; it stays out of shell history):" >&2

@@ -1306,7 +1306,7 @@ test('sweepAll batches each mint into one swap and aggregates claimed proofs', a
     mismatched: [],
   };
   // decode: one proof per token; claim: one 100-sat output per input proof.
-  const decode = (token: string) => [{ amount: 250, secret: token }] as never;
+  const decode = (_mint: string, token: string) => [{ amount: 250, secret: token }] as never;
   const swaps: Array<{ mint: string; nProofs: number; nKeys: number }> = [];
   const claim = async (mint: string, proofs: unknown[], keys: string[]) => {
     swaps.push({ mint, nProofs: proofs.length, nKeys: keys.length });
@@ -1338,7 +1338,7 @@ test('sweepAll falls back to per-receipt claims when the batch swap fails', asyn
     manual: [],
     mismatched: [],
   };
-  const decode = (token: string) => [{ amount: 130, secret: token }] as never;
+  const decode = (_mint: string, token: string) => [{ amount: 130, secret: token }] as never;
   const claim = async (_mint: string, proofs: Array<{ secret: string }>) => {
     if (proofs.some((p) => p.secret === 'bad')) throw new Error('already spent');
     return proofs.map(() => ({ amount: 130 })) as never;
@@ -1358,7 +1358,7 @@ test('filterUnswept skips receipts the mint reports as SPENT (idempotent re-runs
     manual: [],
     mismatched: [],
   };
-  const decode = (token: string) => [{ secret: token, id: '00' }] as never;
+  const decode = (_mint: string, token: string) => [{ secret: token, id: '00' }] as never;
   const check = async (_mint: string, proofs: Array<{ secret: string }>) =>
     proofs.map((p) => (p.secret === 'spent' ? 'SPENT' : 'UNSPENT'));
   const { sweepable, alreadySwept } = await filterUnswept(plan, decode, check);
@@ -1373,7 +1373,7 @@ test('pruneSpent keeps unspent receipts and drops fully-swept ones', async () =>
     purchaseId: id, mint: 'https://m', amountSats: 250, token, secrets: [token], lockPubkey: 'p', receivedAt: 't',
   });
   const receipts = [mk('p0', 'spent'), mk('p1', 'live')];
-  const decode = (token: string) => [{ secret: token, id: '00' }] as never;
+  const decode = (_mint: string, token: string) => [{ secret: token, id: '00' }] as never;
   const check = async (_mint: string, proofs: Array<{ secret: string }>) =>
     proofs.map((p) => (p.secret === 'spent' ? 'SPENT' : 'UNSPENT'));
   const { keep, dropped } = await pruneSpent(receipts, decode, check);
@@ -1712,7 +1712,7 @@ test('property: sweepAll conserves sats across batch and fallback paths', async 
   const plan = { sweepable, manual: [], mismatched: [] };
   const expected = sweepable.reduce((a, e) => a + e.amountSats, 0);
 
-  const decode = (token: string) => [{ id: 'k', secret: token, amount: amtByToken.get(token)! }] as never;
+  const decode = (_mint: string, token: string) => [{ id: 'k', secret: token, amount: amtByToken.get(token)! }] as never;
   const encode = () => 'x';
   // Identity claimer (batch path): claimed proofs == input proofs.
   const idClaim = async (_m: string, proofs: never) => proofs;
