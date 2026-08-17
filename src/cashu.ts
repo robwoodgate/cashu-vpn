@@ -24,8 +24,7 @@
  */
 
 import {
-  PaymentRequest,
-  PaymentRequestTransportType,
+  PaymentRequestBuilder,
   getTokenMetadata,
   getDecodedToken,
   hasValidDleq,
@@ -33,7 +32,6 @@ import {
   Wallet,
   sumProofs,
   type Proof,
-  type PaymentRequestTransport,
   type TokenMetadata,
   type HasKeysetKeys,
 } from '@cashu/cashu-ts';
@@ -90,21 +88,16 @@ export function buildPaymentRequest(opts: {
   description?: string;
   transportTarget?: string;
 }): string {
-  // NUT-10 spending condition: lock the requested proofs to lockPubkey.
-  const nut10 = { kind: 'P2PK', data: opts.lockPubkey, tags: [] as string[][] };
-  const transports: PaymentRequestTransport[] | undefined = opts.transportTarget
-    ? [{ type: PaymentRequestTransportType.POST, target: opts.transportTarget, tags: [] }]
-    : undefined;
-  return new PaymentRequest(
-    transports,
-    opts.paymentId,
-    opts.amountSats,
-    opts.unit ?? 'sat',
-    opts.mints,
-    opts.description,
-    undefined,
-    nut10,
-  ).toEncodedCreqA();
+  // The builder validates what the lenient PaymentRequest class does not: the
+  // lock pubkey must be compressed and on-curve, and mint URLs must parse.
+  const builder = new PaymentRequestBuilder()
+    .id(opts.paymentId)
+    .amount(opts.amountSats, opts.unit ?? 'sat')
+    .addMint(opts.mints)
+    .lock({ kind: 'P2PK', data: opts.lockPubkey });
+  if (opts.description) builder.description(opts.description);
+  if (opts.transportTarget) builder.addHttpPostTransport(opts.transportTarget);
+  return builder.build().toEncodedCreqA();
 }
 
 /** Number of set bits in a non-negative integer (minimal power-of-two split size). */
@@ -197,7 +190,9 @@ export async function verifyPayment(
   const getMetadata = deps.getMetadata ?? getTokenMetadata;
   const loadMintContext = deps.loadMintContext ?? defaultLoadMintContext;
   const decode = deps.decode ?? ((t, ids) => getDecodedToken(t, ids).proofs);
-  const checkDleq = deps.checkDleq ?? ((p, k) => hasValidDleq(p, k));
+  // require:true — the spec-default verify-if-present would pass a proof with no
+  // DLEQ at all, and offline verification is only as good as the DLEQ it checks.
+  const checkDleq = deps.checkDleq ?? ((p, k) => hasValidDleq(p, k, { require: true }));
   const witnessPubkeys = deps.witnessPubkeys ?? getP2PKExpectedWitnessPubkeys;
 
   let meta: TokenMetadata;
@@ -244,8 +239,15 @@ export async function verifyPayment(
     } catch {
       return { valid: false, amountSats: 0, error: 'unknown_keyset' };
     }
-    // NUT-12: proof is genuinely mint-signed (verified offline).
-    if (!checkDleq(proof, keyset)) {
+    // NUT-12: proof is genuinely mint-signed (verified offline). hasValidDleq
+    // throws on a proof amount the keyset has no key for — same verdict.
+    let dleqOk: boolean;
+    try {
+      dleqOk = checkDleq(proof, keyset);
+    } catch {
+      dleqOk = false;
+    }
+    if (!dleqOk) {
       return { valid: false, amountSats: 0, error: 'invalid_dleq' };
     }
     // NUT-11: require a SINGLE-signer P2PK lock with no refund/locktime escape,

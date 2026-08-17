@@ -41,7 +41,7 @@ for (let i = 0; i < 30 && state !== 'PAID'; i++) {
 if (state !== 'PAID') throw new Error(`mint quote not PAID (state=${state}); if a real mint, pay: ${quote.request}`);
 
 const keyset = wallet.getKeyset();
-const outputs = OutputData.createP2PKData({ pubkey: lockPubkey }, amount, keyset);
+const outputs = OutputData.createP2PKData({ kind: 'P2PK', data: lockPubkey }, amount, keyset);
 const proofs = await wallet.ops.mintBolt11(amount, quote).asCustom(outputs).run();
 log({ step: 'minted', proofs: proofs.length, hasDleq: proofs.every((p) => p.dleq != null) });
 

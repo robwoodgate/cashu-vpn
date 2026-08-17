@@ -112,7 +112,7 @@ export async function mintLockedPayload(
   quote: MintQuote,
 ): Promise<PaymentPayload> {
   const outputs = OutputData.createP2PKData(
-    { pubkey: challenge.lockPubkey },
+    { kind: 'P2PK', data: challenge.lockPubkey },
     challenge.amount,
     wallet.getKeyset() as Parameters<typeof OutputData.createP2PKData>[2],
   );
