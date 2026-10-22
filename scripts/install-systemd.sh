@@ -21,7 +21,7 @@ if ! NODE_BIN="$(command -v node)"; then
   export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true
   NODE_BIN="$(command -v node || true)"
 fi
-[ -n "$NODE_BIN" ] || { echo "node not found on PATH. Install Node.js >= 20 first."; exit 1; }
+[ -n "$NODE_BIN" ] || { echo "node not found on PATH. Install Node.js >= 24 first."; exit 1; }
 
 # Build if it hasn't been built yet.
 if [ ! -f "$REPO/dist/src/main.js" ]; then
