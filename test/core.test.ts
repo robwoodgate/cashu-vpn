@@ -1789,6 +1789,42 @@ test('provision keeps an expired lease IP taken until cleanup has removed its pe
   assert.equal((await provisionStore(store, 'o2', 'K2'))!.order.lease!.tunnelIp, '10.77.0.2');
 });
 
+test('a paid order hands its config only to the holder of its secret', async () => {
+  // The order id is in the payment request; it must not unlock the PSK and tunnel IP.
+  const store = createMemoryStateStore();
+  const lockBook = await createLockBook(TEST_XPUB);
+  await withServer(async (url) => {
+    const { orderId } = await (await newOrder(url, { secret: SECRET_A })).json();
+    const paid = await (await payOrder(url, orderId, 0)).json(); // a wallet: no secret
+    assert.equal(paid.status, 'ready');
+    assert.equal(paid.clientConfig, undefined, 'the paying wallet gets no config');
+    for (const headers of [{}, { 'x-order-secret': SECRET_B }] as Record<string, string>[]) {
+      const d = await (await fetch(`${url}/order/${orderId}`, { headers })).json();
+      assert.equal(d.status, 'ready');
+      assert.equal(d.clientConfig, undefined);
+      assert.equal(d.tunnelIp, undefined);
+    }
+    const mine = await (await fetch(`${url}/order/${orderId}`, { headers: { 'x-order-secret': SECRET_A } })).json();
+    assert.match(mine.clientConfig, /PresharedKey = /);
+    assert.equal(mine.lease.presharedKey, undefined, 'the PSK is only in the config, not repeated in the lease');
+    const again = await (await payOrder(url, orderId, 0, SECRET_A)).json();
+    assert.equal(again.clientConfig, mine.clientConfig, 'a repeat /pay with the secret gets it too');
+  }, LIVE_ENV, { store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
+});
+
+test('cleanup expires a lease whose route is already gone, rather than retrying it forever', async () => {
+  // After a host restart the route of a lease that expired meanwhile no longer exists.
+  const past = new Date(Date.now() - 1000).toISOString();
+  const store = seedStore([{ purchaseId: 'old', clientPublicKey: 'K0', tunnelIp: '10.77.0.2', createdAt: past, expiresAt: past, status: 'active' }]);
+  const exec = async (plan: { steps: { argv: string[] }[] }) => {
+    if (plan.steps[0]!.argv[0] === 'ip') throw new Error('RTNETLINK answers: No such process');
+    return [];
+  };
+  const r = await cleanupExpiredPeers(store, 'wg0', false, new Date(), serialize(), exec as never);
+  assert.deepEqual(r.cleaned.map((l) => l.purchaseId), ['old']);
+  assert.equal(await store.countOccupied(), 0, 'the IP is free again');
+});
+
 test('provision refuses a key that already holds a live lease', async () => {
   const store = createMemoryStateStore();
   const future = new Date(Date.now() + 60_000).toISOString();
@@ -1824,7 +1860,7 @@ test('cleanup skips removing a peer whose key a concurrent re-buy now owns', asy
   const orphan = seedStore([mk('old', past, '10.77.0.2')]);
   execCalls = 0;
   const r2 = await cleanupExpiredPeers(orphan, 'wg0', false, now, serialize(), fakeExec as never);
-  assert.equal(execCalls, 1, 'expired peer removed when no live lease claims its key');
+  assert.equal(execCalls, 2, 'expired peer removed (peer, then its route) when no live lease claims its key');
   assert.deepEqual(r2.cleaned.map((l) => l.purchaseId), ['old']);
 });
 
@@ -1985,8 +2021,10 @@ const newOrder = (url: string, body: Record<string, unknown> = {}) => fetch(`${u
   body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, ...body }),
 });
 // Deliver the token for child `idx` to its order's /pay sink.
-const payOrder = (url: string, orderId: string, idx: number) => fetch(`${url}/pay/${orderId}`, {
-  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: fakeToken(idx) }),
+const payOrder = (url: string, orderId: string, idx: number, secret?: string) => fetch(`${url}/pay/${orderId}`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', ...(secret && { 'x-order-secret': secret }) },
+  body: JSON.stringify({ token: fakeToken(idx) }),
 });
 // Create an order and pay it in one step; returns the final /pay Response.
 async function buyViaPay(url: string, idx: number): Promise<Response> {
@@ -2100,9 +2138,13 @@ test('renewing through /purchase rotates the key, IP and PSK, and both peers run
   const execPlan = async (plan: { steps: { argv: string[]; secret?: string }[] }) => { applied.push(plan.steps[0]!); return []; };
   await withServer(async (url) => {
     const first = await (await newOrder(url, { secret: SECRET_A })).json();
-    const a = await (await payOrder(url, first.orderId, 0)).json();
+    const a = await (await payOrder(url, first.orderId, 0, SECRET_A)).json();
     const second = await (await newOrder(url, { clientPublicKey: NEW_KEY, secret: SECRET_B, renew: first.orderId, renewSecret: SECRET_A })).json();
-    const b = await (await payOrder(url, second.orderId, 1)).json();
+    const b = await (await payOrder(url, second.orderId, 1, SECRET_B)).json();
+    // A second renewal of the already-renewed lease is refused: its time has moved on.
+    const again = await newOrder(url, { clientPublicKey: wgKey(7), secret: 'secret-c-0123456789abcdefghijklm', renew: first.orderId, renewSecret: SECRET_A });
+    assert.equal(again.status, 400);
+    assert.equal((await again.json()).error, 'renew_not_live');
 
     assert.notEqual(b.tunnelIp, a.tunnelIp, 'new IP');
     assert.equal(new Date(b.lease.expiresAt).getTime() - new Date(a.lease.expiresAt).getTime(), 86_400_000, 'starts where the first ends');

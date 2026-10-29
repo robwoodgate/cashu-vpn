@@ -234,9 +234,15 @@ function openPayPanel(orderId: string, creq: string): void {
 // POST minted proofs to the order's NUT-18 sink. Idempotent server-side, so a
 // reload safely re-delivers persisted proofs. On success the config is applied
 // (or polled for); on failure the proofs stay persisted for a later retry.
+// The order secret unlocks the config in /pay and /order responses.
+function secretHeader(orderId: string): Record<string, string> {
+  const s = loadOrders().find((o) => o.id === orderId)?.secret;
+  return s ? { 'x-order-secret': s } : {};
+}
+
 async function deliver(orderId: string, payload: PaymentPayload): Promise<void> {
   const r = await fetch('/pay/' + encodeURIComponent(orderId), {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json', ...secretHeader(orderId) },
     body: JSON.stringify({ id: orderId, ...payload }),
   });
   const d = await r.json().catch(() => ({}));
@@ -443,7 +449,7 @@ async function poll(id: string): Promise<void> {
   try {
     for (let i = 0; i < 300; i++) {
       let r: Response;
-      try { r = await fetch('/order/' + encodeURIComponent(id)); } catch { await sleep(2000); continue; }
+      try { r = await fetch('/order/' + encodeURIComponent(id), { headers: secretHeader(id) }); } catch { await sleep(2000); continue; }
       if (r.status === 404) { dropOrder(id); renderAccess(); return; }
       if (r.ok) {
         const d = await r.json();

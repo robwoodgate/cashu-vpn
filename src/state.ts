@@ -191,11 +191,12 @@ function makeStore(records: Map<string, Order>, persist: (recs: Order[]) => Prom
         // The prior then gets RENEWAL_GRACE_MS to switch configs, not its remaining time,
         // so a renewal can't double as a second device for free.
         const priorOrder = order.renewOf ? records.get(order.renewOf) : undefined;
-        const prior = priorOrder?.lease && isLive(priorOrder.lease, now) ? priorOrder.lease : undefined;
+        // A lease already renewed has handed its time on; a second renewal of it starts fresh.
+        const prior = priorOrder?.lease && isLive(priorOrder.lease, now) && !priorOrder.lease.renewed ? priorOrder.lease : undefined;
         const expiryBase = prior ? new Date(prior.expiresAt).getTime() : now.getTime();
         if (prior) {
           const cut = Math.min(expiryBase, now.getTime() + RENEWAL_GRACE_MS);
-          records.set(priorOrder!.id, { ...priorOrder!, lease: { ...prior, expiresAt: new Date(cut).toISOString() } });
+          records.set(priorOrder!.id, { ...priorOrder!, lease: { ...prior, expiresAt: new Date(cut).toISOString(), renewed: true } });
         }
         // An expired lease's IP stays taken until cleanup has removed its peer, or that
         // removal's `ip route del` would cut whoever got the IP in between.

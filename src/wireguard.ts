@@ -302,7 +302,10 @@ async function removeStalePeer(
       l.purchaseId !== lease.purchaseId
   );
   if (renewed) return false; // a re-buy owns this key now — leave its peer alone
-  await exec(planRemovePeer(iface, lease.clientPublicKey, lease.tunnelIp));
+  const [peer, route] = planRemovePeer(iface, lease.clientPublicKey, lease.tunnelIp).steps;
+  await exec({ iface, steps: [peer!] });
+  // The route may already be gone (eg the host restarted since); the lease is done either way.
+  await exec({ iface, steps: [route!] }).catch(() => {});
   await ledger.markExpired(lease.purchaseId);
   return true;
 }
@@ -367,7 +370,8 @@ export async function enforceDataCaps(
       } else {
         skipped.push(lease);
       }
-    } catch {
+    } catch (e) {
+      console.error(`could not remove peer ${lease.purchaseId} (${lease.tunnelIp}); will retry:`, e instanceof Error ? e.message : e);
       skipped.push(lease);
     }
   }
@@ -453,7 +457,8 @@ export async function cleanupExpiredPeers(
       } else {
         skipped.push(lease);
       }
-    } catch {
+    } catch (e) {
+      console.error(`could not remove peer ${lease.purchaseId} (${lease.tunnelIp}); will retry:`, e instanceof Error ? e.message : e);
       skipped.push(lease);
     }
   }

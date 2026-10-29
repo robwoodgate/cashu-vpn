@@ -18,6 +18,8 @@ export interface PeerLease {
   capBaseline?: number;
   /** WireGuard preshared key for this peer (absent on leases from before PSKs). */
   presharedKey?: string;
+  /** Set when a renewal took this lease over: it only runs out its switch-over grace now. */
+  renewed?: boolean;
   /** This lease's data cap in bytes (from its tier). Absent = the global default applies. */
   capBytes?: number;
 }

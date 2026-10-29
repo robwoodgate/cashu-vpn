@@ -27,7 +27,7 @@ function hashSecret(secret: string): string {
 
 /** True if `secret` is the one whose hash the order stored. */
 function secretMatches(hash: string | undefined, secret: unknown): boolean {
-  if (!hash || typeof secret !== 'string') return false;
+  if (!hash || !/^[0-9a-f]{64}$/.test(hash) || typeof secret !== 'string') return false;
   return timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(hashSecret(secret), 'hex'));
 }
 const ORDER_ID_RE = /^[A-Za-z0-9_-]{16,}$/;
@@ -240,7 +240,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
     // Per-order poll: the browser fetches ONLY its own order by capability id.
     const orderId = matchPath(path, '/order/');
     if (orderId !== undefined && req.method === 'GET') {
-      return await handleOrderStatus(res, ctx, orderId);
+      return await handleOrderStatus(req, res, ctx, orderId);
     }
 
     if (req.method === 'GET' && (path === '/' || path === '/marketplace')) {
@@ -307,7 +307,7 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     if (!prior || !secretMatches(prior.secretHash, body.renewSecret)) {
       return json(res, 403, { error: 'renew_unauthorized', message: 'renewSecret must be the secret sent when that order was placed' });
     }
-    if (!prior.lease || !live.some((l) => l.purchaseId === prior.lease!.purchaseId)) {
+    if (!prior.lease || prior.lease.renewed || !live.some((l) => l.purchaseId === prior.lease!.purchaseId)) {
       return json(res, 400, { error: 'renew_not_live', message: 'renew must name an order whose lease is still active' });
     }
     // Prepaid time is capped at RENEW_MAX_PERIODS of the plan: it bounds the operator's
@@ -446,7 +446,7 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
   // Idempotent: already provisioned. Return the config too, so an agent that POSTs
   // here itself gets the .conf in one shot (a wallet just ignores the extra fields).
   if (order.status === 'ready') {
-    return json(res, 200, { ok: true, status: 'ready', ...readyBundleOf(order), mode: ctx.config.mode });
+    return json(res, 200, { ok: true, status: 'ready', ...bundleFor(req, order), mode: ctx.config.mode });
   }
 
   const body = await readBody(req);
@@ -476,23 +476,34 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
   if (r.kind === 'provisioned') console.log(`[pay] order=${tag} ready: ${r.payment.amountSats} sat`);
   // Return the config bundle: an agent POSTing here gets the .conf synchronously,
   // no /order poll needed. Browser/NUT-18 wallet ignores the extra fields.
-  return json(res, 200, { ok: true, status: 'ready', ...readyBundleOf(r.order), mode: ctx.config.mode });
+  return json(res, 200, { ok: true, status: 'ready', ...bundleFor(req, r.order), mode: ctx.config.mode });
 }
 
 /** The buyer-facing config bundle for a ready order. */
 function readyBundleOf(order: Order): ProvisionBundle {
+  const lease = { ...order.lease! };
+  delete lease.presharedKey; // already in clientConfig
   return {
     purchaseId: order.purchaseId!,
     tunnelIp: order.tunnelIp!,
     amountSats: order.amountSats,
     clientConfig: order.clientConfig!,
-    lease: order.lease!,
+    lease,
   };
+}
+
+/**
+ * The config bundle, only for whoever holds the order secret (X-Order-Secret): the order
+ * id travels in the payment request, so it can't be what unlocks the PSK and tunnel IP.
+ */
+function bundleFor(req: IncomingMessage, order: Order): ProvisionBundle | Record<string, never> {
+  const holder = !order.secretHash || secretMatches(order.secretHash, firstHeader(req.headers['x-order-secret']));
+  return holder ? readyBundleOf(order) : {};
 }
 
 // --- GET /order/:orderId (browser poll) ---
 
-async function handleOrderStatus(res: ServerResponse, ctx: Ctx, orderId: string): Promise<void> {
+async function handleOrderStatus(req: IncomingMessage, res: ServerResponse, ctx: Ctx, orderId: string): Promise<void> {
   if (!ORDER_ID_RE.test(orderId)) {
     return json(res, 404, { error: 'order_not_found' });
   }
@@ -501,15 +512,7 @@ async function handleOrderStatus(res: ServerResponse, ctx: Ctx, orderId: string)
     return json(res, 404, { error: 'order_not_found' });
   }
   if (order.status === 'ready') {
-    return json(res, 200, {
-      status: 'ready',
-      mode: ctx.config.mode,
-      purchaseId: order.purchaseId,
-      tunnelIp: order.tunnelIp,
-      amountSats: order.amountSats,
-      clientConfig: order.clientConfig,
-      lease: order.lease,
-    });
+    return json(res, 200, { status: 'ready', mode: ctx.config.mode, ...bundleFor(req, order) });
   }
   // Surface the last /pay rejection so the page can explain what the paying
   // wallet reported only as a generic failure.
@@ -611,7 +614,7 @@ interface ProvisionBundle {
   purchaseId: string;
   tunnelIp: string;
   amountSats?: number;
-  lease: PeerLease;
+  lease: Omit<PeerLease, 'presharedKey'>;
   clientConfig: string;
 }
 
@@ -778,7 +781,7 @@ function clientIp(req: IncomingMessage): string {
 function cors(res: ServerResponse): void {
   res.setHeader('access-control-allow-origin', '*');
   res.setHeader('access-control-allow-methods', 'POST, OPTIONS');
-  res.setHeader('access-control-allow-headers', 'content-type');
+  res.setHeader('access-control-allow-headers', 'content-type, x-order-secret');
 }
 
 function preflight(res: ServerResponse): void {
@@ -866,11 +869,12 @@ Prices, plans, accepted mints and the operator notice: GET /info
    The amount is net of input fees, so cover them (cashu-ts: wallet.ops.sendToRequest does this).
    Keep the DLEQ proofs (NUT-12) on pre-v3 keysets; proofs without them are refused.
 4. POST /pay/<orderId> {"id": "<orderId>", "mint": "<mint url>", "unit": "${config.unit}", "proofs": [...]}
-   (or {"token": "<encoded token>"}) -> 200 {status: "ready", clientConfig, tunnelIp, lease}
+   (or {"token": "<encoded token>"}) with header X-Order-Secret: <secret>
+   -> 200 {status: "ready", clientConfig, tunnelIp, lease}. Without the header the config is left out.
 5. In clientConfig (it carries a per-lease PresharedKey), replace "# PrivateKey = <generate locally>" with "PrivateKey = <your private key>",
    then bring the tunnel up (wg-quick, or the WireGuard app).
 
-A NUT-18 wallet can pay the creq itself instead; then poll GET /order/<orderId> until status is "ready".
+A NUT-18 wallet can pay the creq itself instead; then poll GET /order/<orderId> (same header) until status is "ready".
 Unpaid orders expire after ${Math.round(config.orderTtlMs / 60000)} minutes. A payment only works for the order it was requested for.
 
 ## Renew
