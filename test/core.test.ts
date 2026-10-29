@@ -447,7 +447,9 @@ test('GET /info returns config summary', async () => {
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.mode, 'dry-run');
-    assert.equal(body.priceSats, 1000);
+    assert.equal(body.defaultTier, 'standard');
+    assert.equal(body.tiers[0].priceSats, 1000);
+    assert.equal(body.priceSats, undefined);
     assert.ok(body.acceptedMints.length > 0);
   });
 });
@@ -911,11 +913,11 @@ test('dry-run /purchase provisions with the tier duration and cap', async () => 
   }, { TIERS });
 });
 
-test('/info lists tiers alongside the default-plan scalars', async () => {
+test('/info lists tiers and names the default', async () => {
   const TIERS = '[{"name":"1w","sats":500,"durationMs":604800000,"gb":15},{"name":"30d","sats":1500,"durationMs":2592000000}]';
   await withServer(async (url) => {
     const d = await (await fetch(`${url}/info`)).json();
-    assert.equal(d.priceSats, 500); // scalars mirror the default tier
+    assert.equal(d.defaultTier, '1w');
     assert.deepEqual(d.tiers, [
       { name: '1w', priceSats: 500, leaseDuration: '604800s', dataCapGb: 15 },
       { name: '30d', priceSats: 1500, leaseDuration: '2592000s', dataCapGb: null },

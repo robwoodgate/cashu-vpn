@@ -172,12 +172,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
       return json(res, 200, {
         version: VERSION,
         mode: config.mode,
-        priceSats: config.priceSats,
         unit: config.unit,
-        leaseDuration: `${config.leaseDurationMs / 1000}s`,
-        dataCapGb: config.leaseDataCapBytes > 0 ? config.leaseDataCapBytes / 1024 ** 3 : null,
-        // All purchasable plans; the scalar fields above describe tiers[0] (the
-        // default when POST /purchase names no tier).
+        // The plan POST /purchase uses when it names no tier.
+        defaultTier: config.tiers[0]!.name,
         tiers: config.tiers.map((t) => ({
           name: t.name,
           priceSats: t.priceSats,
@@ -795,7 +792,7 @@ Prices, plans, accepted mints and the operator notice: GET /info
 ## Buy a lease
 
 1. Generate an x25519 WireGuard key pair. Only the public key is ever sent.
-2. POST /purchase {"clientPublicKey": "<base64 public key>", "tier": "<optional plan name from /info>"}
+2. POST /purchase {"clientPublicKey": "<base64 public key>", "tier": "<plan name from /info; default: defaultTier>"}
    -> 402 {orderId, creq}. The same creq is in the X-Cashu header.
 3. Decode creq (a NUT-18 payment request). Get proofs for its amount from one of its mints,
    P2PK-locked (NUT-11) to the pubkey in its nut10 field: single signer, no refund or locktime.
