@@ -453,7 +453,12 @@ async function poll(id: string): Promise<void> {
       if (r.status === 404) { dropOrder(id); renderAccess(); return; }
       if (r.ok) {
         const d = await r.json();
-        if (d.status === 'ready') { applyReady(id, d); return; }
+        if (d.status === 'ready' && d.clientConfig) { applyReady(id, d); return; }
+        if (d.status === 'ready') {
+          // Paid, but the server only hands the config to the order secret, which this browser no longer has.
+          if (id === currentOrderId) setMsg('This order is paid, but its config can only be opened from the browser that placed it.', 'err');
+          return;
+        }
         // A wallet's delivery was refused; the wallet itself only shows a generic
         // error, so explain here. Keep polling — the buyer can just pay again.
         if (d.payError && id === currentOrderId) setMsg(payErrorText(String(d.payError)), 'err');
