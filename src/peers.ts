@@ -12,12 +12,12 @@ export interface PeerLease {
   expiresAt: string;
   status: LeaseStatus;
   /**
-   * The peer's cumulative `wg` transfer counter at the moment this lease was
-   * provisioned. Data-cap usage for this lease is (current counter − baseline),
-   * so a same-key renewal that reuses the peer doesn't inherit the prior lease's
-   * traffic. Absent/0 for fresh peers (counter starts at 0).
+   * The peer's cumulative `wg` counter when this lease began; data-cap usage is the
+   * counter minus this. Only leases from the old same-key renewal carry one.
    */
   capBaseline?: number;
+  /** WireGuard preshared key for this peer (absent on leases from before PSKs). */
+  presharedKey?: string;
   /** This lease's data cap in bytes (from its tier). Absent = the global default applies. */
   capBytes?: number;
 }
@@ -38,6 +38,8 @@ export interface PeerAllocator {
 export interface PeerLedger {
   list(now?: Date): Promise<PeerLease[]>;
   listExpiredActive(now: Date): Promise<PeerLease[]>;
+  /** How many tunnel IPs are held: leases whose peer cleanup hasn't removed yet (expired or not). */
+  countOccupied(): Promise<number>;
   markExpired(purchaseId: string): Promise<void>;
   /** Forget leases that expired at/before `cutoff`. Returns how many were removed. */
   pruneExpiredBefore(cutoff: Date): Promise<number>;

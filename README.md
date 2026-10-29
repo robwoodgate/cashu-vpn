@@ -135,7 +135,7 @@ A sweep is cheap because all of a mint's receipts are claimed in a single swap, 
 
 A buyer opens your page and clicks **Get VPN config**. Their browser generates a WireGuard key pair on the spot, and the private key never leaves the page. They then pay one of two ways. The Lightning option needs no Cashu wallet at all: they pay an invoice and the page mints the ecash and delivers it for them. Alternatively, they scan the payment request with a Cashu wallet, which pays and delivers automatically. Either way the page finishes on its own and offers a ready-to-use `.conf` to download.
 
-To connect, they import it into the free [WireGuard app](https://www.wireguard.com/install/), a separate app, not the VPN settings built into macOS or Windows, and the page links to it and shows a QR for one-tap import on mobile. Past orders are remembered under **Your access** in that browser, where each shows whether it is active or expired, so they can be downloaded again later.
+To connect, they import it into the free [WireGuard app](https://www.wireguard.com/install/), a separate app, not the VPN settings built into macOS or Windows, and the page links to it and shows a QR for one-tap import on mobile. Past orders are remembered under **Your access** in that browser, where each shows whether it is active or expired, so they can be downloaded again later. **Renew** moves the remaining time onto a new lease with new keys and adds the new period; the old config keeps working for 15 minutes so the buyer can switch. A renewal can leave at most two periods of the plan prepaid, which bounds what the operator owes and how long any one key lives. Every lease gets its own WireGuard key, tunnel IP and preshared key, so a server compromised later finds only the current keys, not one long-lived identity. While a renewal's records are retained, the server can still tell that the two leases belong together.
 
 > Paying from a Cashu wallet needs a wallet that locks its proofs to the payment request. Wallets that ignore the lock are refused, because cashu-vpn never accepts unlocked ecash. The Lightning option works with any wallet, and most ecash-only wallets can melt to pay it.
 
@@ -158,7 +158,7 @@ Everything is configured with environment variables.
 | `TERMS_URL` | — | optional acceptable-use / terms URL, linked on the page and in `/info` |
 | `LEASE_DURATION_MS` | `86400000` | how long access lasts, one day by default |
 | `LEASE_DATA_CAP_GB` | `50` | per-lease data cap (rx + tx) in GiB; buyer is disconnected once reached. `0` disables |
-| `CLEANUP_INTERVAL_MS` | `60000` | how often to remove expired peers and run retention; set `0` to disable |
+| `CLEANUP_INTERVAL_MS` | `60000` | how often to remove expired peers and run retention; `0` disables it, and then tunnel IPs are never reused either |
 | `RETAIN_EXPIRED_MS` | `86400000` (1 day) | how long expired leases/orders are kept before they are forgotten; `0` keeps everything |
 | `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | `30` / `60000` | per-IP limit on `/purchase`; set max to 0 to disable |
 | `NOTIFY_WEBHOOK` | — | optional URL POSTed a one-line text body on each new sale; point it at an [ntfy](https://ntfy.sh) topic for a phone push. Best-effort and PII-free (order-id prefix + amount + expiry only) |

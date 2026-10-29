@@ -21,6 +21,9 @@ import {
 } from '@cashu/cashu-ts';
 import { popcount } from './cashu.js';
 
+/** How long a renewed lease keeps working after the renewal, so the buyer can import the new config. */
+export const RENEWAL_GRACE_MS = 15 * 60 * 1000;
+
 export interface Challenge {
   amount: number;
   mintUrl: string;

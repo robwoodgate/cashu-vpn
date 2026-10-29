@@ -1,4 +1,5 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -8,13 +9,15 @@ import type { ProofStore } from './wallet.js';
 import type { LockBook } from './locks.js';
 import { newOrderId, newPurchaseId, type Order, type StateStore } from './state.js';
 import { createRateLimiter, type RateLimiter } from './ratelimit.js';
-import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, enforceDataCaps, readPeerTransfers, reconcileActivePeers, validatePublicKey, type WgLock } from './wireguard.js';
+import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, enforceDataCaps, reconcileActivePeers, validatePublicKey, type WgLock } from './wireguard.js';
 import { serialize } from './serialize.js';
 import { buildPaymentRequest, verifyPayment, normalizePubkey, type VerifyResult, type VerifyDeps } from './cashu.js';
 import { createNotifier, type Notifier, type WebhookPost } from './notify.js';
 import { getEncodedToken, type Proof } from '@cashu/cashu-ts';
 
 const MAX_BODY_BYTES = 16 * 1024;
+/** A renewal may leave at most this many of its plan's periods prepaid. */
+const RENEW_MAX_PERIODS = 2;
 const ORDER_ID_RE = /^[A-Za-z0-9_-]{16,}$/;
 
 // Version + source URL, read from package.json (repo root, two levels up from
@@ -46,8 +49,6 @@ export interface ServerDeps {
   verifyDeps?: VerifyDeps;
   /** Test seam: override the WireGuard executor so a provision can run without a live interface. */
   execPlan?: typeof executePlan;
-  /** Test seam: override the per-peer transfer reader (defaults to `wg show transfer`). */
-  readTransfers?: typeof readPeerTransfers;
   /** Test seam: override the notification POST (defaults to the real fetch path). */
   notifyPost?: WebhookPost;
 }
@@ -181,7 +182,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
           leaseDuration: `${t.durationMs / 1000}s`,
           dataCapGb: t.capBytes > 0 ? t.capBytes / 1024 ** 3 : null,
         })),
-        renewal: 'POST /purchase with the same clientPublicKey while its lease is live: keeps the tunnel IP, extends from the current expiry, resets the data cap',
+        renewal: 'POST /purchase with a NEW clientPublicKey and "renew": <orderId of a live lease>: the new lease starts where that one ends, with a new key, IP and preshared key; the old one stops 15 minutes after payment',
         acceptedMints: config.acceptedMints,
         notice: config.notice,
         termsUrl: config.termsUrl,
@@ -278,16 +279,55 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     return json(res, 400, { error: 'unknown_tier', tiers: config.tiers.map((t) => t.name) });
   }
 
+  // A renewal names the order it extends (its id is the capability) and brings a NEW
+  // key, so leases rotate keys instead of building one long-lived identity.
+  const now0 = new Date();
+  const live = (await ctx.store.list(now0)).filter((l) => l.status === 'active');
+  const renewOf = body.renew;
+  if (renewOf !== undefined) {
+    const prior = typeof renewOf === 'string' ? await ctx.store.getOrder(renewOf, now0) : undefined;
+    if (!prior?.lease || !live.some((l) => l.purchaseId === prior.lease!.purchaseId)) {
+      return json(res, 400, { error: 'renew_not_live', message: 'renew must name an order whose lease is still active' });
+    }
+    // Prepaid time is capped at RENEW_MAX_PERIODS of the plan: it bounds the operator's
+    // liability and how long one key lives, since keys only rotate on renewal.
+    const opensAt = new Date(prior.lease.expiresAt).getTime() + tier.durationMs - RENEW_MAX_PERIODS * tier.durationMs;
+    if (opensAt > now0.getTime()) {
+      return json(res, 400, {
+        error: 'renew_too_early',
+        opensAt: new Date(opensAt).toISOString(),
+        message: `Renewal would prepay more than ${RENEW_MAX_PERIODS} periods; it opens at ${new Date(opensAt).toISOString()}`,
+      });
+    }
+  }
+  // A retried /purchase for a key with an open order gets that order back, not a second
+  // one: paying two orders for one key would strand the second payment (key_in_use).
+  const pending = await ctx.store.findPending(clientPublicKey, now0);
+  if (pending && config.mode === 'live') {
+    const sameAsk = pending.tier?.name === tier.name && pending.renewOf === (typeof renewOf === 'string' ? renewOf : undefined);
+    if (!sameAsk) {
+      return json(res, 409, { error: 'order_pending', message: 'This key already has an unpaid order: repeat that request to get it back, or use a new key.' });
+    }
+    return sendChallenge(req, res, config, pending);
+  }
+  if (live.some((l) => l.clientPublicKey === clientPublicKey)) {
+    return json(res, 409, {
+      error: 'key_in_use',
+      message: 'This WireGuard key has a live lease. To extend it, renew with a NEW key: {"clientPublicKey": <new>, "renew": <orderId>}',
+    });
+  }
+
   // Dry-run skips payment entirely: create an order and provision it immediately.
   if (config.mode !== 'live') {
     const orderId = newOrderId();
     const now = new Date();
     await ctx.store.createOrder({
       id: orderId, status: 'pending', clientPublicKey, lockPubkey: '', tier,
+      ...(typeof renewOf === 'string' && { renewOf }),
       createdAt: now.toISOString(), expiresAt: new Date(now.getTime() + config.orderTtlMs).toISOString(),
     });
     const result = await runProvision(ctx, orderId, clientPublicKey, undefined, undefined, tier);
-    return json(res, 200, { ...readyBundleOf(result!.order), mode: config.mode });
+    return json(res, 200, { ...readyBundleOf(result!.order), orderId, mode: config.mode });
   }
 
   if (!ctx.lockBook) {
@@ -310,13 +350,9 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
   // Don't quote a payment we can't fulfil: if every tunnel IP is already on a
   // live lease, refuse before issuing the request. Best-effort (capacity can
   // still vanish between this quote and /pay) — the /pay 503 no_capacity stays
-  // the hard backstop — but it stops us selling into a full subnet. A same-key
-  // renewal reuses its own slot (state.provision), so it's capacity-neutral and
-  // must be let through even when full.
-  const now0 = new Date();
-  const live = (await ctx.store.list(now0)).filter((l) => l.status === 'active');
-  const ownsSlot = live.some((l) => l.clientPublicKey === clientPublicKey);
-  if (!ownsSlot && live.length >= ctx.allocator.capacity) {
+  // the hard backstop — but it stops us selling into a full subnet. A renewal
+  // needs a slot too: its new key runs beside the old one for the switch-over grace.
+  if ((await ctx.store.countOccupied()) >= ctx.allocator.capacity) {
     return json(res, 503, { error: 'sold_out', message: 'All tunnel slots are in use; try again later.' });
   }
 
@@ -334,25 +370,31 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     lockPubkey,
     lockIndex: lock.index,
     tier,
+    ...(typeof renewOf === 'string' && { renewOf }),
     createdAt: now.toISOString(),
     expiresAt: new Date(now.getTime() + config.orderTtlMs).toISOString(),
   };
   await ctx.store.createOrder(order);
+  sendChallenge(req, res, config, order);
+}
 
+/** Answer 402 with the order's payment request (rebuilt the same way each time). */
+function sendChallenge(req: IncomingMessage, res: ServerResponse, config: Config, order: Order): void {
+  const tier = order.tier ?? config.tiers[0]!;
   const creq = buildPaymentRequest({
-    paymentId: orderId,
+    paymentId: order.id,
     amountSats: tier.priceSats,
     mints: config.acceptedMints,
-    lockPubkey,
+    lockPubkey: order.lockPubkey,
     unit: config.unit,
     description: 'cashu-vpn access',
-    transportTarget: `${baseUrl(req, config)}/pay/${orderId}`,
+    transportTarget: `${baseUrl(req, config)}/pay/${order.id}`,
   });
 
   res.writeHead(402, { 'content-type': 'application/json; charset=utf-8', 'x-cashu': creq });
   res.end(JSON.stringify({
     error: 'payment_required',
-    orderId,
+    orderId: order.id,
     creq,
     tier: tier.name,
     quotedSats: tier.priceSats,
@@ -403,7 +445,7 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
   const r = await provisionOrder(ctx, orderId, verified);
   if (r.kind === 'error') {
     if (r.status === 402) console.log(`[pay] order=${tag} rejected: ${r.error}`);
-    if (r.status === 402 || r.status === 503) ctx.payErrors.set(orderId, r.error);
+    if (r.status === 402 || r.status === 409 || r.status === 503) ctx.payErrors.set(orderId, r.error);
     return json(res, r.status, r.status === 402 ? { error: 'payment_failed', detail: r.error } : { error: r.error });
   }
   ctx.payErrors.delete(orderId);
@@ -523,6 +565,11 @@ async function provisionOrder(ctx: Ctx, orderId: string, verified: Authorized): 
         console.error(`[pay] order=${orderId.slice(0, 8)} no_capacity: ${(e as Error).message} (receipt stored, sweepable)`);
         return { kind: 'error', status: 503, error: 'no_capacity' };
       }
+      // The key got a live lease after this order was quoted (the /purchase gate is best-effort).
+      if ((e as { code?: string })?.code === 'KEY_IN_USE') {
+        console.error(`[pay] order=${orderId.slice(0, 8)} key_in_use (receipt stored, sweepable)`);
+        return { kind: 'error', status: 409, error: 'key_in_use' };
+      }
       throw e;
     }
     if (!result) return { kind: 'error', status: 404, error: 'order_not_found' };
@@ -582,6 +629,9 @@ async function runProvision(
     });
   }
 
+  // A fresh PSK per lease, as `wg genpsk` makes: rotates with the lease and adds a
+  // symmetric layer to the handshake (it protects traffic, not the client's identity).
+  const presharedKey = randomBytes(32).toString('base64');
   const result = await store.provision(orderId, {
     purchaseId,
     clientPublicKey,
@@ -590,15 +640,7 @@ async function runProvision(
     capBytes: tier?.capBytes,
     now,
     allocate: (taken) => allocator.allocateTunnelIp(purchaseId, clientPublicKey, taken),
-    // Called by provision() only on a same-key renewal of a still-live lease (peer
-    // present, so cleanup can't be removing it). A read failure aborts the commit —
-    // the buyer retries — rather than baselining to 0 and insta-capping the renewal.
-    readPeerCounter: async () => {
-      if (config.mode !== 'live' || !config.tiers.some((t) => t.capBytes > 0)) return 0;
-      const readTransfers = ctx.readTransfers ?? readPeerTransfers;
-      const t = (await readTransfers(config.wgInterface)).get(clientPublicKey);
-      return t ? t.rx + t.tx : 0;
-    },
+    presharedKey,
     renderConfig: (tunnelIp, pid) => generateClientConfig({
       tunnelIp,
       serverPublicKey: config.serverPublicKey,
@@ -606,19 +648,19 @@ async function runProvision(
       purchaseId: pid,
       dryRun: config.mode === 'dry-run',
       dns: config.dns,
+      presharedKey,
     }),
   });
   if (!result) return undefined;
 
   // Make WireGuard match the just-committed lease. Best-effort, under the shared wg
   // lock (so it can't interleave with cleanup's remove on the same key). A failure is
-  // logged, not rolled back — housekeep's reconcile re-adds the peer. A renewal reuses
-  // the live peer's key+IP, so this `wg set` is a harmless no-op there.
+  // logged, not rolled back — housekeep's reconcile re-adds the peer.
   if (config.mode === 'live' && !result.alreadyReady && result.order.lease) {
     const exec = ctx.execPlan ?? executePlan;
-    const { clientPublicKey: key, tunnelIp } = result.order.lease;
+    const { clientPublicKey: key, tunnelIp, presharedKey: psk } = result.order.lease;
     try {
-      await ctx.wgLock(() => exec(planAddPeer(config.wgInterface, key, tunnelIp)));
+      await ctx.wgLock(() => exec(planAddPeer(config.wgInterface, key, tunnelIp, psk)));
     } catch (e) {
       console.error(`wg apply failed for ${result.order.purchaseId} (${tunnelIp}); reconcile will retry:`, e instanceof Error ? e.message : e);
     }
@@ -626,7 +668,7 @@ async function runProvision(
 
   // Tell the operator about a genuinely new sale. alreadyReady filters out the
   // idempotent re-deliveries (a wallet re-POSTing to a ready order), so a sale is
-  // announced exactly once; a same-key renewal mints a new lease and counts as one.
+  // announced exactly once; a renewal mints a new lease and counts as one.
   if (!result.alreadyReady && result.order.lease) {
     ctx.notifier.saleProvisioned({
       orderId: result.order.id,
@@ -800,7 +842,7 @@ Prices, plans, accepted mints and the operator notice: GET /info
    Keep the DLEQ proofs (NUT-12) on pre-v3 keysets; proofs without them are refused.
 4. POST /pay/<orderId> {"id": "<orderId>", "mint": "<mint url>", "unit": "${config.unit}", "proofs": [...]}
    (or {"token": "<encoded token>"}) -> 200 {status: "ready", clientConfig, tunnelIp, lease}
-5. In clientConfig, replace "# PrivateKey = <generate locally>" with "PrivateKey = <your private key>",
+5. In clientConfig (it carries a per-lease PresharedKey), replace "# PrivateKey = <generate locally>" with "PrivateKey = <your private key>",
    then bring the tunnel up (wg-quick, or the WireGuard app).
 
 A NUT-18 wallet can pay the creq itself instead; then poll GET /order/<orderId> until status is "ready".
@@ -808,8 +850,11 @@ Unpaid orders expire after ${Math.round(config.orderTtlMs / 60000)} minutes. A p
 
 ## Renew
 
-POST /purchase with the same clientPublicKey while the lease is live, then pay as above.
-Keeps the tunnel IP, extends from the current expiry and resets the data cap.
+Generate a NEW key pair, then POST /purchase {"clientPublicKey": "<new public key>", "renew": "<orderId>"}
+while that order's lease is live, and pay as above. The new lease starts where the old one ends, with
+its own key, tunnel IP and preshared key; the old config stops 15 minutes after the renewal is paid. A key with a
+live lease can't be bought again (409 key_in_use), so keys rotate rather than renew. A renewal may
+leave at most two of the plan's periods prepaid; earlier, it is refused with 400 renew_too_early and opensAt.
 
 ## Errors
 
@@ -818,7 +863,8 @@ Keeps the tunnel IP, extends from the current expiry and resets the data cap.
 - invalid_signature: mint signature missing or invalid (DLEQ proofs, or BLS on v3 keysets)
 - amount_too_low (after input fees), mint_not_accepted, wrong_unit
 - too_many_proofs: use a normal split (about one proof per set bit of the amount)
-/purchase returns 400 unknown_tier, 429 rate_limited or 503 sold_out.
+/purchase returns 400 unknown_tier, renew_not_live or renew_too_early, 409 key_in_use or order_pending, 429 rate_limited or 503 sold_out.
+Retrying /purchase with the same body for a key with an unpaid order returns that same order and request.
 ${REPO_URL ? `\nSource: ${REPO_URL}\n` : ''}`;
 }
 
