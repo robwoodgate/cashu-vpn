@@ -1,36 +1,28 @@
 /**
- * Cashu payment — NUT-24 (HTTP 402) with NON-CUSTODIAL verification.
+ * Cashu payment: a 402 with a NUT-18 request, verified NON-CUSTODIALLY.
  *
- * The daemon NEVER holds spendable ecash. The PaymentRequest demands proofs
- * NUT-11 P2PK-locked to the operator's pubkey; the operator's PRIVATE key never
- * touches the box. On the paid retry the daemon verifies the token ENTIRELY
- * OFFLINE — no swap, no per-sale mint call:
+ * The daemon NEVER holds spendable ecash. Each order's request demands proofs locked to a fresh
+ * xpub child key (locks.ts) whose private key never touches the box, and the delivered token is
+ * verified ENTIRELY OFFLINE, with no swap and no per-sale mint call:
  *
- *   1. getTokenMetadata()      — local mint + amount pre-check
- *   2. hasValidDleq()  (NUT-12) — proves the mint genuinely signed it, checked
- *                                 offline against the mint's public keyset
- *   3. P2PK witness pubkeys (NUT-11) include the operator's pubkey — only the
- *                                 operator can ever spend it
+ *   1. getTokenMetadata(): mint and unit pre-check
+ *   2. isMintSigned(): the mint signed each proof (NUT-12 DLEQ, or BLS on v3)
+ *   3. isPaymentRequestSatisfied(): exactly the requested lock (nut10, or nutroot on v3), netting
+ *      the price after input fees
+ *   4. a proof-count cap against dust griefing
  *
- * The only mint interaction is loadMint() to fetch public keysets, cached per
- * mint for a TTL. The buyer's wallet does all the minting (rate limits fan out
- * across clients). Received tokens are stored locked; the operator sweeps them
- * offline with their key.
- *
- * The lock pubkey is chosen by the caller (server.ts): a fixed operator pubkey,
- * or a fresh xpub-derived per-transaction pubkey (locks.ts) so the mint can't
- * correlate an operator's payments. verifyPayment returns the lock pubkey it
- * found; the caller authorizes it.
+ * The only mint interaction is loadMint() to fetch public keysets, cached per mint for a TTL.
+ * Received tokens are stored locked; the operator sweeps them offline with their key.
  */
 
 import {
   PaymentRequestBuilder,
   getTokenMetadata,
   getDecodedToken,
-  hasValidDleq,
-  getP2PKExpectedWitnessPubkeys,
+  verifyReceivedProofs,
   Wallet,
   sumProofs,
+  type PaymentRequest,
   type Proof,
   type TokenMetadata,
   type HasKeysetKeys,
@@ -54,19 +46,18 @@ export function normalizePubkey(k: string): string {
 }
 
 /**
- * True if a NUT-11 P2PK secret carries a locktime/refund escape — i.e. someone
- * other than the lock holder could reclaim the proofs later. Reject those so the
- * operator is the sole, permanent spender. Fails open (returns false) if the
- * secret can't be parsed; the witness-pubkey check already confirmed it is P2PK.
+ * The request every order quotes: `amountSats` net of input fees, locked to `lockPubkey`.
+ * Carries both encodings (NUT-18): nutroot as a NUMS tree with one unblinded leaf, which a
+ * watch-only payee can check (a key-path lock needs the private key, NUT-28), plus a nut10 twin.
  */
-function hasEscapeClause(secret: string): boolean {
-  try {
-    const parsed = JSON.parse(secret) as [string, { tags?: string[][] }];
-    const tags = parsed?.[1]?.tags ?? [];
-    return tags.some((t) => Array.isArray(t) && (t[0] === 'locktime' || t[0] === 'refund'));
-  } catch {
-    return false;
-  }
+export function lockedRequest(opts: { amountSats: number; mints: string[]; lockPubkey: string; unit?: string }): PaymentRequestBuilder {
+  // The builder validates what the lenient PaymentRequest class does not: the
+  // lock pubkey must be compressed and on-curve, and mint URLs must parse.
+  return new PaymentRequestBuilder()
+    .amount(opts.amountSats, opts.unit ?? 'sat')
+    .addMint(opts.mints)
+    .lock({ leaves: [{ type: 'threshold', n: 1, keys: [opts.lockPubkey] }] })
+    .nut10({ kind: 'P2PK', data: opts.lockPubkey, tags: [] });
 }
 
 /**
@@ -88,13 +79,7 @@ export function buildPaymentRequest(opts: {
   description?: string;
   transportTarget?: string;
 }): string {
-  // The builder validates what the lenient PaymentRequest class does not: the
-  // lock pubkey must be compressed and on-curve, and mint URLs must parse.
-  const builder = new PaymentRequestBuilder()
-    .id(opts.paymentId)
-    .amount(opts.amountSats, opts.unit ?? 'sat')
-    .addMint(opts.mints)
-    .lock({ kind: 'P2PK', data: opts.lockPubkey });
+  const builder = lockedRequest(opts).id(opts.paymentId);
   if (opts.description) builder.description(opts.description);
   if (opts.transportTarget) builder.addHttpPostTransport(opts.transportTarget);
   return builder.build().toEncodedCreqA();
@@ -134,8 +119,17 @@ export interface VerifyDeps {
   getMetadata?: (token: string) => TokenMetadata;
   loadMintContext?: (mint: string, unit: string) => Promise<MintContext>;
   decode?: (token: string, keysetIds: string[]) => Proof[];
-  checkDleq?: (proof: Proof, keyset: HasKeysetKeys) => boolean;
-  witnessPubkeys?: (secret: string) => string[];
+  checkMintSignature?: (proof: Proof, keyset: HasKeysetKeys) => Promise<boolean>;
+  checkRequest?: (request: PaymentRequest, proofs: Proof[], mint: string, unit: string) => Promise<boolean>;
+}
+
+/**
+ * True if the mint signed this proof: DLEQ (NUT-12) on v0-v2 keysets, the BLS pairing on v3.
+ * `require: true` refuses a proof with no DLEQ, which the spec default would pass.
+ */
+async function isMintSigned(proof: Proof, keyset: HasKeysetKeys): Promise<boolean> {
+  const { invalid } = await verifyReceivedProofs([proof], () => keyset, { require: true });
+  return invalid.length === 0;
 }
 
 function amountToNumber(a: unknown): number {
@@ -177,23 +171,26 @@ const defaultLoadMintContext = async (mint: string, unit: string): Promise<MintC
   };
 };
 
+/** True if the proofs settle `request` (lock + net amount); throws if they don't carry its lock. */
+async function requestSatisfied(request: PaymentRequest, proofs: Proof[], mint: string, unit: string): Promise<boolean> {
+  return (await getCachedWallet(mint, unit)).isPaymentRequestSatisfied(request, proofs);
+}
+
 /**
  * Verify a delivered Cashu token fully offline (no swap, no per-sale mint call).
  * Returns the operator-locked token + proof secrets on success.
  */
 export async function verifyPayment(
   encodedToken: string,
-  opts: { acceptedMints: string[]; requiredSats: number; unit?: string; proofCountMargin?: number },
+  opts: { acceptedMints: string[]; requiredSats: number; lockPubkey: string; unit?: string; proofCountMargin?: number },
   deps: VerifyDeps = {},
 ): Promise<VerifyResult> {
   const unit = opts.unit ?? 'sat';
   const getMetadata = deps.getMetadata ?? getTokenMetadata;
   const loadMintContext = deps.loadMintContext ?? defaultLoadMintContext;
   const decode = deps.decode ?? ((t, ids) => getDecodedToken(t, ids).proofs);
-  // require:true — the spec-default verify-if-present would pass a proof with no
-  // DLEQ at all, and offline verification is only as good as the DLEQ it checks.
-  const checkDleq = deps.checkDleq ?? ((p, k) => hasValidDleq(p, k, { require: true }));
-  const witnessPubkeys = deps.witnessPubkeys ?? getP2PKExpectedWitnessPubkeys;
+  const checkMintSignature = deps.checkMintSignature ?? isMintSigned;
+  const checkRequest = deps.checkRequest ?? requestSatisfied;
 
   let meta: TokenMetadata;
   try {
@@ -228,10 +225,6 @@ export async function verifyPayment(
     return { valid: false, amountSats: 0, error: 'no_proofs' };
   }
 
-  // Every proof must be DLEQ-valid and P2PK-locked to one consistent pubkey.
-  // The caller authorizes that pubkey (fixed operator key, or an issued xpub
-  // child — see server.ts).
-  let lockPubkey: string | undefined;
   for (const proof of proofs) {
     let keyset: HasKeysetKeys;
     try {
@@ -239,47 +232,29 @@ export async function verifyPayment(
     } catch {
       return { valid: false, amountSats: 0, error: 'unknown_keyset' };
     }
-    // NUT-12: proof is genuinely mint-signed (verified offline). hasValidDleq
-    // throws on a proof amount the keyset has no key for — same verdict.
-    let dleqOk: boolean;
+    // Proof is genuinely mint-signed (verified offline); a throw counts as unsigned.
+    let signed: boolean;
     try {
-      dleqOk = checkDleq(proof, keyset);
+      signed = await checkMintSignature(proof, keyset);
     } catch {
-      dleqOk = false;
+      signed = false;
     }
-    if (!dleqOk) {
-      return { valid: false, amountSats: 0, error: 'invalid_dleq' };
-    }
-    // NUT-11: require a SINGLE-signer P2PK lock with no refund/locktime escape,
-    // so the lock-key holder is the sole, permanent spender — a buyer can't lock
-    // with a multisig or a refund path and reclaim the proofs after getting access.
-    // A plain (non-P2PK) secret isn't JSON, so getP2PKExpectedWitnessPubkeys
-    // throws — treat that as unlocked (many wallets ignore the PR's nut10 lock and
-    // send ordinary ecash; we reject it rather than custody spendable proofs).
-    let wits: string[];
-    try {
-      wits = witnessPubkeys(proof.secret).map(normalizePubkey).filter(Boolean);
-    } catch {
-      return { valid: false, amountSats: 0, error: 'not_locked' };
-    }
-    if (wits.length === 0) {
-      return { valid: false, amountSats: 0, error: 'not_locked' };
-    }
-    if (wits.length > 1) {
-      return { valid: false, amountSats: 0, error: 'multisig_lock' };
-    }
-    if (hasEscapeClause(proof.secret)) {
-      return { valid: false, amountSats: 0, error: 'refundable_lock' };
-    }
-    if (lockPubkey === undefined) {
-      lockPubkey = wits[0];
-    } else if (wits[0] !== lockPubkey) {
-      return { valid: false, amountSats: 0, error: 'inconsistent_lock' };
+    if (!signed) {
+      return { valid: false, amountSats: 0, error: 'invalid_signature' };
     }
   }
 
+  // Exactly the requested lock (nut10, or the nutroot tree on v3) with no refund or extra
+  // signer, and enough to net the price after input fees (NUT-18). A throw is a lock failure.
   const amountSats = amountToNumber(sumProofs(proofs));
-  if (amountSats < opts.requiredSats) {
+  const request = lockedRequest({ amountSats: opts.requiredSats, mints: opts.acceptedMints, lockPubkey: opts.lockPubkey, unit }).build();
+  let satisfied: boolean;
+  try {
+    satisfied = await checkRequest(request, proofs, mint, unit);
+  } catch {
+    return { valid: false, amountSats, error: 'lock_mismatch' };
+  }
+  if (!satisfied) {
     return { valid: false, amountSats, error: 'amount_too_low' };
   }
 
@@ -299,6 +274,6 @@ export async function verifyPayment(
     mint,
     token: encodedToken,
     secrets: proofs.map((p) => p.secret),
-    lockPubkey,
+    lockPubkey: normalizePubkey(opts.lockPubkey),
   };
 }

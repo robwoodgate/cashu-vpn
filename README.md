@@ -190,9 +190,9 @@ buyer                              daemon                         mint
   │  GET /order/:orderId (poll) ────►│  ◄ ready + WireGuard .conf   │
 ```
 
-The design is non-custodial by construction. The payment request demands proofs locked to a key you control, using NUT-11 pay-to-public-key. cashu-vpn stores those locked proofs but cannot spend them, because only your offline key can. The server therefore never holds spendable money.
+The design is non-custodial by construction. The payment request demands proofs locked to a key you control, in both encodings NUT-18 allows: a nutroot tree for mints on v3 (BLS) keysets, and NUT-11 pay-to-public-key for older ones. The nutroot lock puts your key in a leaf of a script-only tree, so the server can check it without the private key. cashu-vpn stores those locked proofs but cannot spend them, because only your offline key can. The server therefore never holds spendable money.
 
-Payments are verified entirely offline, with no swap and no per-sale call to the mint. When proofs arrive cashu-vpn checks, against a cached copy of the mint's public keys, that the mint genuinely signed them (NUT-12 DLEQ), that they are locked to your key, that the amount covers the price, that the mint is one you accept, and that they are not a replay. Because the buyer's wallet does the minting, your server never generates mint traffic of its own.
+Payments are verified entirely offline, with no swap and no per-sale call to the mint. When proofs arrive cashu-vpn checks, against a cached copy of the mint's public keys, that the mint genuinely signed them (NUT-12 DLEQ, or the BLS pairing on v3), that they carry exactly the requested lock, that the amount covers the price after the mint's input fees, that the mint is one you accept, and that they are not a replay. Because the buyer's wallet does the minting, your server never generates mint traffic of its own.
 
 Privacy comes from the xpub. With `OPERATOR_XPUB` set, every sale is locked to a fresh derived key, so the mint cannot tie your sales together, and you sweep them all with the matching offline key. The fresh-per-sale lock is also what makes each payment single-use: a token is bound to the one order it was issued for, so a spent token can't be replayed for another lease.
 

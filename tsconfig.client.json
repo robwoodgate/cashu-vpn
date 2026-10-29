@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "lib": ["ES2022", "DOM"],
+    "types": [],
+    "module": "ESNext",
+    "moduleResolution": "Bundler"
+  },
+  "comment": "Type-checks the browser bundle (src/client.ts) with DOM types; esbuild does the emit.",
+  "include": ["src/client.ts", "src/icons/svg.d.ts"],
+  "exclude": []
+}

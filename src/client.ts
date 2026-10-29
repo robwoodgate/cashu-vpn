@@ -17,7 +17,7 @@
 
 import { Wallet } from '@cashu/cashu-ts';
 import qrcode from 'qrcode-generator';
-import { decodeChallenge, waitForPaid, mintLockedPayload, type MintWallet, type MintQuote, type PaymentPayload, type Challenge } from './buyer.js';
+import { decodeChallenge, waitForPaid, mintLockedPayload, mintAmount, type MintWallet, type MintQuote, type PaymentPayload, type Challenge } from './buyer.js';
 // Inlined as data-URIs by esbuild (--loader:.svg=dataurl). Centre-overlay marks for
 // the Cashu / Lightning QR tabs; the unified (BIP-321) tab shows none.
 import cashuIcon from './icons/cashu.svg';
@@ -39,7 +39,8 @@ interface OrderRec {
   // minting a fresh invoice — which would orphan a paid-but-unminted quote (lost
   // sats) and leave any already-shown invoice unwatched.
   mintQuote?: string;
-  mintInvoice?: string;
+  // Private key the mint quote is locked to; without it a paid quote can't be minted.
+  mintQuoteKey?: string;
   // The minted NUT-18 proofs, persisted between mint and a confirmed delivery so a
   // reload re-delivers them rather than stranding paid ecash (minting isn't
   // idempotent). Cleared once the order is ready.
@@ -95,7 +96,7 @@ let currentOrderId = '';
 const polling = new Set<string>();
 
 async function genKeys(): Promise<void> {
-  const kp = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
+  const kp = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']) as CryptoKeyPair;
   const pub = await crypto.subtle.exportKey('jwk', kp.publicKey);
   const prv = await crypto.subtle.exportKey('jwk', kp.privateKey);
   pubKey = b64(pub.x as string);
@@ -247,7 +248,7 @@ async function armLightning(orderId: string, creq: string): Promise<void> {
   try {
     const wallet = new Wallet(challenge.mintUrl, { unit: challenge.unit });
     await wallet.loadMint();
-    const w = wallet as unknown as MintWallet;
+    const w: MintWallet = wallet;
     const rec = loadOrders().find((o) => o.id === orderId);
 
     // Already minted in a prior session: the proofs were persisted BEFORE delivery
@@ -263,12 +264,14 @@ async function armLightning(orderId: string, creq: string): Promise<void> {
     // Reuse a persisted quote across reloads; only mint a fresh one for a new order,
     // so a reload never strands a paid quote behind a brand-new invoice.
     let quote: MintQuote;
+    let quoteKey = rec?.mintQuoteKey;
     if (rec?.mintQuote) {
-      const { state } = await w.checkMintQuoteBolt11(rec.mintQuote);
-      quote = { quote: rec.mintQuote, request: rec.mintInvoice, state };
+      quote = await w.checkMintQuoteBolt11(rec.mintQuote);
     } else {
-      quote = await w.createMintQuoteBolt11(challenge.amount);
-      upsertOrder({ id: orderId, mintQuote: quote.quote, mintInvoice: quote.request });
+      const { pubkey, privkey } = await w.createQuoteLockKey();
+      quote = await w.createMintQuoteBolt11(mintAmount(w, challenge), pubkey);
+      quoteKey = privkey;
+      upsertOrder({ id: orderId, mintQuote: quote.quote, mintQuoteKey: privkey });
     }
     const bolt11 = quote.request ?? '';
     if (currentOrderId !== orderId) return; // a newer order took over while we waited
@@ -296,7 +299,7 @@ async function armLightning(orderId: string, creq: string): Promise<void> {
       : await waitForPaid(w, quote.quote, { intervalMs: 2000, tries: 150 });
     if (!paid || currentOrderId !== orderId) return;
     setMsg('Minting & delivering…');
-    const payload = await mintLockedPayload(w, challenge, quote);
+    const payload = await mintLockedPayload(w, challenge, quote, quoteKey);
     // Persist the proofs BEFORE delivery so a crash/close between here and the POST
     // can re-deliver them on reload (above) instead of stranding paid ecash.
     upsertOrder({ id: orderId, payload });
@@ -342,8 +345,8 @@ function errText(e: unknown): string {
 
 // Buyer-facing text for a /pay rejection reported via the /order poll.
 function payErrorText(code: string): string {
-  if (code === 'not_locked' || code === 'lock_mismatch') {
-    return 'Your wallet paid without the required P2PK lock, so the payment was refused and your funds stayed in your wallet. Please use the Auto or Lightning tab instead.';
+  if (code === 'lock_mismatch') {
+    return 'Your wallet paid without the requested lock, so the payment was refused and your funds stayed in your wallet. Please use the Auto or Lightning tab instead.';
   }
   if (code === 'no_capacity') return 'Payment received but no tunnel slots are free — contact the operator for a refund.';
   return 'Payment was refused (' + code + '). Your funds stayed in your wallet — try the Auto or Lightning tab.';

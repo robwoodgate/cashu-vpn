@@ -24,14 +24,14 @@ import {
 import { serialize } from '../src/serialize.js';
 import type { PeerLease } from '../src/peers.js';
 import { HDKey } from '@scure/bip32';
-import { createP2PKsecret, getP2PKExpectedWitnessPubkeys } from '@cashu/cashu-ts';
-import { buildPaymentRequest, normalizeMintUrl, normalizePubkey, verifyPayment, popcount, type VerifyDeps } from '../src/cashu.js';
+import { OutputData, PaymentRequestBuilder, Wallet, createP2PKsecret, getP2PKExpectedWitnessPubkeys, isBlsKeyset, type PaymentRequest, type Proof } from '@cashu/cashu-ts';
+import { buildPaymentRequest, lockedRequest, normalizeMintUrl, normalizePubkey, verifyPayment, popcount, type VerifyDeps } from '../src/cashu.js';
 import { discover, parseRouteSrcIp } from '../src/discover.js';
 import { deriveChildPubkey, deriveChildKeypair, isPrivateExtendedKey } from '../src/hdkeys.js';
 import { generateOperatorKeys } from '../src/keygen.js';
 import { createLockBook } from '../src/locks.js';
 import { planSweep, sweepAll, filterUnswept, pruneSpent } from '../src/sweep.js';
-import { decodeChallenge, waitForPaid } from '../src/buyer.js';
+import { decodeChallenge, waitForPaid, mintLockedPayload, mintAmount } from '../src/buyer.js';
 import { createRateLimiter } from '../src/ratelimit.js';
 import type { ReceivedPayment } from '../src/wallet.js';
 import { createServer } from '../src/server.js';
@@ -682,13 +682,13 @@ function okDeps(over: Record<string, unknown> = {}) {
       getKeyset: () => ({ id: 'k1', keys: {} as never }),
     }),
     decode: () => [{ id: 'k1', secret: 's1', amount: 260 }] as never,
-    checkDleq: () => true,
-    witnessPubkeys: () => [OP_PUBKEY],
+    checkMintSignature: async () => true,
+    checkRequest: async () => true,
     ...over,
   };
 }
 
-const VERIFY_OPTS = { acceptedMints: ['https://good.mint'], requiredSats: 250, unit: 'sat' };
+const VERIFY_OPTS = { acceptedMints: ['https://good.mint'], requiredSats: 250, lockPubkey: OP_PUBKEY, unit: 'sat' };
 
 test('verifyPayment rejects an unaccepted mint', async () => {
   const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
@@ -699,43 +699,17 @@ test('verifyPayment rejects an unaccepted mint', async () => {
 });
 
 test('verifyPayment rejects a proof that fails DLEQ', async () => {
-  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({ checkDleq: () => false }));
+  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({ checkMintSignature: async () => false }));
   assert.equal(r.valid, false);
-  assert.equal(r.error, 'invalid_dleq');
+  assert.equal(r.error, 'invalid_signature');
 });
 
-test('verifyPayment rejects an unlocked proof', async () => {
-  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({ witnessPubkeys: () => [] }));
-  assert.equal(r.valid, false);
-  assert.equal(r.error, 'not_locked');
-});
-
-test('verifyPayment rejects a plain (non-P2PK) secret without throwing', async () => {
-  // Real wallets that ignore the PR's nut10 lock send ordinary ecash, whose
-  // secret is plain hex — getP2PKExpectedWitnessPubkeys throws on it. Must be a
-  // clean not_locked rejection, not a 500.
+test('verifyPayment rejects proofs that do not carry the requested lock', async () => {
   const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
-    witnessPubkeys: () => { throw new Error('Can\'t parse secret'); },
+    checkRequest: async () => { throw new Error('nut10 request: proof lock is not the requested spending condition'); },
   }));
   assert.equal(r.valid, false);
-  assert.equal(r.error, 'not_locked');
-});
-
-test('verifyPayment rejects a multisig lock (not sole operator)', async () => {
-  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
-    witnessPubkeys: () => [OP_PUBKEY, '02' + 'b'.repeat(64)],
-  }));
-  assert.equal(r.valid, false);
-  assert.equal(r.error, 'multisig_lock');
-});
-
-test('verifyPayment rejects a lock with a refund/locktime escape', async () => {
-  const secret = JSON.stringify(['P2PK', { nonce: 'n', data: OP_PUBKEY, tags: [['locktime', '1']] }]);
-  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
-    decode: () => [{ id: 'k1', secret, amount: 260 }] as never,
-  }));
-  assert.equal(r.valid, false);
-  assert.equal(r.error, 'refundable_lock');
+  assert.equal(r.error, 'lock_mismatch');
 });
 
 test('verifyPayment rejects a wrong-unit token', async () => {
@@ -746,20 +720,8 @@ test('verifyPayment rejects a wrong-unit token', async () => {
   assert.equal(r.error, 'wrong_unit');
 });
 
-test('verifyPayment rejects inconsistent lock pubkeys across proofs', async () => {
-  let n = 0;
-  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
-    decode: () => [{ id: 'k1', secret: 's1', amount: 130 }, { id: 'k1', secret: 's2', amount: 130 }] as never,
-    witnessPubkeys: () => [n++ === 0 ? OP_PUBKEY : '02' + 'b'.repeat(64)],
-  }));
-  assert.equal(r.valid, false);
-  assert.equal(r.error, 'inconsistent_lock');
-});
-
 test('verifyPayment rejects too-low amount', async () => {
-  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
-    decode: () => [{ id: 'k1', secret: 's1', amount: 100 }] as never,
-  }));
+  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({ checkRequest: async () => false }));
   assert.equal(r.valid, false);
   assert.equal(r.error, 'amount_too_low');
 });
@@ -1181,7 +1143,8 @@ test('decodeChallenge extracts amount/mint/unit/lock from a creqA', () => {
   assert.equal(c.amount, 250);
   assert.equal(c.mintUrl, 'https://mint.example.com');
   assert.equal(c.unit, 'sat');
-  assert.equal(c.lockPubkey, OP_PUBKEY);
+  assert.equal(c.request.nut10?.data, OP_PUBKEY);
+  assert.ok(c.request.toNutrootOptions(), 'carries the nutroot encoding too');
 });
 
 test('waitForPaid resolves once the quote is PAID', async () => {
@@ -1190,6 +1153,48 @@ test('waitForPaid resolves once the quote is PAID', async () => {
   const ok = await waitForPaid(wallet as never, 'q', { tries: 5, sleep: async () => {} });
   assert.equal(ok, true);
   assert.equal(n, 3);
+});
+
+// A fake wallet that records what mintLockedPayload asks the mint for.
+function fakeMintWallet(keysetId: string) {
+  const minted: { amount: number; lock: Record<string, unknown>; key?: string }[] = [];
+  const wallet = {
+    getKeyset: () => ({ id: keysetId }),
+    getFeesForKeyset: (n: number) => ({ toNumber: () => Math.ceil((n * 100) / 1000) }), // 100 ppk
+    ops: {
+      mintBolt11: (amount: number) => ({
+        asLocked: (lock: Record<string, unknown>) => {
+          const rec: (typeof minted)[number] = { amount, lock };
+          const step = { privkey: (k: string) => { rec.key = k; return step; }, run: async () => { minted.push(rec); return []; } };
+          return step;
+        },
+      }),
+    },
+  };
+  return { wallet, minted };
+}
+
+test('mintLockedPayload signs a locked quote with its key, and leaves a legacy unlocked one unsigned', async () => {
+  const challenge = decodeChallenge(buildPaymentRequest({ paymentId: 'x', amountSats: 500, mints: ['https://mint.example.com'], lockPubkey: OP_PUBKEY }));
+  const { wallet, minted } = fakeMintWallet('00ad268c4d1f5826');
+  await mintLockedPayload(wallet as never, challenge, { quote: 'q' } as never, 'quote-sk');
+  await mintLockedPayload(wallet as never, challenge, { quote: 'q' } as never);
+  assert.deepEqual(minted.map((m) => m.key), ['quote-sk', undefined]);
+});
+
+test('mintLockedPayload mints the lock encoding the keyset takes, grossed up for input fees', async () => {
+  const challenge = decodeChallenge(buildPaymentRequest({ paymentId: 'x', amountSats: 500, mints: ['https://mint.example.com'], lockPubkey: OP_PUBKEY }));
+  const legacy = fakeMintWallet('00ad268c4d1f5826');
+  await mintLockedPayload(legacy.wallet as never, challenge, { quote: 'q' } as never, 'k');
+  assert.deepEqual(legacy.minted[0]!.lock.mainKeys, [OP_PUBKEY]); // NUT-11 lock
+  assert.equal(legacy.minted[0]!.lock.leaves, undefined);
+  const v3 = fakeMintWallet('02' + 'f'.repeat(64));
+  await mintLockedPayload(v3.wallet as never, challenge, { quote: 'q' } as never, 'k');
+  assert.equal(v3.minted[0]!.lock.mainKeys, undefined); // nutroot: NUMS tree, key in a leaf
+  assert.deepEqual((v3.minted[0]!.lock.leaves as { keys: string[] }[])[0]!.keys, [OP_PUBKEY]);
+  // 501 splits into 7 proofs, 1 sat fee at 100 ppk: the payee still nets 500.
+  assert.equal(legacy.minted[0]!.amount, 501);
+  assert.equal(mintAmount(legacy.wallet as never, challenge), 501);
 });
 
 test('waitForPaid times out if never paid', async () => {
@@ -1558,7 +1563,7 @@ test('property: an honest power-of-two split never trips the dust guard', async 
     const proofs = parts.map((amount, i) => ({ id: 'k1', secret: `s${t}_${i}`, amount }));
     const r = await verifyPayment(
       'tok',
-      { acceptedMints: ['https://good.mint'], requiredSats: n, unit: 'sat', proofCountMargin: 0 },
+      { acceptedMints: ['https://good.mint'], requiredSats: n, lockPubkey: OP_PUBKEY, unit: 'sat', proofCountMargin: 0 },
       okDeps({ decode: () => proofs as never }),
     );
     assert.equal(r.valid, true, `honest split must verify (n=${n})`);
@@ -1765,8 +1770,8 @@ function slowProofStore(delayMs: number) {
 }
 
 // A fake token "idx:N" that verifies as 1000 sat locked to xpub child N. The proof
-// secret encodes the index so witnessPubkeys can return the matching child pubkey —
-// so a test can mint a "token" for any order's lock. The loadMintContext delay
+// secret encodes the index, and checkRequest throws unless that child is the
+// requested lock, so a test can mint a "token" for any order's lock. The loadMintContext delay
 // converges concurrent requests so they actually contend on the per-order guard.
 const fakeToken = (idx: number): string => `idx:${idx}`;
 function xpubVerifyDeps(xpub: string): VerifyDeps {
@@ -1774,8 +1779,12 @@ function xpubVerifyDeps(xpub: string): VerifyDeps {
     getMetadata: () => ({ mint: 'https://mint.example.com', amount: 1000, unit: 'sat' }) as never,
     loadMintContext: async () => { await slept(20); return { keysetIds: ['k1'], getKeyset: () => ({ id: 'k1', keys: {} as never }) }; },
     decode: (t) => [{ id: 'k1', secret: `sec-${String(t).split(':')[1]}`, amount: 1000 }] as never,
-    checkDleq: () => true,
-    witnessPubkeys: (secret) => [deriveChildPubkey(xpub, Number(String(secret).split('-')[1]))],
+    checkMintSignature: async () => true,
+    checkRequest: async (request, proofs) => {
+      const held = deriveChildPubkey(xpub, Number(String(proofs[0]!.secret).split('-')[1]));
+      if (held !== request.nut10?.data) throw new Error('proof lock is not the requested spending condition');
+      return true;
+    },
   };
 }
 
@@ -1986,37 +1995,96 @@ test('a fresh provision whose wg apply fails still commits; reconcile adds the p
   }, LIVE_ENV, { store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: execPlan as never, lockBook });
 });
 
-// --- Real P2PK secret parsing through verifyPayment (offline, no mint) ---
+// --- Real CTS request checks (offline, no mint) ---
 //
-// The witness-pubkey extraction is the half of verification that breaks silently
-// on a cashu-ts upgrade. Other verify tests fake witnessPubkeys; these drive the
-// REAL getP2PKExpectedWitnessPubkeys (and the real escape-clause parse) end-to-end
-// through verifyPayment, with only DLEQ + mint context faked. DLEQ itself needs a
-// mint-signed proof — covered by the live deploy check, not here.
+// The lock and net-amount half of verification is CTS's isPaymentRequestSatisfied. These run it
+// for real on wallets loaded from captured keysets (testnut v1 and a local v3 BLS mint, both
+// 100 ppk), with proofs built the way a payer builds them. Only the mint signature is faked.
 
-const REAL_P2PK_PUB = deriveChildPubkey(
-  HDKey.fromMasterSeed(new Uint8Array(64).fill(9)).derive("m/1597'/0'").publicExtendedKey, 3,
-);
-const REAL_P2PK_OPTS = { acceptedMints: ['https://good.mint'], requiredSats: 1000, unit: 'sat', proofCountMargin: 0 };
-const realP2PKDeps = (secret: string): VerifyDeps => ({
-  getMetadata: () => ({ mint: 'https://good.mint', amount: 1000, unit: 'sat' }) as never,
-  loadMintContext: async () => ({ keysetIds: ['k1'], getKeyset: () => ({ id: 'k1', keys: {} as never }) }),
-  decode: () => [{ id: 'k1', secret, amount: 1000 }] as never,
-  checkDleq: () => true,
-  // witnessPubkeys left to the real getP2PKExpectedWitnessPubkeys default.
+const MINT_CACHES = JSON.parse(await readFile(new URL('../../test/fixtures/mint-caches.json', import.meta.url), 'utf8'));
+const REAL_XPUB = HDKey.fromMasterSeed(new Uint8Array(64).fill(9)).derive("m/1597'/0'").publicExtendedKey;
+const ORDER_LOCK = deriveChildPubkey(REAL_XPUB, 3);
+const OTHER_LOCK = deriveChildPubkey(REAL_XPUB, 4);
+
+function cachedWallet(kind: 'v1' | 'v3'): Wallet {
+  const { info, cache } = MINT_CACHES[kind];
+  const wallet = new Wallet(cache.mintUrl, { unit: 'sat' });
+  wallet.loadMintFromCache(info, cache);
+  return wallet;
+}
+
+// Proofs as a payer mints them for `pr` on this wallet's keyset, with a placeholder C.
+function payerProofs(wallet: Wallet, pr: PaymentRequest, amount: number): Proof[] {
+  const ks = wallet.getKeyset();
+  const outputs = isBlsKeyset(ks.id)
+    ? OutputData.createNutrootData(pr.toNutrootOptions()!, amount, ks)
+    : OutputData.createP2PKData(pr.toP2PKOptions()!, amount, ks);
+  return outputs.map((o) => ({
+    id: ks.id,
+    amount: o.blindedMessage.amount,
+    secret: typeof o.secret === 'string' ? o.secret : new TextDecoder().decode(o.secret),
+    C: ORDER_LOCK,
+    ...(o.spendInfo && { spend_info: o.spendInfo }),
+  })) as Proof[];
+}
+
+async function verifyReal(wallet: Wallet, proofs: Proof[]) {
+  const mint = wallet.mint.mintUrl;
+  return verifyPayment('tok', { acceptedMints: [mint], requiredSats: 500, lockPubkey: ORDER_LOCK, unit: 'sat', proofCountMargin: 4 }, {
+    getMetadata: () => ({ mint, unit: 'sat' }) as never,
+    loadMintContext: async () => ({ keysetIds: [wallet.getKeyset().id], getKeyset: () => wallet.getKeyset() }),
+    decode: () => proofs,
+    checkMintSignature: async () => true,
+    checkRequest: async (request, ps) => wallet.isPaymentRequestSatisfied(request, ps),
+  });
+}
+
+const orderRequest = (wallet: Wallet, lockPubkey: string) =>
+  lockedRequest({ amountSats: 500, mints: [wallet.mint.mintUrl], lockPubkey }).build();
+
+for (const kind of ['v1', 'v3'] as const) {
+  test(`${kind}: a payer's proofs for the order's request verify, netting the price after fees`, async () => {
+    const wallet = cachedWallet(kind);
+    const r = await verifyReal(wallet, payerProofs(wallet, orderRequest(wallet, ORDER_LOCK), 501));
+    assert.equal(r.valid, true, r.error);
+    assert.equal(r.lockPubkey, normalizePubkey(ORDER_LOCK));
+  });
+
+  test(`${kind}: exactly the price is underpaid once the input fee is due`, async () => {
+    const wallet = cachedWallet(kind);
+    const r = await verifyReal(wallet, payerProofs(wallet, orderRequest(wallet, ORDER_LOCK), 500));
+    assert.equal(r.error, 'amount_too_low');
+  });
+
+  test(`${kind}: proofs locked to another order's key are refused`, async () => {
+    const wallet = cachedWallet(kind);
+    const r = await verifyReal(wallet, payerProofs(wallet, orderRequest(wallet, OTHER_LOCK), 501));
+    assert.equal(r.error, 'lock_mismatch');
+  });
+}
+
+test('v1: a lock with a refund escape is refused', async () => {
+  const wallet = cachedWallet('v1');
+  const escape = new PaymentRequestBuilder().amount(500, 'sat').addMint([wallet.mint.mintUrl])
+    .lock({ kind: 'P2PK', data: ORDER_LOCK, locktime: 9_999_999_999, refundKeys: [OTHER_LOCK] }).build();
+  const r = await verifyReal(wallet, payerProofs(wallet, escape, 501));
+  assert.equal(r.error, 'lock_mismatch');
 });
 
-test('verifyPayment accepts a REAL P2PK secret and recovers the lock pubkey', async () => {
-  const secret = createP2PKsecret(REAL_P2PK_PUB);
-  const r = await verifyPayment('tok', REAL_P2PK_OPTS, realP2PKDeps(secret));
-  assert.equal(r.valid, true);
-  assert.equal(r.lockPubkey, normalizePubkey(REAL_P2PK_PUB));
+test('v1: unlocked ecash is refused', async () => {
+  const wallet = cachedWallet('v1');
+  const ks = wallet.getKeyset();
+  const proofs = OutputData.createRandomData(501, ks).map((o) => ({
+    id: ks.id, amount: o.blindedMessage.amount, secret: new TextDecoder().decode(o.secret as Uint8Array), C: ORDER_LOCK,
+  })) as Proof[];
+  const r = await verifyReal(wallet, proofs);
+  assert.equal(r.error, 'lock_mismatch');
 });
 
-test('verifyPayment rejects a REAL P2PK secret carrying a locktime escape', async () => {
-  // Real secret, real witness extraction (passes), real escape-clause parse (trips).
-  const secret = createP2PKsecret(REAL_P2PK_PUB, [['locktime', '9999999999']]);
-  const r = await verifyPayment('tok', REAL_P2PK_OPTS, realP2PKDeps(secret));
-  assert.equal(r.valid, false);
-  assert.equal(r.error, 'refundable_lock');
+test('v3: a tree with an extra refund leaf is refused', async () => {
+  const wallet = cachedWallet('v3');
+  const escape = new PaymentRequestBuilder().amount(500, 'sat').addMint([wallet.mint.mintUrl])
+    .lock({ leaves: [{ type: 'threshold', n: 1, keys: [ORDER_LOCK] }, { type: 'after', n: 1, time: 9_999_999_999, keys: [OTHER_LOCK] }] }).build();
+  const r = await verifyReal(wallet, payerProofs(wallet, escape, 501));
+  assert.equal(r.error, 'lock_mismatch');
 });

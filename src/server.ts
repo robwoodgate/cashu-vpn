@@ -393,7 +393,7 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
     return json(res, 400, { error: 'invalid_payload', message: 'Expected a NUT-18 payload {mint,unit,proofs} or {token}' });
   }
 
-  const verified = await verifyAndAuthorize(ctx, encodedToken, order.tier?.priceSats ?? ctx.config.priceSats);
+  const verified = await verifyAndAuthorize(ctx, encodedToken, order);
   if ('error' in verified) {
     console.log(`[pay] order=${tag} rejected: ${verified.error}`);
     ctx.payErrors.set(orderId, verified.error);
@@ -456,18 +456,18 @@ async function handleOrderStatus(res: ServerResponse, ctx: Ctx, orderId: string)
 interface Authorized { payment: VerifyResult; lockIndex: number; }
 
 /**
- * Verify a delivered token offline (DLEQ + P2PK + amount + proof cap) and confirm
- * its lock is an xpub child we issued. `requiredSats` is the ORDER's quoted
- * price (tiers price per order, not globally). Returns the verified payment plus
- * that child index (for sweeping), or `{error}`. Replay protection is NOT here —
- * it's the order binding: a token's lock maps to exactly one order, which
- * provisions at most once (see provisionOrder).
+ * Verify a delivered token offline against THIS order's request (its lock key and
+ * quoted price), and confirm that lock is an xpub child we issued. Returns the
+ * verified payment plus that child index (for sweeping), or `{error}`. The order
+ * binding is the replay defense: each lock belongs to one order, which provisions
+ * at most once (see provisionOrder).
  */
-async function verifyAndAuthorize(ctx: Ctx, encodedToken: string, requiredSats: number): Promise<Authorized | { error: string }> {
+async function verifyAndAuthorize(ctx: Ctx, encodedToken: string, order: Order): Promise<Authorized | { error: string }> {
   const { config } = ctx;
   const payment = await verifyPayment(encodedToken, {
     acceptedMints: config.acceptedMints,
-    requiredSats,
+    requiredSats: order.tier?.priceSats ?? config.priceSats,
+    lockPubkey: order.lockPubkey,
     unit: config.unit,
     proofCountMargin: config.proofCountMargin,
   }, ctx.verifyDeps);
@@ -794,9 +794,10 @@ Prices, plans, accepted mints and the operator notice: GET /info
 1. Generate an x25519 WireGuard key pair. Only the public key is ever sent.
 2. POST /purchase {"clientPublicKey": "<base64 public key>", "tier": "<plan name from /info; default: defaultTier>"}
    -> 402 {orderId, creq}. The same creq is in the X-Cashu header.
-3. Decode creq (a NUT-18 payment request). Get proofs for its amount from one of its mints,
-   P2PK-locked (NUT-11) to the pubkey in its nut10 field: single signer, no refund or locktime.
-   Keep the DLEQ proofs (NUT-12); proofs without them are refused.
+3. Decode creq (a NUT-18 payment request) and pay it from one of its mints with exactly its lock:
+   on a v3 keyset the nutroot option (a NUMS tree with one leaf), otherwise the nut10 P2PK option.
+   The amount is net of input fees, so cover them (cashu-ts: wallet.ops.sendToRequest does this).
+   Keep the DLEQ proofs (NUT-12) on pre-v3 keysets; proofs without them are refused.
 4. POST /pay/<orderId> {"id": "<orderId>", "mint": "<mint url>", "unit": "${config.unit}", "proofs": [...]}
    (or {"token": "<encoded token>"}) -> 200 {status: "ready", clientConfig, tunnelIp, lease}
 5. In clientConfig, replace "# PrivateKey = <generate locally>" with "PrivateKey = <your private key>",
@@ -813,9 +814,9 @@ Keeps the tunnel IP, extends from the current expiry and resets the data cap.
 ## Errors
 
 /pay returns 402 {error: "payment_failed", detail}, where detail is eg:
-- not_locked, lock_mismatch: proofs are not locked to this order's nut10 pubkey
-- invalid_dleq: DLEQ proofs missing or invalid
-- amount_too_low, mint_not_accepted, wrong_unit
+- lock_mismatch: proofs do not carry exactly this order's requested lock
+- invalid_signature: mint signature missing or invalid (DLEQ proofs, or BLS on v3 keysets)
+- amount_too_low (after input fees), mint_not_accepted, wrong_unit
 - too_many_proofs: use a normal split (about one proof per set bit of the amount)
 /purchase returns 400 unknown_tier, 429 rate_limited or 503 sold_out.
 ${REPO_URL ? `\nSource: ${REPO_URL}\n` : ''}`;

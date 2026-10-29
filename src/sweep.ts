@@ -102,8 +102,13 @@ function loadWallet(mint: string): Promise<Wallet> {
   return w;
 }
 
-const defaultClaimer: Claimer = async (mint, proofs, privkeys) =>
-  (await loadWallet(mint)).receive(proofs, { privkey: privkeys });
+// v3 receipts are NUMS trees with our key in a leaf, so they spend by script path (planned per
+// proof); pre-v3 receipts are NUT-11 locks the plain privkey signs.
+const defaultClaimer: Claimer = async (mint, proofs, privkeys) => {
+  const wallet = await loadWallet(mint);
+  const plans = wallet.planScriptPaths(proofs, { privkeys });
+  return wallet.ops.receive(proofs).privkey(privkeys).scriptPath(plans).run();
+};
 
 /**
  * Decode a stored (locked) token into its proofs. Needs the mint: tokens on
