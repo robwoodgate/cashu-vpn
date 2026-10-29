@@ -48,6 +48,8 @@ fi
 remove 2>/dev/null || true
 iptables -N "$CHAIN"
 
+# Buyers only reach the internet, never each other's tunnel addresses.
+iptables -A "$CHAIN" -d "$SUBNET" -j DROP
 # Let replies to allowed, already-open connections through.
 iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 # DNS (so names resolve — without this the tunnel looks broken).
