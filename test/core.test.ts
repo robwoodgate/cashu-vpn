@@ -452,6 +452,19 @@ test('GET /info returns config summary', async () => {
   });
 });
 
+test('agent guide is served at /llms.txt and linked from /info and the page', async () => {
+  await withServer(async (url) => {
+    const res = await fetch(`${url}/llms.txt`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') ?? '', /^text\/plain/);
+    const guide = await res.text();
+    assert.match(guide, /POST \/purchase/);
+    assert.match(guide, /# PrivateKey = <generate locally>/);
+    assert.equal((await (await fetch(`${url}/info`)).json()).agentGuide, '/llms.txt');
+    assert.match(await (await fetch(url)).text(), /href="\/llms\.txt"/);
+  });
+});
+
 test('POST /purchase dry-run creates lease without payment', async () => {
   await withServer(async (url) => {
     const res = await fetch(`${url}/purchase`, {

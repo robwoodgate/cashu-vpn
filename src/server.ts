@@ -189,7 +189,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
         notice: config.notice,
         termsUrl: config.termsUrl,
         sourceUrl: REPO_URL || undefined,
+        agentGuide: '/llms.txt',
       });
+    }
+
+    if (req.method === 'GET' && path === '/llms.txt') {
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end(agentGuide(config));
+      return;
     }
 
     if (req.method === 'GET' && path === '/favicon.ico') {
@@ -354,7 +361,7 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     quotedSats: tier.priceSats,
     unit: config.unit,
     acceptedMints: config.acceptedMints,
-    hint: 'Pay the request; a NUT-18 wallet delivers automatically, then poll GET /order/:orderId.',
+    hint: 'Pay the request; a NUT-18 wallet delivers automatically, then poll GET /order/:orderId. Agents: see /llms.txt.',
   }));
 }
 
@@ -776,6 +783,47 @@ function esc(s: string): string {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+// --- Agent guide (/llms.txt) ---
+
+/** Plain-text purchase instructions for automated clients; live prices stay in /info. */
+function agentGuide(config: Config): string {
+  return `# cashu-vpn
+
+Buy short-lived WireGuard VPN access with Cashu ecash. No account: your WireGuard key is the identity.
+Prices, plans, accepted mints and the operator notice: GET /info
+
+## Buy a lease
+
+1. Generate an x25519 WireGuard key pair. Only the public key is ever sent.
+2. POST /purchase {"clientPublicKey": "<base64 public key>", "tier": "<optional plan name from /info>"}
+   -> 402 {orderId, creq}. The same creq is in the X-Cashu header.
+3. Decode creq (a NUT-18 payment request). Get proofs for its amount from one of its mints,
+   P2PK-locked (NUT-11) to the pubkey in its nut10 field: single signer, no refund or locktime.
+   Keep the DLEQ proofs (NUT-12); proofs without them are refused.
+4. POST /pay/<orderId> {"id": "<orderId>", "mint": "<mint url>", "unit": "${config.unit}", "proofs": [...]}
+   (or {"token": "<encoded token>"}) -> 200 {status: "ready", clientConfig, tunnelIp, lease}
+5. In clientConfig, replace "# PrivateKey = <generate locally>" with "PrivateKey = <your private key>",
+   then bring the tunnel up (wg-quick, or the WireGuard app).
+
+A NUT-18 wallet can pay the creq itself instead; then poll GET /order/<orderId> until status is "ready".
+Unpaid orders expire after ${Math.round(config.orderTtlMs / 60000)} minutes. A payment only works for the order it was requested for.
+
+## Renew
+
+POST /purchase with the same clientPublicKey while the lease is live, then pay as above.
+Keeps the tunnel IP, extends from the current expiry and resets the data cap.
+
+## Errors
+
+/pay returns 402 {error: "payment_failed", detail}, where detail is eg:
+- not_locked, lock_mismatch: proofs are not locked to this order's nut10 pubkey
+- invalid_dleq: DLEQ proofs missing or invalid
+- amount_too_low, mint_not_accepted, wrong_unit
+- too_many_proofs: use a normal split (about one proof per set bit of the amount)
+/purchase returns 400 unknown_tier, 429 rate_limited or 503 sold_out.
+${REPO_URL ? `\nSource: ${REPO_URL}\n` : ''}`;
+}
+
 // --- Marketplace page ---
 
 // "1500 sats / 30d" — whole multiples of 24h read as days, anything else stays in hours.
@@ -812,6 +860,7 @@ function renderPage(config: Config): string {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Cashu VPN</title>
+  <link rel="alternate" type="text/plain" href="/llms.txt" title="Agent guide">
   <style>
     :root { color-scheme: dark; --bg: #0b0f14; --panel: #121821; --line: #273241; --text: #eef4fb; --muted: #93a4b7; --accent: #38bdf8; --good: #41d695; --warn: #f4c95d; }
     * { box-sizing: border-box; }
@@ -922,11 +971,11 @@ ${config.notice ? `
     <h2>Your access</h2>
     <div id="access"><div class="empty">No access yet.</div></div>
   </div>
-${config.termsUrl || REPO_URL ? `
   <p style="text-align:center;margin-top:18px">${[
     config.termsUrl ? `<a href="${esc(config.termsUrl)}" target="_blank" rel="noopener">Terms of use</a>` : '',
     REPO_URL ? `<a href="${esc(REPO_URL)}" target="_blank" rel="noopener">Source code</a>` : '',
-  ].filter(Boolean).join(' · ')}</p>` : ''}
+    '<a href="/llms.txt">For agents</a>',
+  ].filter(Boolean).join(' · ')}</p>
 </main>
 <script src="/client.js"></script>
 </body></html>`;
