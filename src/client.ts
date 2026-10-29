@@ -35,6 +35,7 @@ interface OrderRec {
   pub: string;
   status: 'pending' | 'ready';
   renewOf?: string; // the order this one renews, so its record can be cut to the server's grace
+  secret?: string; // proves to the server that this browser placed the order (needed to renew it)
   creq?: string; // the payment request, kept so a pending order can be resumed after a reload
   // The in-browser Lightning mint quote, persisted so a reload reuses it instead of
   // minting a fresh invoice — which would orphan a paid-but-unminted quote (lost
@@ -91,7 +92,7 @@ function pruneOrders(): void {
   if (kept.length !== list.length) saveOrders(kept);
 }
 
-let priv = '', pubKey = '';
+let priv = '', pubKey = '', secret = '';
 let challenge: Challenge | null = null;
 let currentOrderId = '';
 const polling = new Set<string>();
@@ -102,6 +103,8 @@ async function genKeys(): Promise<void> {
   const prv = await crypto.subtle.exportKey('jwk', kp.privateKey);
   pubKey = b64(pub.x as string);
   priv = b64(prv.d as string);
+  const raw = crypto.getRandomValues(new Uint8Array(24));
+  secret = btoa(String.fromCharCode(...raw)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 function setMsg(text: string, cls = ''): void {
@@ -326,11 +329,14 @@ function resumeOrder(id: string): void {
   void poll(id);
 }
 
-async function purchase(tier?: string, renew?: string): Promise<Response> {
+async function purchase(tier?: string, renew?: { id: string; secret?: string }): Promise<Response> {
   return fetch('/purchase', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ clientPublicKey: pubKey, ...(tier && { tier }), ...(renew && { renew }) }),
+    body: JSON.stringify({
+      clientPublicKey: pubKey, secret, ...(tier && { tier }),
+      ...(renew && { renew: renew.id, renewSecret: renew.secret }),
+    }),
   });
 }
 
@@ -356,6 +362,7 @@ function payErrorText(code: string): string {
 
 // Buyer-facing text for a refused /purchase.
 function purchaseErrorText(d: { error?: string; message?: string; opensAt?: string }): string {
+  if (d.error === 'renew_unauthorized') return 'This access can’t be renewed from this browser. Buy new access instead.';
   if (d.error === 'renew_not_live') return 'That access has ended or was already renewed, so it can’t be renewed. Buy new access instead.';
   if (d.error === 'sold_out') return 'All slots are in use right now. Please try again later.';
   if (d.error === 'renew_too_early' && d.opensAt) return 'You already have plenty of time left. Renewal opens ' + new Date(d.opensAt).toLocaleString() + '.';
@@ -364,7 +371,7 @@ function purchaseErrorText(d: { error?: string; message?: string; opensAt?: stri
 
 // One purchase flow for both paths, each with a fresh keypair: a renewal names the
 // live order it extends, and its new lease starts where that one ends.
-async function startPurchase(renew?: { id: string; tier?: string }): Promise<void> {
+async function startPurchase(renew?: { id: string; tier?: string; secret?: string }): Promise<void> {
   btn('buy').disabled = true;
   // A renewal re-buys its own plan; a fresh buy uses the page's picker.
   const tier = renew ? renew.tier : selectedTier();
@@ -372,12 +379,12 @@ async function startPurchase(renew?: { id: string; tier?: string }): Promise<voi
     setMsg('Generating keys…');
     await genKeys();
     setMsg('Requesting access…');
-    const r = await purchase(tier, renew?.id);
+    const r = await purchase(tier, renew);
     if (r.status === 402) {
       const d = await r.json();
       const creq = r.headers.get('x-cashu') ?? d.creq ?? '';
       const orderId = String(d.orderId ?? '');
-      upsertOrder({ id: orderId, priv, pub: pubKey, status: 'pending', creq, tier: String(d.tier ?? tier ?? '') || undefined, renewOf: renew?.id });
+      upsertOrder({ id: orderId, priv, pub: pubKey, secret, status: 'pending', creq, tier: String(d.tier ?? tier ?? '') || undefined, renewOf: renew?.id });
       openPayPanel(orderId, creq);
       setMsg(renew
         ? 'Renewal: pay below. Your remaining time moves to a new config (new keys); import it, as the current one stops 15 minutes after payment.'
@@ -389,7 +396,7 @@ async function startPurchase(renew?: { id: string; tier?: string }): Promise<voi
       const d = await r.json();
       const conf = injectPriv(String(d.clientConfig ?? ''), priv);
       const id = String(d.orderId ?? d.purchaseId ?? 'dry-run');
-      upsertOrder({ id, priv, pub: pubKey, status: 'ready', conf, tunnelIp: d.tunnelIp, expiresAt: d.lease?.expiresAt, tier });
+      upsertOrder({ id, priv, pub: pubKey, secret, status: 'ready', conf, tunnelIp: d.tunnelIp, expiresAt: d.lease?.expiresAt, tier });
       showConfig(conf, id, d.tunnelIp, d.lease?.expiresAt);
       renderAccess();
     } else {
@@ -504,7 +511,7 @@ function renderAccess(): void {
       const rec = loadOrders().find((o) => o.id === (b as HTMLElement).dataset.id);
       if (!rec) return;
       window.scrollTo({ top: 0, behavior: 'smooth' });
-      void startPurchase({ id: rec.id, tier: rec.tier });
+      void startPurchase({ id: rec.id, tier: rec.tier, secret: rec.secret });
     });
   });
   // "Buy again" starts a brand-new purchase (fresh key + lease), not a renewal.

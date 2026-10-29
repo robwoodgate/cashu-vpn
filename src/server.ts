@@ -1,5 +1,5 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -18,6 +18,18 @@ import { getEncodedToken, type Proof } from '@cashu/cashu-ts';
 const MAX_BODY_BYTES = 16 * 1024;
 /** A renewal may leave at most this many of its plan's periods prepaid. */
 const RENEW_MAX_PERIODS = 2;
+// A buyer-chosen order secret: base64url, at least 128 bits. Never in the creq or any URL.
+const SECRET_RE = /^[A-Za-z0-9_-]{22,128}$/;
+
+function hashSecret(secret: string): string {
+  return createHash('sha256').update(secret).digest('hex');
+}
+
+/** True if `secret` is the one whose hash the order stored. */
+function secretMatches(hash: string | undefined, secret: unknown): boolean {
+  if (!hash || typeof secret !== 'string') return false;
+  return timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(hashSecret(secret), 'hex'));
+}
 const ORDER_ID_RE = /^[A-Za-z0-9_-]{16,}$/;
 
 // Version + source URL, read from package.json (repo root, two levels up from
@@ -182,7 +194,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
           leaseDuration: `${t.durationMs / 1000}s`,
           dataCapGb: t.capBytes > 0 ? t.capBytes / 1024 ** 3 : null,
         })),
-        renewal: 'POST /purchase with a NEW clientPublicKey and "renew": <orderId of a live lease>: the new lease starts where that one ends, with a new key, IP and preshared key; the old one stops 15 minutes after payment',
+        renewal: 'POST /purchase with a NEW clientPublicKey, "renew": <orderId of a live lease> and "renewSecret": <the secret sent with that order>: the new lease starts where that one ends, with a new key, IP and preshared key; the old one stops 15 minutes after payment',
         acceptedMints: config.acceptedMints,
         notice: config.notice,
         termsUrl: config.termsUrl,
@@ -279,14 +291,23 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     return json(res, 400, { error: 'unknown_tier', tiers: config.tiers.map((t) => t.name) });
   }
 
-  // A renewal names the order it extends (its id is the capability) and brings a NEW
-  // key, so leases rotate keys instead of building one long-lived identity.
+  const secret = body.secret;
+  if (secret !== undefined && (typeof secret !== 'string' || !SECRET_RE.test(secret))) {
+    return json(res, 400, { error: 'invalid_secret', message: 'secret must be 22-128 base64url characters' });
+  }
+
+  // A renewal names the order it extends and proves it is that order's buyer with its
+  // secret (the order id alone is no proof: it travels in the payment request). It
+  // brings a NEW key, so leases rotate keys instead of building one long-lived identity.
   const now0 = new Date();
   const live = (await ctx.store.list(now0)).filter((l) => l.status === 'active');
   const renewOf = body.renew;
   if (renewOf !== undefined) {
     const prior = typeof renewOf === 'string' ? await ctx.store.getOrder(renewOf, now0) : undefined;
-    if (!prior?.lease || !live.some((l) => l.purchaseId === prior.lease!.purchaseId)) {
+    if (!prior || !secretMatches(prior.secretHash, body.renewSecret)) {
+      return json(res, 403, { error: 'renew_unauthorized', message: 'renewSecret must be the secret sent when that order was placed' });
+    }
+    if (!prior.lease || !live.some((l) => l.purchaseId === prior.lease!.purchaseId)) {
       return json(res, 400, { error: 'renew_not_live', message: 'renew must name an order whose lease is still active' });
     }
     // Prepaid time is capped at RENEW_MAX_PERIODS of the plan: it bounds the operator's
@@ -301,19 +322,20 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     }
   }
   // A retried /purchase for a key with an open order gets that order back, not a second
-  // one: paying two orders for one key would strand the second payment (key_in_use).
+  // one (paying two orders for one key would strand the second payment, key_in_use). Only
+  // with the order's secret: the public key alone doesn't prove who is asking.
   const pending = await ctx.store.findPending(clientPublicKey, now0);
   if (pending && config.mode === 'live') {
     const sameAsk = pending.tier?.name === tier.name && pending.renewOf === (typeof renewOf === 'string' ? renewOf : undefined);
-    if (!sameAsk) {
-      return json(res, 409, { error: 'order_pending', message: 'This key already has an unpaid order: repeat that request to get it back, or use a new key.' });
+    if (!sameAsk || !secretMatches(pending.secretHash, secret)) {
+      return json(res, 409, { error: 'order_pending', message: 'This key already has an unpaid order: repeat that request, with its secret, to get it back, or use a new key.' });
     }
     return sendChallenge(req, res, config, pending);
   }
   if (live.some((l) => l.clientPublicKey === clientPublicKey)) {
     return json(res, 409, {
       error: 'key_in_use',
-      message: 'This WireGuard key has a live lease. To extend it, renew with a NEW key: {"clientPublicKey": <new>, "renew": <orderId>}',
+      message: 'This WireGuard key has a live lease. To extend it, renew with a NEW key: {"clientPublicKey": <new>, "renew": <orderId>, "renewSecret": <its secret>}',
     });
   }
 
@@ -324,6 +346,7 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     await ctx.store.createOrder({
       id: orderId, status: 'pending', clientPublicKey, lockPubkey: '', tier,
       ...(typeof renewOf === 'string' && { renewOf }),
+      ...(typeof secret === 'string' && { secretHash: hashSecret(secret) }),
       createdAt: now.toISOString(), expiresAt: new Date(now.getTime() + config.orderTtlMs).toISOString(),
     });
     const result = await runProvision(ctx, orderId, clientPublicKey, undefined, undefined, tier);
@@ -371,6 +394,7 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     lockIndex: lock.index,
     tier,
     ...(typeof renewOf === 'string' && { renewOf }),
+    ...(typeof secret === 'string' && { secretHash: hashSecret(secret) }),
     createdAt: now.toISOString(),
     expiresAt: new Date(now.getTime() + config.orderTtlMs).toISOString(),
   };
@@ -834,7 +858,8 @@ Prices, plans, accepted mints and the operator notice: GET /info
 ## Buy a lease
 
 1. Generate an x25519 WireGuard key pair. Only the public key is ever sent.
-2. POST /purchase {"clientPublicKey": "<base64 public key>", "tier": "<plan name from /info; default: defaultTier>"}
+2. POST /purchase {"clientPublicKey": "<base64 public key>", "secret": "<random base64url, 22-128 chars>", "tier": "<plan name from /info; default: defaultTier>"}
+   Keep the secret: it is never sent anywhere else, and you need it to retry this request or to renew.
    -> 402 {orderId, creq}. The same creq is in the X-Cashu header.
 3. Decode creq (a NUT-18 payment request) and pay it from one of its mints with exactly its lock:
    on a v3 keyset the nutroot option (a NUMS tree with one leaf), otherwise the nut10 P2PK option.
@@ -850,7 +875,8 @@ Unpaid orders expire after ${Math.round(config.orderTtlMs / 60000)} minutes. A p
 
 ## Renew
 
-Generate a NEW key pair, then POST /purchase {"clientPublicKey": "<new public key>", "renew": "<orderId>"}
+Generate a NEW key pair, then POST /purchase {"clientPublicKey": "<new public key>", "secret": "<a new secret>",
+"renew": "<orderId>", "renewSecret": "<that order's secret>"}
 while that order's lease is live, and pay as above. The new lease starts where the old one ends, with
 its own key, tunnel IP and preshared key; the old config stops 15 minutes after the renewal is paid. A key with a
 live lease can't be bought again (409 key_in_use), so keys rotate rather than renew. A renewal may
@@ -863,8 +889,9 @@ leave at most two of the plan's periods prepaid; earlier, it is refused with 400
 - invalid_signature: mint signature missing or invalid (DLEQ proofs, or BLS on v3 keysets)
 - amount_too_low (after input fees), mint_not_accepted, wrong_unit
 - too_many_proofs: use a normal split (about one proof per set bit of the amount)
-/purchase returns 400 unknown_tier, renew_not_live or renew_too_early, 409 key_in_use or order_pending, 429 rate_limited or 503 sold_out.
-Retrying /purchase with the same body for a key with an unpaid order returns that same order and request.
+/purchase returns 400 unknown_tier, invalid_secret, renew_not_live or renew_too_early, 403 renew_unauthorized,
+409 key_in_use or order_pending, 429 rate_limited or 503 sold_out.
+Retrying /purchase with the same body (secret included) for a key with an unpaid order returns that same order.
 ${REPO_URL ? `\nSource: ${REPO_URL}\n` : ''}`;
 }
 

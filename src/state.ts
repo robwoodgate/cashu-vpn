@@ -51,6 +51,8 @@ export interface Order {
   tier?: Tier;
   /** Pending renewal: the order whose live lease this one extends. Dropped once provisioned. */
   renewOf?: string;
+  /** SHA-256 of the buyer's order secret: proves a retry or a renewal comes from whoever placed it. */
+  secretHash?: string;
   // --- populated when status === 'ready' ---
   purchaseId?: string;
   tunnelIp?: string;

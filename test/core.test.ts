@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import test from 'node:test';
 import type { AddressInfo } from 'node:net';
@@ -801,6 +802,10 @@ const LIVE_ENV = {
 const VALID_WG_KEY = 'nKpu1TI56v6JqS+wxnhMd+hBQJ8X15y7075zpATtJWU=';
 // Distinct well-formed WireGuard public keys, for tests that need several buyers.
 const wgKey = (n: number) => Buffer.alloc(32, n).toString('base64');
+// Buyer order secrets (base64url, 32 chars) and the hash the server stores for them.
+const SECRET_A = 'secret-a-0123456789abcdefghijklm';
+const SECRET_B = 'secret-b-0123456789abcdefghijklm';
+const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
 test('live POST /purchase without payment returns 402 + x-cashu challenge', async () => {
   await withServer(async (url) => {
@@ -885,14 +890,20 @@ test('live POST /purchase hands a retried key its open order instead of a second
     const ask = (body: Record<string, unknown>) => fetch(`${url}/purchase`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, ...body }),
     });
-    const first = await ask({});
-    const again = await ask({});
+    const first = await ask({ secret: SECRET_A });
+    const again = await ask({ secret: SECRET_A });
     assert.equal(again.status, 402);
     const [a, b] = [await first.json(), await again.json()];
     assert.equal(b.orderId, a.orderId, 'same order');
     assert.equal(again.headers.get('x-cashu'), first.headers.get('x-cashu'), 'same payment request');
+    // Without the order's secret the key alone gets nothing back.
+    for (const body of [{}, { secret: SECRET_B }]) {
+      const res = await ask(body);
+      assert.equal(res.status, 409);
+      assert.equal((await res.json()).orderId, undefined, 'no order id for a caller without its secret');
+    }
     // A different ask for the same key is refused rather than opening a second order.
-    const otherPlan = await ask({ tier: '30d' });
+    const otherPlan = await ask({ tier: '30d', secret: SECRET_A });
     assert.equal(otherPlan.status, 409);
     const body = await otherPlan.json();
     assert.equal(body.error, 'order_pending');
@@ -902,13 +913,13 @@ test('live POST /purchase hands a retried key its open order instead of a second
 
 test('live POST /purchase caps renewal at two prepaid periods', async () => {
   const day = 86_400_000;
-  const lease = (expiresInMs: number) => createMemoryStateStore([orderWithLease({
+  const lease = (expiresInMs: number) => createMemoryStateStore([{ ...orderWithLease({
     purchaseId: 'p-a', clientPublicKey: wgKey(5), tunnelIp: '10.77.0.2',
     createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + expiresInMs).toISOString(), status: 'active',
-  })]);
+  }), secretHash: sha256(SECRET_A) }]);
   const renew = (url: string) => fetch(`${url}/purchase`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, renew: 'o-p-a' }),
+    body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, renew: 'o-p-a', renewSecret: SECRET_A }),
   });
   // A day left on a 1-day plan: renewing leaves exactly two days. Allowed.
   await withServer(async (url) => assert.equal((await renew(url)).status, 402), LIVE_ENV, { store: lease(day) });
@@ -922,17 +933,41 @@ test('live POST /purchase caps renewal at two prepaid periods', async () => {
   }, LIVE_ENV, { store: lease(2 * day) });
 });
 
-test('live POST /purchase refuses to renew an order with no live lease', async () => {
+test('live POST /purchase renews only for the holder of the order secret', async () => {
+  // The order id travels in the payment request (QR, wallet, transport URL), so it can't be the proof.
+  const future = new Date(Date.now() + 3600_000).toISOString();
+  const store = createMemoryStateStore([{ ...orderWithLease({
+    purchaseId: 'p-a', clientPublicKey: wgKey(5), tunnelIp: '10.77.0.2',
+    createdAt: new Date().toISOString(), expiresAt: future, status: 'active',
+  }), secretHash: sha256(SECRET_A) }]);
+  const renew = (url: string, body: Record<string, unknown>) => fetch(`${url}/purchase`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, ...body }),
+  });
   await withServer(async (url) => {
-    for (const renew of ['no-such-order', 42]) {
-      const res = await fetch(`${url}/purchase`, {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, renew }),
-      });
-      assert.equal(res.status, 400);
-      assert.equal((await res.json()).error, 'renew_not_live');
+    for (const body of [{ renew: 'o-p-a' }, { renew: 'o-p-a', renewSecret: SECRET_B }, { renew: 'no-such-order', renewSecret: SECRET_A }, { renew: 42 }]) {
+      const res = await renew(url, body);
+      assert.equal(res.status, 403, JSON.stringify(body));
+      assert.equal((await res.json()).error, 'renew_unauthorized');
     }
-  }, LIVE_ENV);
+    assert.equal((await renew(url, { renew: 'o-p-a', renewSecret: SECRET_A })).status, 402, 'the secret holder can renew');
+    // A malformed secret is a client error.
+    assert.equal((await renew(url, { secret: 'short' })).status, 400);
+  }, LIVE_ENV, { store });
+});
+
+test('live POST /purchase refuses to renew a lease that has ended', async () => {
+  const past = new Date(Date.now() - 1000).toISOString();
+  const store = createMemoryStateStore([{ ...orderWithLease({
+    purchaseId: 'p-a', clientPublicKey: wgKey(5), tunnelIp: '10.77.0.2', createdAt: past, expiresAt: past, status: 'active',
+  }), secretHash: sha256(SECRET_A) }]);
+  await withServer(async (url) => {
+    const res = await fetch(`${url}/purchase`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, renew: 'o-p-a', renewSecret: SECRET_A }),
+    });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, 'renew_not_live');
+  }, LIVE_ENV, { store });
 });
 
 test('POST /purchase quotes the named tier and rejects unknown ones', async () => {
@@ -2064,9 +2099,9 @@ test('renewing through /purchase rotates the key, IP and PSK, and both peers run
   const applied: { argv: string[]; secret?: string }[] = [];
   const execPlan = async (plan: { steps: { argv: string[]; secret?: string }[] }) => { applied.push(plan.steps[0]!); return []; };
   await withServer(async (url) => {
-    const first = await (await newOrder(url)).json();
+    const first = await (await newOrder(url, { secret: SECRET_A })).json();
     const a = await (await payOrder(url, first.orderId, 0)).json();
-    const second = await (await newOrder(url, { clientPublicKey: NEW_KEY, renew: first.orderId })).json();
+    const second = await (await newOrder(url, { clientPublicKey: NEW_KEY, secret: SECRET_B, renew: first.orderId, renewSecret: SECRET_A })).json();
     const b = await (await payOrder(url, second.orderId, 1)).json();
 
     assert.notEqual(b.tunnelIp, a.tunnelIp, 'new IP');
