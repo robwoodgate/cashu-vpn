@@ -170,9 +170,15 @@ export async function executePlan(plan: CommandPlan, run: typeof runStep = runSt
   return results;
 }
 
+// Ubuntu 26.04 confines wg with AppArmor and only lets it read keys under /etc/wireguard,
+// so the 0700 temp dir goes there when we can write it and falls back to tmpdir otherwise.
+async function secretDir(): Promise<string> {
+  try { return await mkdtemp('/etc/wireguard/cashu-vpn-'); } catch { return mkdtemp(join(tmpdir(), 'cashu-vpn-')); }
+}
+
 async function runStep({ argv, secret }: CommandStep): Promise<CommandResult> {
   if (secret === undefined) return runArgv(argv);
-  const dir = await mkdtemp(join(tmpdir(), 'cashu-vpn-')); // 0700
+  const dir = await secretDir();
   try {
     const file = join(dir, 'psk');
     await writeFile(file, secret, { mode: 0o600 });
