@@ -36,6 +36,7 @@ interface OrderRec {
   status: 'pending' | 'ready';
   renewOf?: string; // the order this one renews, so its record can be cut to the server's grace
   secret?: string; // proves to the server that this browser placed the order (needed to renew it)
+  renewed?: boolean; // a renewal took this lease over; it only runs out its switch-over now
   creq?: string; // the payment request, kept so a pending order can be resumed after a reload
   // The in-browser Lightning mint quote, persisted so a reload reuses it instead of
   // minting a fresh invoice — which would orphan a paid-but-unminted quote (lost
@@ -435,7 +436,7 @@ function applyReady(id: string, d: { clientConfig?: string; tunnelIp?: string; l
   if (prior?.expiresAt) {
     const paidAt = d.lease?.createdAt ? new Date(d.lease.createdAt).getTime() : Date.now();
     const cut = Math.min(new Date(prior.expiresAt).getTime(), paidAt + RENEWAL_GRACE_MS);
-    upsertOrder({ id: prior.id, expiresAt: new Date(cut).toISOString() });
+    upsertOrder({ id: prior.id, expiresAt: new Date(cut).toISOString(), renewed: true });
   }
   if (id === currentOrderId) showConfig(conf, id, d.tunnelIp, d.lease?.expiresAt);
   renderAccess();
@@ -498,6 +499,10 @@ function renderAccess(): void {
       // fresh purchase rather than a download that can't connect.
       status = '<small class="expired">expired ' + esc(when.toLocaleString()) + '</small>';
       action = '<button class="buyagain" type="button">Buy again</button>';
+    } else if (o.renewed) {
+      // Renewed: its time moved to the new config, so only the switch-over is left.
+      status = '<small>renewed, stops ' + (when ? esc(when.toLocaleString()) : 'soon') + '</small>';
+      action = '<button class="ghost dlacc" data-id="' + esc(o.id) + '" type="button">Download</button>';
     } else {
       status = '<small>active' + (when ? ' until ' + esc(when.toLocaleString()) : '') + '</small>';
       action = '<span style="display:flex;gap:8px"><button class="renewacc" data-id="' + esc(o.id) + '" type="button">Renew</button>'
