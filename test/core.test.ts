@@ -32,7 +32,7 @@ import { deriveChildPubkey, deriveChildKeypair, isPrivateExtendedKey } from '../
 import { generateOperatorKeys } from '../src/keygen.js';
 import { createLockBook } from '../src/locks.js';
 import { planSweep, sweepAll, filterUnswept, pruneSpent } from '../src/sweep.js';
-import { decodeChallenge, waitForPaid, mintLockedPayload, mintAmount } from '../src/buyer.js';
+import { confFileName, decodeChallenge, waitForPaid, mintLockedPayload, mintAmount } from '../src/buyer.js';
 import { createRateLimiter } from '../src/ratelimit.js';
 import type { ReceivedPayment } from '../src/wallet.js';
 import { createServer } from '../src/server.js';
@@ -1285,6 +1285,13 @@ test('decodeChallenge extracts amount/mint/unit/lock from a creqA', () => {
   assert.equal(c.unit, 'sat');
   assert.equal(c.request.nut10?.data, OP_PUBKEY);
   assert.ok(c.request.toNutrootOptions(), 'carries the nutroot encoding too');
+});
+
+test('confFileName fits the 15-character interface name limit for any pool address', () => {
+  assert.equal(confFileName('10.77.65.27'), 'cashu-65-27');
+  assert.equal(confFileName('10.77.255.254'), 'cashu-255-254'); // the longest: 13
+  assert.equal(confFileName(undefined), 'cashu-vpn');
+  assert.match(confFileName('10.77.255.254'), /^[a-zA-Z0-9_=+.-]{1,15}$/, 'a valid Linux interface name');
 });
 
 test('waitForPaid resolves once the quote is PAID', async () => {

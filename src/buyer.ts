@@ -24,6 +24,15 @@ import { popcount } from './cashu.js';
 /** How long a renewed lease keeps working after the renewal, so the buyer can import the new config. */
 export const RENEWAL_GRACE_MS = 15 * 60 * 1000;
 
+/**
+ * Config file name, eg cashu-65-27 for 10.77.65.27. Apps use it as the tunnel name, and
+ * wg-quick as the Linux interface name, which is capped at 15 characters.
+ */
+export function confFileName(tunnelIp?: string): string {
+  const m = /^\d+\.\d+\.(\d+)\.(\d+)$/.exec(tunnelIp ?? '');
+  return m ? `cashu-${m[1]}-${m[2]}` : 'cashu-vpn';
+}
+
 export interface Challenge {
   amount: number;
   mintUrl: string;

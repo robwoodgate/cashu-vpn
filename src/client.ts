@@ -17,7 +17,7 @@
 
 import { Wallet } from '@cashu/cashu-ts';
 import qrcode from 'qrcode-generator';
-import { decodeChallenge, waitForPaid, mintLockedPayload, mintAmount, RENEWAL_GRACE_MS, type MintWallet, type MintQuote, type PaymentPayload, type Challenge } from './buyer.js';
+import { confFileName, decodeChallenge, waitForPaid, mintLockedPayload, mintAmount, RENEWAL_GRACE_MS, type MintWallet, type MintQuote, type PaymentPayload, type Challenge } from './buyer.js';
 // Inlined as data-URIs by esbuild (--loader:.svg=dataurl). Centre-overlay marks for
 // the Cashu / Lightning QR tabs; the unified (BIP-321) tab shows none.
 import cashuIcon from './icons/cashu.svg';
@@ -172,14 +172,14 @@ function showConfig(conf: string, name: string, tunnelIp?: string, expiresAt?: s
   setMsg('Config ready.', 'ok');
   const dl = btn('dl');
   dl.disabled = false;
-  dl.onclick = () => download(conf, name);
+  dl.onclick = () => download(conf, tunnelIp);
   $('pay').style.display = 'none';
 }
 
-function download(conf: string, name: string): void {
+function download(conf: string, tunnelIp?: string): void {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([conf + '\n'], { type: 'text/plain' }));
-  a.download = (name || 'vpn') + '.conf';
+  a.download = confFileName(tunnelIp) + '.conf';
   a.click();
 }
 
@@ -514,7 +514,7 @@ function renderAccess(): void {
     b.addEventListener('click', () => {
       const id = (b as HTMLElement).dataset.id ?? '';
       const rec = loadOrders().find((o) => o.id === id);
-      if (rec?.conf) { showConfig(rec.conf, id, rec.tunnelIp, rec.expiresAt); download(rec.conf, id); }
+      if (rec?.conf) { showConfig(rec.conf, id, rec.tunnelIp, rec.expiresAt); download(rec.conf, rec.tunnelIp); }
     });
   });
   // "Pay" reopens a still-pending order so it can be paid after a reload.
