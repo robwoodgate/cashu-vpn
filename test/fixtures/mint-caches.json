@@ -1,0 +1,618 @@
+{
+ "v3": {
+  "info": {
+   "version": "cdk-mintd/0.18.0",
+   "nuts": {
+    "4": {
+     "methods": [
+      {
+       "method": "bolt11",
+       "unit": "sat",
+       "method_name": "Bolt11",
+       "min_amount": 1,
+       "max_amount": 500000,
+       "options": {
+        "description": true
+       }
+      },
+      {
+       "method": "bolt12",
+       "unit": "sat",
+       "method_name": "Bolt12",
+       "min_amount": 1,
+       "max_amount": 500000,
+       "options": {
+        "description": true
+       }
+      },
+      {
+       "method": "onchain",
+       "unit": "sat",
+       "method_name": "Onchain",
+       "min_amount": 1,
+       "max_amount": 500000,
+       "options": {
+        "confirmations": 1
+       }
+      },
+      {
+       "method": "paypal",
+       "unit": "sat",
+       "min_amount": 1,
+       "max_amount": 500000
+      }
+     ],
+     "disabled": false
+    },
+    "5": {
+     "methods": [
+      {
+       "method": "bolt11",
+       "unit": "sat",
+       "method_name": "Bolt11",
+       "min_amount": 1,
+       "max_amount": 500000
+      },
+      {
+       "method": "bolt12",
+       "unit": "sat",
+       "method_name": "Bolt12",
+       "min_amount": 1,
+       "max_amount": 500000
+      },
+      {
+       "method": "onchain",
+       "unit": "sat",
+       "method_name": "Onchain",
+       "min_amount": 1,
+       "max_amount": 500000
+      },
+      {
+       "method": "paypal",
+       "unit": "sat",
+       "min_amount": 1,
+       "max_amount": 500000
+      }
+     ],
+     "disabled": false
+    },
+    "7": {
+     "supported": true
+    },
+    "8": {
+     "supported": true
+    },
+    "9": {
+     "supported": true
+    },
+    "10": {
+     "supported": true
+    },
+    "11": {
+     "supported": true
+    },
+    "12": {
+     "supported": true
+    },
+    "14": {
+     "supported": true
+    },
+    "15": {
+     "methods": [
+      {
+       "method": "bolt11",
+       "unit": "sat"
+      }
+     ]
+    },
+    "17": {
+     "supported": [
+      {
+       "method": "bolt11",
+       "unit": "sat",
+       "commands": [
+        "bolt11_mint_quote",
+        "bolt11_melt_quote",
+        "proof_state"
+       ]
+      },
+      {
+       "method": "bolt12",
+       "unit": "sat",
+       "commands": [
+        "bolt12_mint_quote",
+        "bolt12_melt_quote",
+        "proof_state"
+       ]
+      },
+      {
+       "method": "onchain",
+       "unit": "sat",
+       "commands": [
+        "onchain_mint_quote",
+        "onchain_melt_quote",
+        "proof_state"
+       ]
+      },
+      {
+       "method": "paypal",
+       "unit": "sat",
+       "commands": [
+        "paypal_mint_quote",
+        "paypal_melt_quote",
+        "proof_state"
+       ]
+      },
+      {
+       "method": "txout",
+       "unit": "sat",
+       "commands": [
+        "txout_mint_quote"
+       ]
+      }
+     ]
+    },
+    "19": {
+     "ttl": 60,
+     "cached_endpoints": [
+      {
+       "method": "POST",
+       "path": "/v1/swap"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/transaction"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/mint/bolt11"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/melt/bolt11"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/mint/bolt12"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/melt/bolt12"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/mint/onchain"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/melt/onchain"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/mint/paypal"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/melt/paypal"
+      }
+     ]
+    },
+    "20": {
+     "supported": true
+    },
+    "29": {
+     "max_batch_size": 100,
+     "methods": [
+      "bolt11",
+      "bolt12",
+      "onchain",
+      "paypal"
+     ]
+    },
+    "XX": {
+     "supported": true,
+     "quote_input_fee_ppk": 0,
+     "fixed_txout_quotes": true
+    }
+   }
+  },
+  "cache": {
+   "keysets": [
+    {
+     "id": "02f175edd55ee92dc6d0351b99dcd3b24ba8b7d2d98f3b1bf568452dd1c044c182",
+     "unit": "sat",
+     "active": true,
+     "input_fee_ppk": 100,
+     "keys": {
+      "1": "b266243f15d35e2f46ee9bb7b2ec3170774ebe982cf536e9c172a0e46412c5f11214aa52550a693e93851f5e2e135d3218123b0bb3d8be350742c4441599b0c61ac02bbacd133d699b42e53e8a8589f31c29682779ecf1a09080a9cf781f59e9",
+      "2": "a58857620d304b6a246046f1becd8e0e67c383151bfb5ea9ebc4696dd8936f2df4d4b68240d90918adc0852bcbe650af00a727bf0f2c89ae1da55906f9db3cbf39d24dba14b3dfc1f1d046937c294b7633cf3524ff871a501f806ac1c9b4b8d2",
+      "4": "af8d6b1e6f4ea6d3a4c2891df33c01ca2a8619078b2d840a011a851636376f4c5c4860d345b4938f82a384d917eb5d760b8c3a34bae59a34df16071a751a6cc9d98ba738d796325a84c18195391b345238a1c9559147ea52ce26073b9708c9ea",
+      "8": "a951b93a01934fa4e1591223a90691488766d4d8805739abe258b6ced62c73db3ec9ba2e833ee44100cb3e695ef57b6001c69c6e5f1002ace56573af0eb6a69a148426472aa66e1e2d34f4b6e9f781dd2743cbe117f76df04994d7b766128ec0",
+      "16": "b1431fe90e262bca4c3fcf8a4489ecabd371f79a40146703daf8e64eb7621029943cc98769f959c8191dc9700f25adea196328bcd83927829d4db3054445b511b59f9eebadc243fda49ad23a5c144535f129eee961df2c11d88fbccbf0099b68",
+      "32": "9749afdda05dd0c870e12810cc50498576a08b5a5a1a2f2440ae13e2c199d2ea2521cb2dc760d9005c707dc3a4fa4a2317d444e1b266ca06db423664afc338c67eb8a825f53ef5a2149312e0cf7cd58140103d4348ba43b6a9a936c314331cb4",
+      "64": "9304997a38478db04ebe73f05a1d3e87fca0ab612a11e1053089acff95f6a1b2f86d29779b3a47189e8fbd32747bd9b40baf1c5301ac6eee3c6a03794c45caa6e4011624e7dce16666a70f307155f059ad7c4b966a0b9400e32355e69ac9da0d",
+      "128": "b394166dad962a928ccf4b9d493bc2ef6ae21eb4441521f73fa712bc88c2851b2bd8d2920ac4645c284c407a8cd9f77d0b24b81289762998d968cf868e9cb4247220d31ebf1680a953a87f05767e0d706ab257a37ec65a87da1cb515dd87c69f",
+      "256": "a07d904c914ce1ec22d7aecf093eca42126c14b0447932dc75ee654105181245906ba6c5c92f154c1a42539e8fc6fa020657075d788dbcbea288403003d5bec866c0aacb1aff9340d5384d625b0e57716289c592f9362548d0be0a77fa3f6b30",
+      "512": "82c74632837b4240b0f81b305863c6431c5d809e65a3597e79ce16935f373522833e959a35ba6456f007c8a6a590c27e016cd7a275fc487d4109c9e3ad340bdff268f137dc0c81c5cefabdf4f3c9be11f9607a9e8544f8dcb80f91eb50dc7a1a",
+      "1024": "a0863903417270bec29a62d24b3a9852885322587f79a50519c1bfdd3ce2fd5286ff6cbd26907fb0d6b574c75cab707619862fd89837764be9bb220352695e037b87ded3679900454d5a1e3f238882327dd9c2275d8252330aab62b220ac11a6",
+      "2048": "8d2f619a377b9fd146e4c9a82dd24b9c13ddc9067b0e037eddba825ea6bb2456959e8133b3341e445deeba3cb82d792d06f4cd25449fbb3c9bad90ccc6a1bd063c90e2359f7089ddcc4602716985bc3d922843ecc23ba2c569b937409f0f2e1a",
+      "4096": "98386593020c30860a19ad5b3969b1a238226b1ed9613bf793384e82adbe55b88497cb95acdfca71fcc297e7d94f682a0d6a60e2001c328743256a9492d06eb58f11acef9f7a1043810dd0a1a8866d352842da6953cc8175dbcff4a0aa9ab068",
+      "8192": "8b767eea8a4bf27a913980c15b41e9e23e1cf79909ee535bb24d78001adf4dd9e4d973709e5ac2041994466a79b0299b068e6eddb8c03d0550215eb7f935d1a0cd0b261efa9f4b68de06b8a636c7ad4b38648262c64a990ec64dd5870008420b",
+      "16384": "a74c719dc63059f482574b80ffd8e2c99566df32c99b4c1458e0485738eefe9a91d7e6889e7a795f52759ac1bc48edaf06cc8863ed9fcd9cf2e1ad2ffa20e68a540152f183e961b27628625cfb3098d7b032656bc2587f87204fe97fb8193d7d",
+      "32768": "b6042635853326838faa6477a19062466945166780ae9a79958b8dcf5c7a25534d2b788db944205bc3b4ba8bff7d8d6f11fe103bdb2ea422606f2340dbdc1097a40dfb44932980e9ab540df52fa0fd1217da6ab1d5d5d50a4932a2ce573b5b34",
+      "65536": "930b4790a421498edeee81cc080d31fe31fa94a166039522396143e5d391b2d889237b5e887b9f361a7e15ba0571e8890e028cf9981181588a65fba473971edf7deb723481b69aea536bc4af10c529a1c9f669d8fae00b74ab44e4b496c80287",
+      "131072": "af93c94dc0cfa8a8767d475f42b561e407e2cd63f1a431d09c65a385155d1ca9a05500b52cfbbb852459cd4a4ef60a9d06825c2f9dab10ba267743fc0c60fd7224fc82f2e09135b650edf00de54517bddc89b21060f0d82d31943029b061e9fc",
+      "262144": "84944e1de873aca123979782ad927dce10eac386fc35c00ce67a0737549ca6c0f069396b61c01f077639a8e4ee3333070c32ee89aea604c234ba333777cdf732baa37cab3147a42750e1b7e1514918348af1595d417435b9d4f72f37685176da",
+      "524288": "802bf4a3613c0a478999728fad95f33b556cd58728752de5a0469a870b316468d4fbc79322593d16c37936cdb284575510afb58f8132e1856aead43649324182de5bd981dcaa1be1e9cbb48fca8e82cc1fadcb05efc78c7bc367c19a7a85e028",
+      "1048576": "91c95d179d095758b2ed778242b93eee590306b162bab0aa1dfcb5ce16e59c3a4dca9323443c6d0d464d615e35a1a7590c717cf15d69c6df028cf8058bd5196caacecea42b0c9ddd99750540284c85369c871ce98ee5601664b7b4ab0dc4c71f",
+      "2097152": "89f20efd2737c94d3806b34b414ec4fb67a35d92f990effa60d88ac06cd3aefa82630d2b1ad03949ca26413cb661c18c05a752f359591b8fc5ea897227d7d5bf59aac06aeb0047414e2e6398b468954c3edf59cb5e48abbb8428525141d34688",
+      "4194304": "a3d597d973109d1086144b1df1c7a940ea46f11e5624b1b9d1eab5070a642295e8ca670ac0a06d94a920bd7a0434f3ff17558ce03bf82e7ac432a391b41d59939cfe342a9cc75afd30fc25743c38048c0b3e8b269c251967de4ce63a5a9aa6e0",
+      "8388608": "b84f58431edac6157b345223fccafec44e863dc5e497ccff9075edb107b2e4f864b9237ff3007f8063cdf04506e0bb3b1602cdc68303a0f73f983aba4a97aac9b4fe4f1c0f53e2e6fd32f7e59c2c5d14156382393a1dbfcb9e62b67383b9ce6e",
+      "16777216": "93bdadfb17202a9e0652f186d3b604b520ebfe951ee3c5508e86249da7739c3103b706bf183c2518e23004a6ee4750310a62475aa98732294a3eb1ada27ca093d3f5411f12216b3c2c631292bc2bec409c45bce0540340f2be267b82ecedb436",
+      "33554432": "a8e6cca2eed32bf3c494af82d47b9e24470ebff26eb17e8aa54d965772fa352435041ec61d5e4cc6311fb99552c07b2b0f2cd7b0194d0d70a24a4b832ecb0268b68ad676bcc8910f2d4926be079c5b11b87b6b4c9f64145e22ab106c90f0e066",
+      "67108864": "a53f87f50e7a7a39c05676892b8e0ce8420788d5db1b7ac8e6285bcd566b49d69efba99640a5a3c43cf1fefc055f1de5162aacf9727959d912fc929fe915515c76057d45d7f9b37c3a1f2eb7b014b2ab402a9e3bde4dba68dbf39347abf8218e",
+      "134217728": "98c9a655e86cf9e58e3b2dcff92497cd70708cb851438af6401d51733aaf93c0c6f705eb60fa0fceff9a7721e0d725e5103f97fb3f5f67ee34a64575dd067c93195487e27431707438988ffc00458f220889fa8121d4d2392e2e84fd1c811253",
+      "268435456": "8f9ac56be1363ee513488a8713b8add8c0166e8b89bc14e903f62ecee0e1b5f2118494ed5c82145b1cb2c4b50f5b147114ce10643110f725901d3f0fb8bd8dfcc563ccffa79e591e576574d691d745cb4a92f6b48f88f1c4513ebffef7ce5ae6",
+      "536870912": "8a75f6ef4d3632614fe56e7274a0f5d43e51eacae22496f7bc1a2ecd2c0309d7ac4358085c50312a1d139e759c4e74330d6ef90afdc05dfa7f8d7fb9bb82bbf716ec4554a8f985f68fab31decdb2e6c050703455ac53a3f062bde0f357f95797",
+      "1073741824": "af9827158b80597001fcce75f133bc0deb8ad7a9eadd0d865a22d6a5532f4f9b9e92917297d5e8c0d2c80fd07bf36edf1712bc512a4d9469e5f81d6a4133024288a7ef6d64d49a64508839b1df4b728a30a247625e36fb841db737879437c43f",
+      "2147483648": "968f91cc28ff28065a08dc5236008b67e3f781ac25a5a4eb07f24886b4293355cb5900830a1c532498d707a0b212ee0b115e4397d903f99634ececa0459810c4a63abd4fc0a37a932b5f823b506c4db487b3aa54cc0ba7998901c8fb67015840"
+     }
+    }
+   ],
+   "mintUrl": "http://localhost:3338",
+   "savedAt": 1793288573383
+  }
+ },
+ "v1": {
+  "info": {
+   "name": "mintd cdk test mint",
+   "version": "cdk-mintd/0.18.0",
+   "nuts": {
+    "4": {
+     "methods": [
+      {
+       "method": "bolt11",
+       "unit": "sat",
+       "method_name": "Bolt11",
+       "min_amount": 1,
+       "max_amount": 500000,
+       "options": {
+        "description": true
+       }
+      },
+      {
+       "method": "bolt12",
+       "unit": "sat",
+       "method_name": "Bolt12",
+       "min_amount": 1,
+       "max_amount": 500000,
+       "options": {
+        "description": true
+       }
+      },
+      {
+       "method": "onchain",
+       "unit": "sat",
+       "method_name": "Onchain",
+       "min_amount": 1,
+       "max_amount": 500000,
+       "options": {
+        "confirmations": 1
+       }
+      },
+      {
+       "method": "paypal",
+       "unit": "sat",
+       "min_amount": 1,
+       "max_amount": 500000
+      },
+      {
+       "method": "bolt11",
+       "unit": "usd",
+       "method_name": "Bolt11",
+       "min_amount": 1,
+       "max_amount": 500000,
+       "options": {
+        "description": true
+       }
+      },
+      {
+       "method": "bolt12",
+       "unit": "usd",
+       "method_name": "Bolt12",
+       "min_amount": 1,
+       "max_amount": 500000,
+       "options": {
+        "description": true
+       }
+      },
+      {
+       "method": "onchain",
+       "unit": "usd",
+       "method_name": "Onchain",
+       "min_amount": 1,
+       "max_amount": 500000,
+       "options": {
+        "confirmations": 1
+       }
+      },
+      {
+       "method": "paypal",
+       "unit": "usd",
+       "min_amount": 1,
+       "max_amount": 500000
+      }
+     ],
+     "disabled": false
+    },
+    "5": {
+     "methods": [
+      {
+       "method": "bolt11",
+       "unit": "sat",
+       "method_name": "Bolt11",
+       "min_amount": 1,
+       "max_amount": 500000
+      },
+      {
+       "method": "bolt12",
+       "unit": "sat",
+       "method_name": "Bolt12",
+       "min_amount": 1,
+       "max_amount": 500000
+      },
+      {
+       "method": "onchain",
+       "unit": "sat",
+       "method_name": "Onchain",
+       "min_amount": 1,
+       "max_amount": 500000
+      },
+      {
+       "method": "paypal",
+       "unit": "sat",
+       "min_amount": 1,
+       "max_amount": 500000
+      },
+      {
+       "method": "bolt11",
+       "unit": "usd",
+       "method_name": "Bolt11",
+       "min_amount": 1,
+       "max_amount": 500000
+      },
+      {
+       "method": "bolt12",
+       "unit": "usd",
+       "method_name": "Bolt12",
+       "min_amount": 1,
+       "max_amount": 500000
+      },
+      {
+       "method": "onchain",
+       "unit": "usd",
+       "method_name": "Onchain",
+       "min_amount": 1,
+       "max_amount": 500000
+      },
+      {
+       "method": "paypal",
+       "unit": "usd",
+       "min_amount": 1,
+       "max_amount": 500000
+      }
+     ],
+     "disabled": false
+    },
+    "7": {
+     "supported": true
+    },
+    "8": {
+     "supported": true
+    },
+    "9": {
+     "supported": true
+    },
+    "10": {
+     "supported": true
+    },
+    "11": {
+     "supported": true
+    },
+    "12": {
+     "supported": true
+    },
+    "14": {
+     "supported": true
+    },
+    "15": {
+     "methods": [
+      {
+       "method": "bolt11",
+       "unit": "sat"
+      },
+      {
+       "method": "bolt11",
+       "unit": "usd"
+      }
+     ]
+    },
+    "17": {
+     "supported": [
+      {
+       "method": "bolt11",
+       "unit": "sat",
+       "commands": [
+        "bolt11_mint_quote",
+        "bolt11_melt_quote",
+        "proof_state"
+       ]
+      },
+      {
+       "method": "bolt12",
+       "unit": "sat",
+       "commands": [
+        "bolt12_mint_quote",
+        "bolt12_melt_quote",
+        "proof_state"
+       ]
+      },
+      {
+       "method": "onchain",
+       "unit": "sat",
+       "commands": [
+        "onchain_mint_quote",
+        "onchain_melt_quote",
+        "proof_state"
+       ]
+      },
+      {
+       "method": "paypal",
+       "unit": "sat",
+       "commands": [
+        "paypal_mint_quote",
+        "paypal_melt_quote",
+        "proof_state"
+       ]
+      },
+      {
+       "method": "bolt11",
+       "unit": "usd",
+       "commands": [
+        "bolt11_mint_quote",
+        "bolt11_melt_quote",
+        "proof_state"
+       ]
+      },
+      {
+       "method": "bolt12",
+       "unit": "usd",
+       "commands": [
+        "bolt12_mint_quote",
+        "bolt12_melt_quote",
+        "proof_state"
+       ]
+      },
+      {
+       "method": "onchain",
+       "unit": "usd",
+       "commands": [
+        "onchain_mint_quote",
+        "onchain_melt_quote",
+        "proof_state"
+       ]
+      },
+      {
+       "method": "paypal",
+       "unit": "usd",
+       "commands": [
+        "paypal_mint_quote",
+        "paypal_melt_quote",
+        "proof_state"
+       ]
+      }
+     ]
+    },
+    "19": {
+     "ttl": 60,
+     "cached_endpoints": [
+      {
+       "method": "POST",
+       "path": "/v1/swap"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/mint/bolt11"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/melt/bolt11"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/mint/bolt12"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/melt/bolt12"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/mint/onchain"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/melt/onchain"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/mint/paypal"
+      },
+      {
+       "method": "POST",
+       "path": "/v1/melt/paypal"
+      }
+     ]
+    },
+    "20": {
+     "supported": true
+    },
+    "29": {
+     "max_batch_size": 100,
+     "methods": [
+      "bolt11",
+      "bolt12",
+      "onchain",
+      "paypal"
+     ]
+    }
+   }
+  },
+  "cache": {
+   "keysets": [
+    {
+     "id": "00163d7a87ffcd92",
+     "unit": "sat",
+     "active": true,
+     "input_fee_ppk": 100,
+     "keys": {
+      "1": "033ec736aa3e1ba919b5bdb4f4436101b5bb7da66d39bbb96f3cac578ec03820ff",
+      "2": "02ac84d3010215a916523d60bc1e3459f813fac0abeef049e6c6c2ecb4d02a1f03",
+      "4": "02bd5c758d80de892006263dc80ddd29d4409e269cc210540f906271f69527ca6b",
+      "8": "02750c11dce17b6a84a746f6a5ef4819bdf04e3486de08485e88643bf390ef255f",
+      "16": "025868c1f8cac2b65d8453ba459368642ea18eba69dbb713fc2de1d8f3a7e405a2",
+      "32": "03f81b15ff6ddb1b9c4894e4539388b7a70d7b7925d91548e093c9031027be5782",
+      "64": "03e2d453c5ef38702c54282034c1c41c2544219765712c99555b064a99cd294b77",
+      "128": "0335cad67cadfcc0bd119c387a21d0c18a1396f70b234d449040beec86171a925c",
+      "256": "03de8e54f89d57280d39d71ea2d08ace6735375ef51e3586b2189ffe577277e1e0",
+      "512": "02bc9b979d95878a971a84f8cfe2ba9074705d9bd29929d9ee3f18f6538967804c",
+      "1024": "02991622c38aee3c1ee7c3c6bcd6e241eb1318f20c7f43394fd68b9e7092be4eb4",
+      "2048": "03c597f2f2bbfb8686bcaf9d488bcb52fe70d84f7701dc82225922c6d7207c2b6b",
+      "4096": "03696452e5fee483588751f99e7686ecc96c24b5e8db14393309de8b000a07bd81",
+      "8192": "02ae8370eb62f7e5db990bf40f5aa09a39ec09f322f44ed4cae190e3cd75d50884",
+      "16384": "037f99c83d846cddc1a259b47e5bb6c8d63e43bcd6f2a61e0ff69cece07cecb218",
+      "32768": "024ba7a32dae4bcb6f2e123bcc292ae74b0488ec451ef42705aee3fe188d2455ac",
+      "65536": "020d57191f46bb4a53bad335899b7b366ef2c2ad72995c3c3c98b8b1097859f0cb",
+      "131072": "030b65f0f778aead6a3b0b321b2a1933eeb124919a68c1fdec5491a5c81f0eb189",
+      "262144": "02780b8def94d5839c52b7b7f6766e38414801760600a6acec58d3ab855e82bf90",
+      "524288": "03d297c33d5bd5d14b79b561c40d7d514d9de4688fb48b84ccc1339fa3bf6b6895",
+      "1048576": "026be37d1c61727d0094ae9432ab22d5d18db4caa60d92951cd4855a7b3dad70e5",
+      "2097152": "0245feb9626a3553ff8871453b4749e020df7b4c58f228b963e050c0bf0999176e",
+      "4194304": "036f030972ba2e6c231dafc4e851b2e8d22e87d9a7ea21ca2ed5220ef3b94d404c",
+      "8388608": "03817e0f19b596216402541cdd0bc344d8b6b079c93341c6b24fe5605f018cd311",
+      "16777216": "0374f3b72991d0e7244523c312cefac034119260dba23a5f2cae5ed9f9ebd64fcd",
+      "33554432": "0390cd80733876b8e44e3210994add8c84a8d47d501649ca4e9f6db723f4e9e524",
+      "67108864": "02c2cf9015d948a030e6e9b5f784d5c66fd76578a571995b6670c2a0ea1e5cf977",
+      "134217728": "02d7c12005c4efd64d360b1f938001e19c2a6cfdf39765f6419a9bbaa65ecb1c3d",
+      "268435456": "02b5429da4efa26d859c54444e779a5ab80f35e09977c5c7c48a2d1454832e1134",
+      "536870912": "03915f815da168c0767c1b48e6cb7f3a92284d1320cf1dbd66c45efa527965e849",
+      "1073741824": "03e460e1045be69b248a88e24672653ec71a3d466e7d0a189ac5cd66c5ac751410",
+      "2147483648": "0315c848ba1bf2ed2940e192b0394994ba311551174d45ce16bca464ea257b2103"
+     }
+    }
+   ],
+   "mintUrl": "https://testnut.cashudevkit.org",
+   "savedAt": 1793288573728
+  }
+ }
+}

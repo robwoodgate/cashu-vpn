@@ -1,6 +1,6 @@
 {
   "name": "cashu-vpn",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Sell short-lived WireGuard VPN access for Cashu ecash — non-custodial, no accounts",
   "type": "module",
   "license": "MIT",
@@ -28,7 +28,7 @@
     "build:client": "esbuild src/client.ts --bundle --minify --format=iife --platform=browser --loader:.svg=dataurl --outfile=dist/public/client.js",
     "test": "npm run build --silent && node --test $(find dist/test -name '*.test.js')",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit --project tsconfig.json",
+    "typecheck": "tsc --noEmit --project tsconfig.json && tsc --project tsconfig.client.json",
     "start": "node dist/src/main.js",
     "start:env": "node --env-file=.env dist/src/main.js",
     "update": "bash scripts/update.sh",
@@ -42,7 +42,7 @@
     "node": ">=24"
   },
   "dependencies": {
-    "@cashu/cashu-ts": "5.0.0-rc.7",
+    "@cashu/cashu-ts": "5.0.0-rc.12",
     "@scure/bip32": "^2.4.0",
     "qrcode-generator": "^2.0.4"
   },

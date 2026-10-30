@@ -1,4 +1,7 @@
 import { execFile } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 import type { PeerLedger, PeerLease } from './peers.js';
 
@@ -9,7 +12,12 @@ const execFileAsync = promisify(execFile);
 /** A single command, expressed as an argv array — never a shell string. */
 export interface CommandStep {
   argv: string[];
+  /** A secret (the preshared key) for `wg`, passed as a private temp file at PSK_FILE, never in argv. */
+  secret?: string;
 }
+
+/** argv placeholder runStep swaps for the secret's temp file path (wg can't read a socket stdin). */
+export const PSK_FILE = '<preshared-key-file>';
 
 export interface CommandPlan {
   iface: string;
@@ -76,11 +84,15 @@ function isTunnelCidr(value: string): boolean {
 
 // --- Command planning ---
 
-export function planAddPeer(iface: string, clientPubKey: string, tunnelIp: string): CommandPlan {
+/** `presharedKey` is optional only for leases from before per-lease PSKs. */
+export function planAddPeer(iface: string, clientPubKey: string, tunnelIp: string, presharedKey?: string): CommandPlan {
+  const peer = presharedKey
+    ? { argv: ['wg', 'set', iface, 'peer', clientPubKey, 'preshared-key', PSK_FILE, 'allowed-ips', `${tunnelIp}/32`], secret: presharedKey }
+    : { argv: ['wg', 'set', iface, 'peer', clientPubKey, 'allowed-ips', `${tunnelIp}/32`] };
   return {
     iface,
     steps: [
-      { argv: ['wg', 'set', iface, 'peer', clientPubKey, 'allowed-ips', `${tunnelIp}/32`] },
+      peer,
       { argv: ['ip', 'route', 'replace', `${tunnelIp}/32`, 'dev', iface] },
     ],
   };
@@ -102,7 +114,19 @@ export function planRemovePeer(iface: string, clientPubKey: string, tunnelIp: st
 // strict pattern, so a hostile clientPublicKey cannot smuggle extra args, flags,
 // or shell metacharacters. Combined with execFile (no shell), there is no
 // injection surface even before this check.
-function validateStep(iface: string, argv: string[]): void {
+function validateStep(iface: string, step: CommandStep): void {
+  const { argv } = step;
+  // wg set <iface> peer <pubkey> preshared-key <file> allowed-ips <ip>/32, key in the file
+  if (
+    argv.length === 9 &&
+    argv[0] === 'wg' && argv[1] === 'set' && argv[2] === iface &&
+    argv[3] === 'peer' && PUBKEY_RE.test(argv[4]!) &&
+    argv[5] === 'preshared-key' && argv[6] === PSK_FILE &&
+    argv[7] === 'allowed-ips' && isTunnelCidr(argv[8]!) &&
+    PUBKEY_RE.test(step.secret ?? '')
+  ) return;
+  if (step.secret !== undefined) throw new Error(`Unsafe WireGuard command: unexpected secret for ${argv.join(' ')}`);
+
   // wg set <iface> peer <pubkey> allowed-ips <ip>/32
   if (
     argv.length === 7 &&
@@ -131,11 +155,11 @@ function validateStep(iface: string, argv: string[]): void {
 
 export async function executePlan(plan: CommandPlan, run: typeof runStep = runStep): Promise<CommandResult[]> {
   validateInterface(plan.iface);
-  for (const step of plan.steps) validateStep(plan.iface, step.argv);
+  for (const step of plan.steps) validateStep(plan.iface, step);
 
   const results: CommandResult[] = [];
   for (const step of plan.steps) {
-    const result = await run(step.argv);
+    const result = await run(step);
     results.push(result);
     if (result.exitCode !== 0) {
       throw new Error(
@@ -146,7 +170,20 @@ export async function executePlan(plan: CommandPlan, run: typeof runStep = runSt
   return results;
 }
 
-async function runStep(argv: string[]): Promise<CommandResult> {
+async function runStep({ argv, secret }: CommandStep): Promise<CommandResult> {
+  if (secret === undefined) return runArgv(argv);
+  const dir = await mkdtemp(join(tmpdir(), 'cashu-vpn-')); // 0700
+  try {
+    const file = join(dir, 'psk');
+    await writeFile(file, secret, { mode: 0o600 });
+    const result = await runArgv(argv.map((a) => (a === PSK_FILE ? file : a)));
+    return { ...result, argv };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function runArgv(argv: string[]): Promise<CommandResult> {
   const [program, ...args] = argv;
   try {
     const { stdout, stderr } = await execFileAsync(program!, args);
@@ -171,6 +208,7 @@ export function generateClientConfig(opts: {
   purchaseId: string;
   dryRun: boolean;
   dns?: string[];
+  presharedKey?: string;
 }): string {
   // Full-tunnel (AllowedIPs = 0.0.0.0/0) needs an explicit DNS line, or the
   // client keeps its LAN resolver — unreachable through the tunnel — and name
@@ -201,6 +239,7 @@ export function generateClientConfig(opts: {
     '',
     '[Peer]',
     `PublicKey = ${opts.serverPublicKey}`,
+    ...(opts.presharedKey ? [`PresharedKey = ${opts.presharedKey}`] : []),
     `Endpoint = ${opts.endpoint}`,
     'AllowedIPs = 0.0.0.0/0',
     'PersistentKeepalive = 25',
@@ -263,7 +302,10 @@ async function removeStalePeer(
       l.purchaseId !== lease.purchaseId
   );
   if (renewed) return false; // a re-buy owns this key now — leave its peer alone
-  await exec(planRemovePeer(iface, lease.clientPublicKey, lease.tunnelIp));
+  const [peer, route] = planRemovePeer(iface, lease.clientPublicKey, lease.tunnelIp).steps;
+  await exec({ iface, steps: [peer!] });
+  // The route may already be gone (eg the host restarted since); the lease is done either way.
+  await exec({ iface, steps: [route!] }).catch(() => {});
   await ledger.markExpired(lease.purchaseId);
   return true;
 }
@@ -328,7 +370,8 @@ export async function enforceDataCaps(
       } else {
         skipped.push(lease);
       }
-    } catch {
+    } catch (e) {
+      console.error(`could not remove peer ${lease.purchaseId} (${lease.tunnelIp}); will retry:`, e instanceof Error ? e.message : e);
       skipped.push(lease);
     }
   }
@@ -339,7 +382,7 @@ export async function enforceDataCaps(
 // --- Startup reconciliation ---
 
 /**
- * Re-add every active lease's peer to the interface. Runtime peers are added with
+ * Re-add any active lease whose peer or route is missing from the interface. Runtime peers are added with
  * `wg set` and deliberately kept OUT of wg0.conf, so a host or wg-interface
  * restart brings wg0 up without them — paid buyers silently dropped while their
  * order still reads `ready` and lease `active`. Run once at startup (before
@@ -351,17 +394,21 @@ export async function reconcileActivePeers(
   iface: string,
   now = new Date(),
   exec: typeof executePlan = executePlan,
-  wgLock: WgLock = runDirect
+  wgLock: WgLock = runDirect,
+  readState: typeof readInterfaceState = readInterfaceState
 ): Promise<{ restored: number; failed: number }> {
   const active = (await ledger.list(now)).filter((l) => l.status === 'active');
+  // Re-add only what is missing; if the interface can't be read, re-add everything.
+  const state = await readState(iface).catch(() => undefined);
+  const missing = active.filter((l) => !state || !state.peers.has(l.clientPublicKey) || !state.routes.has(l.tunnelIp));
   let restored = 0;
   let failed = 0;
-  for (const lease of active) {
+  for (const lease of missing) {
     try {
       // Under the shared wg lock so a periodic reconcile can't interleave with
       // cleanup's `wg ... remove` on the same key (startup passes no lock — nothing
       // else is mutating the interface yet).
-      await wgLock(() => exec(planAddPeer(iface, lease.clientPublicKey, lease.tunnelIp)));
+      await wgLock(() => exec(planAddPeer(iface, lease.clientPublicKey, lease.tunnelIp, lease.presharedKey)));
       restored++;
     } catch (e) {
       failed++;
@@ -369,6 +416,19 @@ export async function reconcileActivePeers(
     }
   }
   return { restored, failed };
+}
+
+/** The peer keys on `iface` and the tunnel IPs routed to it, read once per reconcile pass. */
+export async function readInterfaceState(iface: string): Promise<{ peers: Set<string>; routes: Set<string> }> {
+  validateInterface(iface);
+  const [{ stdout: peers }, { stdout: routes }] = await Promise.all([
+    execFileAsync('wg', ['show', iface, 'peers']),
+    execFileAsync('ip', ['route', 'show', 'dev', iface]),
+  ]);
+  return {
+    peers: new Set(peers.split('\n').map((l) => l.trim()).filter(Boolean)),
+    routes: new Set(routes.split('\n').map((l) => l.trim().split(/\s+/)[0]!.replace(/\/32$/, '')).filter(Boolean)),
+  };
 }
 
 // --- Expired peer cleanup ---
@@ -397,7 +457,8 @@ export async function cleanupExpiredPeers(
       } else {
         skipped.push(lease);
       }
-    } catch {
+    } catch (e) {
+      console.error(`could not remove peer ${lease.purchaseId} (${lease.tunnelIp}); will retry:`, e instanceof Error ? e.message : e);
       skipped.push(lease);
     }
   }

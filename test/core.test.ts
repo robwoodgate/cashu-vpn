@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import test from 'node:test';
 import type { AddressInfo } from 'node:net';
@@ -9,7 +10,7 @@ import { decodePaymentRequest } from '@cashu/cashu-ts';
 import { loadConfig } from '../src/config.js';
 import { createAllocator } from '../src/peers.js';
 import { createMemoryProofStore, createFileProofStore } from '../src/wallet.js';
-import { createMemoryStateStore, createFileStateStore, newOrderId, newPurchaseId, type Order, type ProvisionArgs, type StateStore } from '../src/state.js';
+import { createMemoryStateStore, createFileStateStore, newOrderId, newPurchaseId, RENEWAL_GRACE_MS, type Order, type ProvisionArgs, type StateStore } from '../src/state.js';
 import {
   validateInterface,
   validatePublicKey,
@@ -24,14 +25,14 @@ import {
 import { serialize } from '../src/serialize.js';
 import type { PeerLease } from '../src/peers.js';
 import { HDKey } from '@scure/bip32';
-import { createP2PKsecret, getP2PKExpectedWitnessPubkeys } from '@cashu/cashu-ts';
-import { buildPaymentRequest, normalizeMintUrl, normalizePubkey, verifyPayment, popcount, type VerifyDeps } from '../src/cashu.js';
+import { OutputData, PaymentRequestBuilder, Wallet, createP2PKsecret, getP2PKExpectedWitnessPubkeys, isBlsKeyset, type PaymentRequest, type Proof } from '@cashu/cashu-ts';
+import { buildPaymentRequest, lockedRequest, normalizeMintUrl, normalizePubkey, verifyPayment, popcount, type VerifyDeps } from '../src/cashu.js';
 import { discover, parseRouteSrcIp } from '../src/discover.js';
 import { deriveChildPubkey, deriveChildKeypair, isPrivateExtendedKey } from '../src/hdkeys.js';
 import { generateOperatorKeys } from '../src/keygen.js';
 import { createLockBook } from '../src/locks.js';
 import { planSweep, sweepAll, filterUnswept, pruneSpent } from '../src/sweep.js';
-import { decodeChallenge, waitForPaid } from '../src/buyer.js';
+import { confFileName, decodeChallenge, waitForPaid, mintLockedPayload, mintAmount } from '../src/buyer.js';
 import { createRateLimiter } from '../src/ratelimit.js';
 import type { ReceivedPayment } from '../src/wallet.js';
 import { createServer } from '../src/server.js';
@@ -188,7 +189,7 @@ const seedStore = (leases: PeerLease[]) => createMemoryStateStore(leases.map((l)
 function provisionStore(store: StateStore, orderId: string, clientPublicKey: string, over: Partial<ProvisionArgs> = {}) {
   return store.provision(orderId, {
     purchaseId: newPurchaseId(), clientPublicKey, amountSats: 250, leaseDurationMs: 60_000,
-    now: new Date(), allocate: lowestFree, readPeerCounter: async () => 0, renderConfig: () => 'CONF',
+    now: new Date(), allocate: lowestFree, presharedKey: 'PSK', renderConfig: () => 'CONF',
     ...over,
   });
 }
@@ -289,6 +290,13 @@ test('planAddPeer and planRemovePeer produce correct argv steps', () => {
     ['ip', 'route', 'replace', '10.77.0.42/32', 'dev', 'wg0'],
   ]);
 
+  // With a PSK the key travels as a private temp file, never in argv.
+  const withPsk = planAddPeer('wg0', 'PUBKEY', '10.77.0.42', 'PSK=');
+  assert.deepEqual(withPsk.steps[0], {
+    argv: ['wg', 'set', 'wg0', 'peer', 'PUBKEY', 'preshared-key', '<preshared-key-file>', 'allowed-ips', '10.77.0.42/32'],
+    secret: 'PSK=',
+  });
+
   const rm = planRemovePeer('wg0', 'PUBKEY', '10.77.0.42');
   assert.deepEqual(rm.steps.map((s) => s.argv), [
     ['wg', 'set', 'wg0', 'peer', 'PUBKEY', 'remove'],
@@ -311,7 +319,7 @@ test('executePlan accepts any /16 pool IP and rejects out-of-pool ones', async (
   // allocated past the old /24 provisioned in state but never got its wg peer.
   const key = 'nKpu1TI56v6JqS+wxnhMd+hBQJ8X15y7075zpATtJWU=';
   const seen: string[][] = [];
-  const fakeRun = (async (argv: string[]) => { seen.push(argv); return { argv, exitCode: 0, stdout: '', stderr: '' }; }) as never;
+  const fakeRun = (async ({ argv }: { argv: string[] }) => { seen.push(argv); return { argv, exitCode: 0, stdout: '', stderr: '' }; }) as never;
   await executePlan({ iface: 'wg0', steps: [
     { argv: ['wg', 'set', 'wg0', 'peer', key, 'allowed-ips', '10.77.84.136/32'] },
     { argv: ['ip', 'route', 'replace', '10.77.255.254/32', 'dev', 'wg0'] },
@@ -324,6 +332,31 @@ test('executePlan accepts any /16 pool IP and rejects out-of-pool ones', async (
       /Unsafe WireGuard command/, bad
     );
   }
+});
+
+test('executePlan only takes a well-formed preshared key, and only where wg expects one', async () => {
+  const key = 'nKpu1TI56v6JqS+wxnhMd+hBQJ8X15y7075zpATtJWU=';
+  const ran: unknown[] = [];
+  const fakeRun = (async (step: { argv: string[] }) => { ran.push(step); return { argv: step.argv, exitCode: 0, stdout: '', stderr: '' }; }) as never;
+  const psk = ['wg', 'set', 'wg0', 'peer', key, 'preshared-key', '<preshared-key-file>', 'allowed-ips', '10.77.0.5/32'];
+  await executePlan({ iface: 'wg0', steps: [{ argv: psk, secret: key }] }, fakeRun);
+  assert.equal(ran.length, 1);
+  for (const secret of [undefined, 'not a key', key + '\n--']) {
+    await assert.rejects(executePlan({ iface: 'wg0', steps: [{ argv: psk, secret }] }, fakeRun), /Unsafe WireGuard command/);
+  }
+  // A step that takes no secret must not be handed one.
+  await assert.rejects(
+    executePlan({ iface: 'wg0', steps: [{ argv: ['wg', 'set', 'wg0', 'peer', key, 'remove'], secret: key }] }, fakeRun),
+    /Unsafe WireGuard command/,
+  );
+  assert.equal(ran.length, 1, 'nothing ran after the first valid plan');
+});
+
+test('generateClientConfig carries the lease preshared key', () => {
+  const conf = generateClientConfig({
+    tunnelIp: '10.77.0.42', serverPublicKey: 'SPK', endpoint: '1.2.3.4:51820', purchaseId: 'p1', dryRun: false, presharedKey: 'PSK=',
+  });
+  assert.match(conf, /\[Peer\]\nPublicKey = SPK\nPresharedKey = PSK=\n/);
 });
 
 test('executePlan rejects unsafe steps before running anything', async () => {
@@ -682,13 +715,13 @@ function okDeps(over: Record<string, unknown> = {}) {
       getKeyset: () => ({ id: 'k1', keys: {} as never }),
     }),
     decode: () => [{ id: 'k1', secret: 's1', amount: 260 }] as never,
-    checkDleq: () => true,
-    witnessPubkeys: () => [OP_PUBKEY],
+    checkMintSignature: async () => true,
+    checkRequest: async () => true,
     ...over,
   };
 }
 
-const VERIFY_OPTS = { acceptedMints: ['https://good.mint'], requiredSats: 250, unit: 'sat' };
+const VERIFY_OPTS = { acceptedMints: ['https://good.mint'], requiredSats: 250, lockPubkey: OP_PUBKEY, unit: 'sat' };
 
 test('verifyPayment rejects an unaccepted mint', async () => {
   const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
@@ -699,43 +732,17 @@ test('verifyPayment rejects an unaccepted mint', async () => {
 });
 
 test('verifyPayment rejects a proof that fails DLEQ', async () => {
-  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({ checkDleq: () => false }));
+  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({ checkMintSignature: async () => false }));
   assert.equal(r.valid, false);
-  assert.equal(r.error, 'invalid_dleq');
+  assert.equal(r.error, 'invalid_signature');
 });
 
-test('verifyPayment rejects an unlocked proof', async () => {
-  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({ witnessPubkeys: () => [] }));
-  assert.equal(r.valid, false);
-  assert.equal(r.error, 'not_locked');
-});
-
-test('verifyPayment rejects a plain (non-P2PK) secret without throwing', async () => {
-  // Real wallets that ignore the PR's nut10 lock send ordinary ecash, whose
-  // secret is plain hex — getP2PKExpectedWitnessPubkeys throws on it. Must be a
-  // clean not_locked rejection, not a 500.
+test('verifyPayment rejects proofs that do not carry the requested lock', async () => {
   const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
-    witnessPubkeys: () => { throw new Error('Can\'t parse secret'); },
+    checkRequest: async () => { throw new Error('nut10 request: proof lock is not the requested spending condition'); },
   }));
   assert.equal(r.valid, false);
-  assert.equal(r.error, 'not_locked');
-});
-
-test('verifyPayment rejects a multisig lock (not sole operator)', async () => {
-  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
-    witnessPubkeys: () => [OP_PUBKEY, '02' + 'b'.repeat(64)],
-  }));
-  assert.equal(r.valid, false);
-  assert.equal(r.error, 'multisig_lock');
-});
-
-test('verifyPayment rejects a lock with a refund/locktime escape', async () => {
-  const secret = JSON.stringify(['P2PK', { nonce: 'n', data: OP_PUBKEY, tags: [['locktime', '1']] }]);
-  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
-    decode: () => [{ id: 'k1', secret, amount: 260 }] as never,
-  }));
-  assert.equal(r.valid, false);
-  assert.equal(r.error, 'refundable_lock');
+  assert.equal(r.error, 'lock_mismatch');
 });
 
 test('verifyPayment rejects a wrong-unit token', async () => {
@@ -746,20 +753,8 @@ test('verifyPayment rejects a wrong-unit token', async () => {
   assert.equal(r.error, 'wrong_unit');
 });
 
-test('verifyPayment rejects inconsistent lock pubkeys across proofs', async () => {
-  let n = 0;
-  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
-    decode: () => [{ id: 'k1', secret: 's1', amount: 130 }, { id: 'k1', secret: 's2', amount: 130 }] as never,
-    witnessPubkeys: () => [n++ === 0 ? OP_PUBKEY : '02' + 'b'.repeat(64)],
-  }));
-  assert.equal(r.valid, false);
-  assert.equal(r.error, 'inconsistent_lock');
-});
-
 test('verifyPayment rejects too-low amount', async () => {
-  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({
-    decode: () => [{ id: 'k1', secret: 's1', amount: 100 }] as never,
-  }));
+  const r = await verifyPayment('tok', VERIFY_OPTS, okDeps({ checkRequest: async () => false }));
   assert.equal(r.valid, false);
   assert.equal(r.error, 'amount_too_low');
 });
@@ -805,6 +800,12 @@ const LIVE_ENV = {
 } satisfies NodeJS.ProcessEnv;
 
 const VALID_WG_KEY = 'nKpu1TI56v6JqS+wxnhMd+hBQJ8X15y7075zpATtJWU=';
+// Distinct well-formed WireGuard public keys, for tests that need several buyers.
+const wgKey = (n: number) => Buffer.alloc(32, n).toString('base64');
+// Buyer order secrets (base64url, 32 chars) and the hash the server stores for them.
+const SECRET_A = 'secret-a-0123456789abcdefghijklm';
+const SECRET_B = 'secret-b-0123456789abcdefghijklm';
+const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
 test('live POST /purchase without payment returns 402 + x-cashu challenge', async () => {
   await withServer(async (url) => {
@@ -851,9 +852,23 @@ test('live POST /purchase refuses with 503 sold_out when every tunnel IP is in u
   }, LIVE_ENV, { store: occupied, allocator: { capacity: 1, allocateTunnelIp: () => '10.77.0.2' } });
 });
 
-test('live POST /purchase lets a same-key renewal through even when the subnet is full', async () => {
-  // The only slot is held by THIS buyer's key; renewal reuses it (capacity-neutral),
-  // so /purchase must still quote (402) rather than refuse with sold_out.
+test('live POST /purchase counts a lease cleanup has not removed yet as holding its IP', async () => {
+  // Allocation keeps such an IP taken, so the sold_out gate must too, or a quoted order hits no_capacity after payment.
+  const past = new Date(Date.now() - 1000).toISOString();
+  const uncleaned = createMemoryStateStore([orderWithLease({
+    purchaseId: 'p-old', clientPublicKey: wgKey(9), tunnelIp: '10.77.0.2', createdAt: past, expiresAt: past, status: 'active',
+  })]);
+  await withServer(async (url) => {
+    const res = await fetch(`${url}/purchase`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+    });
+    assert.equal(res.status, 503);
+    assert.equal((await res.json()).error, 'sold_out');
+  }, LIVE_ENV, { store: uncleaned, allocator: { capacity: 1, allocateTunnelIp: () => '10.77.0.3' } });
+});
+
+test('live POST /purchase refuses a key that already has a live lease', async () => {
+  // Keys rotate: extending a lease means a NEW key plus "renew", never re-buying the old key.
   const future = new Date(Date.now() + 3600_000).toISOString();
   const occupied = createMemoryStateStore([orderWithLease({
     purchaseId: 'p-mine', clientPublicKey: VALID_WG_KEY, tunnelIp: '10.77.0.2',
@@ -861,12 +876,98 @@ test('live POST /purchase lets a same-key renewal through even when the subnet i
   })]);
   await withServer(async (url) => {
     const res = await fetch(`${url}/purchase`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
     });
-    assert.equal(res.status, 402);
-  }, LIVE_ENV, { store: occupied, allocator: { capacity: 1, allocateTunnelIp: () => '10.77.0.2' } });
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).error, 'key_in_use');
+  }, LIVE_ENV, { store: occupied });
+});
+
+test('live POST /purchase hands a retried key its open order instead of a second one', async () => {
+  // Two orders for one key would strand the second payment (key_in_use at provision).
+  await withServer(async (url) => {
+    const ask = (body: Record<string, unknown>) => fetch(`${url}/purchase`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, ...body }),
+    });
+    const first = await ask({ secret: SECRET_A });
+    const again = await ask({ secret: SECRET_A });
+    assert.equal(again.status, 402);
+    const [a, b] = [await first.json(), await again.json()];
+    assert.equal(b.orderId, a.orderId, 'same order');
+    assert.equal(again.headers.get('x-cashu'), first.headers.get('x-cashu'), 'same payment request');
+    // Without the order's secret the key alone gets nothing back.
+    for (const body of [{}, { secret: SECRET_B }]) {
+      const res = await ask(body);
+      assert.equal(res.status, 409);
+      assert.equal((await res.json()).orderId, undefined, 'no order id for a caller without its secret');
+    }
+    // A different ask for the same key is refused rather than opening a second order.
+    const otherPlan = await ask({ tier: '30d', secret: SECRET_A });
+    assert.equal(otherPlan.status, 409);
+    const body = await otherPlan.json();
+    assert.equal(body.error, 'order_pending');
+    assert.equal(body.orderId, undefined, 'the 409 does not hand out the open order id');
+  }, { ...LIVE_ENV, TIERS: '[{"name":"1w","sats":500,"durationMs":604800000,"gb":15},{"name":"30d","sats":1500,"durationMs":2592000000,"gb":50}]' });
+});
+
+test('live POST /purchase caps renewal at two prepaid periods', async () => {
+  const day = 86_400_000;
+  const lease = (expiresInMs: number) => createMemoryStateStore([{ ...orderWithLease({
+    purchaseId: 'p-a', clientPublicKey: wgKey(5), tunnelIp: '10.77.0.2',
+    createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + expiresInMs).toISOString(), status: 'active',
+  }), secretHash: sha256(SECRET_A) }]);
+  const renew = (url: string) => fetch(`${url}/purchase`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, renew: 'o-p-a', renewSecret: SECRET_A }),
+  });
+  // A day left on a 1-day plan: renewing leaves exactly two days. Allowed.
+  await withServer(async (url) => assert.equal((await renew(url)).status, 402), LIVE_ENV, { store: lease(day) });
+  // Two days left: renewing would leave three. Refused, with when it opens.
+  await withServer(async (url) => {
+    const res = await renew(url);
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error, 'renew_too_early');
+    assert.ok(Math.abs(new Date(body.opensAt).getTime() - (Date.now() + day)) < 60_000, 'opens once a period is left');
+  }, LIVE_ENV, { store: lease(2 * day) });
+});
+
+test('live POST /purchase renews only for the holder of the order secret', async () => {
+  // The order id travels in the payment request (QR, wallet, transport URL), so it can't be the proof.
+  const future = new Date(Date.now() + 3600_000).toISOString();
+  const store = createMemoryStateStore([{ ...orderWithLease({
+    purchaseId: 'p-a', clientPublicKey: wgKey(5), tunnelIp: '10.77.0.2',
+    createdAt: new Date().toISOString(), expiresAt: future, status: 'active',
+  }), secretHash: sha256(SECRET_A) }]);
+  const renew = (url: string, body: Record<string, unknown>) => fetch(`${url}/purchase`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, ...body }),
+  });
+  await withServer(async (url) => {
+    for (const body of [{ renew: 'o-p-a' }, { renew: 'o-p-a', renewSecret: SECRET_B }, { renew: 'no-such-order', renewSecret: SECRET_A }, { renew: 42 }]) {
+      const res = await renew(url, body);
+      assert.equal(res.status, 403, JSON.stringify(body));
+      assert.equal((await res.json()).error, 'renew_unauthorized');
+    }
+    assert.equal((await renew(url, { renew: 'o-p-a', renewSecret: SECRET_A })).status, 402, 'the secret holder can renew');
+    // A malformed secret is a client error.
+    assert.equal((await renew(url, { secret: 'short' })).status, 400);
+  }, LIVE_ENV, { store });
+});
+
+test('live POST /purchase refuses to renew a lease that has ended', async () => {
+  const past = new Date(Date.now() - 1000).toISOString();
+  const store = createMemoryStateStore([{ ...orderWithLease({
+    purchaseId: 'p-a', clientPublicKey: wgKey(5), tunnelIp: '10.77.0.2', createdAt: past, expiresAt: past, status: 'active',
+  }), secretHash: sha256(SECRET_A) }]);
+  await withServer(async (url) => {
+    const res = await fetch(`${url}/purchase`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, renew: 'o-p-a', renewSecret: SECRET_A }),
+    });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, 'renew_not_live');
+  }, LIVE_ENV, { store });
 });
 
 test('POST /purchase quotes the named tier and rejects unknown ones', async () => {
@@ -884,13 +985,13 @@ test('POST /purchase quotes the named tier and rejects unknown ones', async () =
     // Omitted tier: the first tier is the default.
     const r2 = await fetch(`${url}/purchase`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+      body: JSON.stringify({ clientPublicKey: wgKey(2) }),
     });
     assert.equal((await r2.json()).quotedSats, 500);
     // Unknown tier: a client error, never silently the default price.
     const r3 = await fetch(`${url}/purchase`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, tier: 'lifetime' }),
+      body: JSON.stringify({ clientPublicKey: wgKey(3), tier: 'lifetime' }),
     });
     assert.equal(r3.status, 400);
     assert.equal((await r3.json()).error, 'unknown_tier');
@@ -1010,17 +1111,17 @@ test('live xpub mode issues a fresh per-tx lock pubkey on each 402', async () =>
     ACCEPTED_MINTS: 'https://mint.example.com',
   } satisfies NodeJS.ProcessEnv; // this test supplies its own lockBook (overrides withServer's default)
   await withServer(async (url) => {
-    const get402Lock = async () => {
+    const get402Lock = async (key: string) => {
       const res = await fetch(`${url}/purchase`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+        body: JSON.stringify({ clientPublicKey: key }),
       });
       assert.equal(res.status, 402);
       return decodePaymentRequest(res.headers.get('x-cashu') ?? '').nut10?.data ?? '';
     };
-    const d1 = await get402Lock();
-    const d2 = await get402Lock();
+    const d1 = await get402Lock(wgKey(1));
+    const d2 = await get402Lock(wgKey(2));
     assert.notEqual(d1, d2); // per-tx unlinkable locks
     assert.equal(lockBook.resolve(d1), 0);
     assert.equal(lockBook.resolve(d2), 1);
@@ -1158,9 +1259,10 @@ test('rate limiter allows up to max then blocks within the window', () => {
 
 test('POST /purchase is rate limited per IP', async () => {
   await withServer(async (url) => {
+    let n = 0; // a fresh key per attempt: a key with a live lease is refused
     const post = () => fetch(`${url}/purchase`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ clientPublicKey: 'k' }),
+      body: JSON.stringify({ clientPublicKey: `k${n++}` }),
     });
     assert.equal((await post()).status, 200);
     assert.equal((await post()).status, 200);
@@ -1181,7 +1283,15 @@ test('decodeChallenge extracts amount/mint/unit/lock from a creqA', () => {
   assert.equal(c.amount, 250);
   assert.equal(c.mintUrl, 'https://mint.example.com');
   assert.equal(c.unit, 'sat');
-  assert.equal(c.lockPubkey, OP_PUBKEY);
+  assert.equal(c.request.nut10?.data, OP_PUBKEY);
+  assert.ok(c.request.toNutrootOptions(), 'carries the nutroot encoding too');
+});
+
+test('confFileName fits the 15-character interface name limit for any pool address', () => {
+  assert.equal(confFileName('10.77.65.27'), 'cashu-65-27');
+  assert.equal(confFileName('10.77.255.254'), 'cashu-255-254'); // the longest: 13
+  assert.equal(confFileName(undefined), 'cashu-vpn');
+  assert.match(confFileName('10.77.255.254'), /^[a-zA-Z0-9_=+.-]{1,15}$/, 'a valid Linux interface name');
 });
 
 test('waitForPaid resolves once the quote is PAID', async () => {
@@ -1190,6 +1300,48 @@ test('waitForPaid resolves once the quote is PAID', async () => {
   const ok = await waitForPaid(wallet as never, 'q', { tries: 5, sleep: async () => {} });
   assert.equal(ok, true);
   assert.equal(n, 3);
+});
+
+// A fake wallet that records what mintLockedPayload asks the mint for.
+function fakeMintWallet(keysetId: string) {
+  const minted: { amount: number; lock: Record<string, unknown>; key?: string }[] = [];
+  const wallet = {
+    getKeyset: () => ({ id: keysetId }),
+    getFeesForKeyset: (n: number) => ({ toNumber: () => Math.ceil((n * 100) / 1000) }), // 100 ppk
+    ops: {
+      mintBolt11: (amount: number) => ({
+        asLocked: (lock: Record<string, unknown>) => {
+          const rec: (typeof minted)[number] = { amount, lock };
+          const step = { privkey: (k: string) => { rec.key = k; return step; }, run: async () => { minted.push(rec); return []; } };
+          return step;
+        },
+      }),
+    },
+  };
+  return { wallet, minted };
+}
+
+test('mintLockedPayload signs a locked quote with its key, and leaves a legacy unlocked one unsigned', async () => {
+  const challenge = decodeChallenge(buildPaymentRequest({ paymentId: 'x', amountSats: 500, mints: ['https://mint.example.com'], lockPubkey: OP_PUBKEY }));
+  const { wallet, minted } = fakeMintWallet('00ad268c4d1f5826');
+  await mintLockedPayload(wallet as never, challenge, { quote: 'q' } as never, 'quote-sk');
+  await mintLockedPayload(wallet as never, challenge, { quote: 'q' } as never);
+  assert.deepEqual(minted.map((m) => m.key), ['quote-sk', undefined]);
+});
+
+test('mintLockedPayload mints the lock encoding the keyset takes, grossed up for input fees', async () => {
+  const challenge = decodeChallenge(buildPaymentRequest({ paymentId: 'x', amountSats: 500, mints: ['https://mint.example.com'], lockPubkey: OP_PUBKEY }));
+  const legacy = fakeMintWallet('00ad268c4d1f5826');
+  await mintLockedPayload(legacy.wallet as never, challenge, { quote: 'q' } as never, 'k');
+  assert.deepEqual(legacy.minted[0]!.lock.mainKeys, [OP_PUBKEY]); // NUT-11 lock
+  assert.equal(legacy.minted[0]!.lock.leaves, undefined);
+  const v3 = fakeMintWallet('02' + 'f'.repeat(64));
+  await mintLockedPayload(v3.wallet as never, challenge, { quote: 'q' } as never, 'k');
+  assert.equal(v3.minted[0]!.lock.mainKeys, undefined); // nutroot: NUMS tree, key in a leaf
+  assert.deepEqual((v3.minted[0]!.lock.leaves as { keys: string[] }[])[0]!.keys, [OP_PUBKEY]);
+  // 501 splits into 7 proofs, 1 sat fee at 100 ppk: the payee still nets 500.
+  assert.equal(legacy.minted[0]!.amount, 501);
+  assert.equal(mintAmount(legacy.wallet as never, challenge), 501);
 });
 
 test('waitForPaid times out if never paid', async () => {
@@ -1558,7 +1710,7 @@ test('property: an honest power-of-two split never trips the dust guard', async 
     const proofs = parts.map((amount, i) => ({ id: 'k1', secret: `s${t}_${i}`, amount }));
     const r = await verifyPayment(
       'tok',
-      { acceptedMints: ['https://good.mint'], requiredSats: n, unit: 'sat', proofCountMargin: 0 },
+      { acceptedMints: ['https://good.mint'], requiredSats: n, lockPubkey: OP_PUBKEY, unit: 'sat', proofCountMargin: 0 },
       okDeps({ decode: () => proofs as never }),
     );
     assert.equal(r.valid, true, `honest split must verify (n=${n})`);
@@ -1598,27 +1750,96 @@ test('property: planSweep partitions every receipt exactly once', () => {
 
 // --- Atomic provisioning + cross-process prune lock ---
 
-test('provision renews a same-key lease in place: keeps the IP, expires the prior', async () => {
-  // One key holds one active lease. A second order for the same key is a renewal: it
-  // REUSES the live peer's IP (no route churn / counter reset) and rebases the data
-  // cap to the live counter, expiring the prior lease — all in one atomic write.
+test('provision renews onto a new key and IP, starting where the prior lease ends', async () => {
+  const store = createMemoryStateStore();
+  const future = new Date(Date.now() + 60_000).toISOString();
+  await store.createOrder({ id: 'oa', status: 'pending', clientPublicKey: 'K1', lockPubkey: '', createdAt: new Date().toISOString(), expiresAt: future });
+  await store.createOrder({ id: 'ob', status: 'pending', clientPublicKey: 'K2', lockPubkey: '', renewOf: 'oa', createdAt: new Date().toISOString(), expiresAt: future });
+  const hour = { leaseDurationMs: 3_600_000 }; // longer than the grace, so the cut shows
+  const a = await provisionStore(store, 'oa', 'K1', { presharedKey: 'PSK1', ...hour });
+  const b = await provisionStore(store, 'ob', 'K2', { presharedKey: 'PSK2', ...hour });
+  assert.notEqual(b!.order.lease!.tunnelIp, a!.order.lease!.tunnelIp, 'the renewal gets its own IP');
+  assert.equal(b!.order.lease!.presharedKey, 'PSK2', 'and its own preshared key');
+  // Early renewal tops up: the new expiry starts where the prior lease ends.
+  assert.equal(new Date(b!.order.lease!.expiresAt).getTime(), new Date(a!.order.lease!.expiresAt).getTime() + 3_600_000);
+  // The prior keeps working only for the switch-over grace, so it isn't a free second device.
+  const priorNow = (await store.getOrder('oa'))!.lease!;
+  assert.ok(new Date(priorNow.expiresAt).getTime() <= Date.now() + RENEWAL_GRACE_MS, 'prior cut to the grace');
+  const active = (await store.list()).filter((l) => l.status === 'active');
+  assert.deepEqual(active.map((l) => l.clientPublicKey).sort(), ['K1', 'K2'], 'both run during the grace');
+  const afterGrace = (await store.list(new Date(Date.now() + RENEWAL_GRACE_MS + 1000))).filter((l) => l.status === 'active');
+  assert.deepEqual(afterGrace.map((l) => l.clientPublicKey), ['K2'], 'then only the renewal');
+  // The link between the two keys is not kept once provisioned.
+  assert.equal((await store.getOrder('ob'))!.renewOf, undefined);
+});
+
+test('a renewal near the prior lease end leaves that end alone', async () => {
+  const store = createMemoryStateStore();
+  const future = new Date(Date.now() + 60_000).toISOString();
+  await store.createOrder({ id: 'oa', status: 'pending', clientPublicKey: 'K1', lockPubkey: '', createdAt: new Date().toISOString(), expiresAt: future });
+  await store.createOrder({ id: 'ob', status: 'pending', clientPublicKey: 'K2', lockPubkey: '', renewOf: 'oa', createdAt: new Date().toISOString(), expiresAt: future });
+  const a = await provisionStore(store, 'oa', 'K1'); // 60 s lease: already inside the grace
+  await provisionStore(store, 'ob', 'K2');
+  assert.equal((await store.getOrder('oa'))!.lease!.expiresAt, a!.order.lease!.expiresAt, 'never extended by the cut');
+});
+
+test('provision keeps an expired lease IP taken until cleanup has removed its peer', async () => {
+  // Otherwise cleanup's `ip route del` for the old peer would cut the new holder of the IP.
+  const past = new Date(Date.now() - 1000).toISOString();
+  const store = seedStore([{ purchaseId: 'old', clientPublicKey: 'K0', tunnelIp: '10.77.0.2', createdAt: past, expiresAt: past, status: 'active' }]);
+  const future = new Date(Date.now() + 60_000).toISOString();
+  await store.createOrder({ id: 'on', status: 'pending', clientPublicKey: 'K1', lockPubkey: '', createdAt: new Date().toISOString(), expiresAt: future });
+  const r = await provisionStore(store, 'on', 'K1');
+  assert.notEqual(r!.order.lease!.tunnelIp, '10.77.0.2');
+  await store.markExpired('old'); // cleanup removed the peer: now the IP is free again
+  await store.createOrder({ id: 'o2', status: 'pending', clientPublicKey: 'K2', lockPubkey: '', createdAt: new Date().toISOString(), expiresAt: future });
+  assert.equal((await provisionStore(store, 'o2', 'K2'))!.order.lease!.tunnelIp, '10.77.0.2');
+});
+
+test('a paid order hands its config only to the holder of its secret', async () => {
+  // The order id is in the payment request; it must not unlock the PSK and tunnel IP.
+  const store = createMemoryStateStore();
+  const lockBook = await createLockBook(TEST_XPUB);
+  await withServer(async (url) => {
+    const { orderId } = await (await newOrder(url, { secret: SECRET_A })).json();
+    const paid = await (await payOrder(url, orderId, 0)).json(); // a wallet: no secret
+    assert.equal(paid.status, 'ready');
+    assert.equal(paid.clientConfig, undefined, 'the paying wallet gets no config');
+    for (const headers of [{}, { 'x-order-secret': SECRET_B }] as Record<string, string>[]) {
+      const d = await (await fetch(`${url}/order/${orderId}`, { headers })).json();
+      assert.equal(d.status, 'ready');
+      assert.equal(d.clientConfig, undefined);
+      assert.equal(d.tunnelIp, undefined);
+    }
+    const mine = await (await fetch(`${url}/order/${orderId}`, { headers: { 'x-order-secret': SECRET_A } })).json();
+    assert.match(mine.clientConfig, /PresharedKey = /);
+    assert.equal(mine.lease.presharedKey, undefined, 'the PSK is only in the config, not repeated in the lease');
+    const again = await (await payOrder(url, orderId, 0, SECRET_A)).json();
+    assert.equal(again.clientConfig, mine.clientConfig, 'a repeat /pay with the secret gets it too');
+  }, LIVE_ENV, { store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
+});
+
+test('cleanup expires a lease whose route is already gone, rather than retrying it forever', async () => {
+  // After a host restart the route of a lease that expired meanwhile no longer exists.
+  const past = new Date(Date.now() - 1000).toISOString();
+  const store = seedStore([{ purchaseId: 'old', clientPublicKey: 'K0', tunnelIp: '10.77.0.2', createdAt: past, expiresAt: past, status: 'active' }]);
+  const exec = async (plan: { steps: { argv: string[] }[] }) => {
+    if (plan.steps[0]!.argv[0] === 'ip') throw new Error('RTNETLINK answers: No such process');
+    return [];
+  };
+  const r = await cleanupExpiredPeers(store, 'wg0', false, new Date(), serialize(), exec as never);
+  assert.deepEqual(r.cleaned.map((l) => l.purchaseId), ['old']);
+  assert.equal(await store.countOccupied(), 0, 'the IP is free again');
+});
+
+test('provision refuses a key that already holds a live lease', async () => {
   const store = createMemoryStateStore();
   const future = new Date(Date.now() + 60_000).toISOString();
   await store.createOrder({ id: 'oa', status: 'pending', clientPublicKey: 'K', lockPubkey: '', createdAt: new Date().toISOString(), expiresAt: future });
   await store.createOrder({ id: 'ob', status: 'pending', clientPublicKey: 'K', lockPubkey: '', createdAt: new Date().toISOString(), expiresAt: future });
-  const a = await provisionStore(store, 'oa', 'K');
-  const b = await provisionStore(store, 'ob', 'K', { readPeerCounter: async () => 4242 });
-  assert.equal(b!.order.lease!.tunnelIp, a!.order.lease!.tunnelIp, 'renewal keeps the live peer IP');
-  assert.equal(b!.order.lease!.capBaseline, 4242, 'renewal rebases the data cap to the live counter');
-  const active = (await store.list()).filter((l) => l.status === 'active');
-  assert.equal(active.length, 1, 'one key, one active lease');
-  assert.equal(active[0]!.purchaseId, b!.order.purchaseId, 'the newest lease wins');
-  assert.equal((await store.list()).length, 2, 'the prior lease is expired, not deleted');
-  // Early renewal tops up: the new expiry starts where the prior lease ended,
-  // so the remaining time isn't forfeited.
-  const priorExpiry = new Date(a!.order.lease!.expiresAt).getTime();
-  const renewedExpiry = new Date(b!.order.lease!.expiresAt).getTime();
-  assert.equal(renewedExpiry, priorExpiry + 60_000, 'renewal extends from the prior expiry, not from now');
+  await provisionStore(store, 'oa', 'K');
+  await assert.rejects(provisionStore(store, 'ob', 'K'), (e: { code?: string }) => e.code === 'KEY_IN_USE');
+  assert.equal((await store.getOrder('ob'))!.status, 'pending', 'nothing committed');
 });
 
 test('cleanup skips removing a peer whose key a concurrent re-buy now owns', async () => {
@@ -1646,7 +1867,7 @@ test('cleanup skips removing a peer whose key a concurrent re-buy now owns', asy
   const orphan = seedStore([mk('old', past, '10.77.0.2')]);
   execCalls = 0;
   const r2 = await cleanupExpiredPeers(orphan, 'wg0', false, now, serialize(), fakeExec as never);
-  assert.equal(execCalls, 1, 'expired peer removed when no live lease claims its key');
+  assert.equal(execCalls, 2, 'expired peer removed (peer, then its route) when no live lease claims its key');
   assert.deepEqual(r2.cleaned.map((l) => l.purchaseId), ['old']);
 });
 
@@ -1667,6 +1888,24 @@ test('reconcileActivePeers re-adds only active leases at startup', async () => {
   const r = await reconcileActivePeers(store, 'wg0', now, exec as never);
   assert.deepEqual(r, { restored: 1, failed: 0 });
   assert.deepEqual(added, ['K-live']);
+});
+
+test('reconcileActivePeers re-adds only peers or routes missing from the interface', async () => {
+  const now = new Date();
+  const future = new Date(now.getTime() + 60_000).toISOString();
+  const mk = (id: string, tunnelIp: string): PeerLease =>
+    ({ purchaseId: id, clientPublicKey: `K-${id}`, tunnelIp, createdAt: now.toISOString(), expiresAt: future, status: 'active', presharedKey: 'PSK' });
+  const store = seedStore([mk('ok', '10.77.0.2'), mk('noroute', '10.77.0.3'), mk('nopeer', '10.77.0.4')]);
+  const added: string[] = [];
+  const exec = async (plan: { steps: { argv: string[] }[] }) => { added.push(plan.steps[0]!.argv[4]!); return []; };
+  const state = async () => ({ peers: new Set(['K-ok', 'K-noroute']), routes: new Set(['10.77.0.2', '10.77.0.4']) });
+  const r = await reconcileActivePeers(store, 'wg0', now, exec as never, undefined, state);
+  assert.deepEqual(r, { restored: 2, failed: 0 });
+  assert.deepEqual(added.sort(), ['K-nopeer', 'K-noroute'], 'the healthy peer is left alone');
+  // If the interface can't be read, fall back to re-adding everything.
+  added.length = 0;
+  await reconcileActivePeers(store, 'wg0', now, exec as never, undefined, async () => { throw new Error('wg missing'); });
+  assert.equal(added.length, 3);
 });
 
 test('concurrent provisions serialize allocation — no IP collisions', async () => {
@@ -1765,8 +2004,8 @@ function slowProofStore(delayMs: number) {
 }
 
 // A fake token "idx:N" that verifies as 1000 sat locked to xpub child N. The proof
-// secret encodes the index so witnessPubkeys can return the matching child pubkey —
-// so a test can mint a "token" for any order's lock. The loadMintContext delay
+// secret encodes the index, and checkRequest throws unless that child is the
+// requested lock, so a test can mint a "token" for any order's lock. The loadMintContext delay
 // converges concurrent requests so they actually contend on the per-order guard.
 const fakeToken = (idx: number): string => `idx:${idx}`;
 function xpubVerifyDeps(xpub: string): VerifyDeps {
@@ -1774,19 +2013,25 @@ function xpubVerifyDeps(xpub: string): VerifyDeps {
     getMetadata: () => ({ mint: 'https://mint.example.com', amount: 1000, unit: 'sat' }) as never,
     loadMintContext: async () => { await slept(20); return { keysetIds: ['k1'], getKeyset: () => ({ id: 'k1', keys: {} as never }) }; },
     decode: (t) => [{ id: 'k1', secret: `sec-${String(t).split(':')[1]}`, amount: 1000 }] as never,
-    checkDleq: () => true,
-    witnessPubkeys: (secret) => [deriveChildPubkey(xpub, Number(String(secret).split('-')[1]))],
+    checkMintSignature: async () => true,
+    checkRequest: async (request, proofs) => {
+      const held = deriveChildPubkey(xpub, Number(String(proofs[0]!.secret).split('-')[1]));
+      if (held !== request.nut10?.data) throw new Error('proof lock is not the requested spending condition');
+      return true;
+    },
   };
 }
 
 // POST /purchase: create an order (issues the next xpub child). Returns the Response.
-const newOrder = (url: string) => fetch(`${url}/purchase`, {
+const newOrder = (url: string, body: Record<string, unknown> = {}) => fetch(`${url}/purchase`, {
   method: 'POST', headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ clientPublicKey: VALID_WG_KEY }),
+  body: JSON.stringify({ clientPublicKey: VALID_WG_KEY, ...body }),
 });
 // Deliver the token for child `idx` to its order's /pay sink.
-const payOrder = (url: string, orderId: string, idx: number) => fetch(`${url}/pay/${orderId}`, {
-  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: fakeToken(idx) }),
+const payOrder = (url: string, orderId: string, idx: number, secret?: string) => fetch(`${url}/pay/${orderId}`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', ...(secret && { 'x-order-secret': secret }) },
+  body: JSON.stringify({ token: fakeToken(idx) }),
 });
 // Create an order and pay it in one step; returns the final /pay Response.
 async function buyViaPay(url: string, idx: number): Promise<Response> {
@@ -1819,8 +2064,8 @@ test('/pay rejects a token locked to a different order (per-order binding)', asy
   // unique lock it carries — so an old/foreign token can't redeem a fresh order.
   const lockBook = await createLockBook(TEST_XPUB);
   await withServer(async (url) => {
-    await newOrder(url);                            // order A (child 0)
-    const b = await (await newOrder(url)).json();   // order B (child 1)
+    await newOrder(url);                                                     // order A (child 0)
+    const b = await (await newOrder(url, { clientPublicKey: wgKey(2) })).json(); // order B (child 1)
     const res = await fetch(`${url}/pay/${b.orderId}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: fakeToken(0) }),
     });
@@ -1892,75 +2137,31 @@ test('malformed JSON returns 400 and an oversized body 413 (not 500)', async () 
   }, LIVE_ENV);
 });
 
-test('re-buying with an already-active key renews the lease in place (no early disconnect)', async () => {
-  // A second purchase with the same key is a renewal: the prior lease is expired and
-  // the new one reuses the SAME peer IP (one key, one active lease) — so cleanup never
-  // runs `wg ... peer remove` on a key the live buyer still holds.
+test('renewing through /purchase rotates the key, IP and PSK, and both peers run until the old one ends', async () => {
+  const NEW_KEY = 'mIqQv8Qe0Up5mVb3nX0tIhC3o8V0uQ3v0F5n7TjG1XY=';
   const store = createMemoryStateStore();
   const lockBook = await createLockBook(TEST_XPUB);
+  const applied: { argv: string[]; secret?: string }[] = [];
+  const execPlan = async (plan: { steps: { argv: string[]; secret?: string }[] }) => { applied.push(plan.steps[0]!); return []; };
   await withServer(async (url) => {
-    await buyViaPay(url, 0); // order child 0 → lease 1
-    await buyViaPay(url, 1); // order child 1 → renewal (same key)
+    const first = await (await newOrder(url, { secret: SECRET_A })).json();
+    const a = await (await payOrder(url, first.orderId, 0, SECRET_A)).json();
+    const second = await (await newOrder(url, { clientPublicKey: NEW_KEY, secret: SECRET_B, renew: first.orderId, renewSecret: SECRET_A })).json();
+    const b = await (await payOrder(url, second.orderId, 1, SECRET_B)).json();
+    // A second renewal of the already-renewed lease is refused: its time has moved on.
+    const again = await newOrder(url, { clientPublicKey: wgKey(7), secret: 'secret-c-0123456789abcdefghijklm', renew: first.orderId, renewSecret: SECRET_A });
+    assert.equal(again.status, 400);
+    assert.equal((await again.json()).error, 'renew_not_live');
 
-    const all = await store.list();
-    assert.equal(all.length, 2, 'both purchases recorded a lease');
-    const active = all.filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
-    assert.equal(active.length, 1, 'one key holds exactly one active lease (old one expired, not removed)');
-    assert.equal(active[0]!.tunnelIp, all.find((l) => l.status === 'expired')!.tunnelIp, 'renewal kept the same IP');
-  }, LIVE_ENV, { store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], readTransfers: async () => new Map(), lockBook });
-});
-
-test('a renewal whose wg apply fails still commits (converges, never rolls back)', async () => {
-  // New model: desired state commits first, WireGuard converges. A failed `wg set` on
-  // a renewal is logged, not rolled back — and since a renewal reuses the live peer's
-  // key+IP, the buyer was never cut; housekeep's reconcile re-asserts the peer.
-  const store = createMemoryStateStore();
-  const lockBook = await createLockBook(TEST_XPUB);
-  let calls = 0;
-  const execPlan = async () => { calls += 1; if (calls === 2) throw new Error('wg down'); return []; };
-  await withServer(async (url) => {
-    assert.equal((await buyViaPay(url, 0)).status, 200); // first lease + peer
-    assert.equal((await buyViaPay(url, 1)).status, 200); // renewal commits; wg apply fails but isn't fatal
-
-    const all = await store.list();
-    const active = all.filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
-    assert.equal(active.length, 1, 'one active lease (the renewal); the prior is expired');
-    assert.equal(active[0]!.tunnelIp, all.find((l) => l.status === 'expired')!.tunnelIp, 'renewal kept the same IP');
-  }, LIVE_ENV, { store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: execPlan as never, readTransfers: async () => new Map(), lockBook });
-});
-
-test('a same-key renewal baselines the cap to the peer\'s current counter', async () => {
-  // The renewal's lease must record the peer's cumulative counter as its baseline,
-  // so cap enforcement later charges it only for traffic beyond the prior lease.
-  const store = createMemoryStateStore();
-  const lockBook = await createLockBook(TEST_XPUB);
-  await withServer(async (url) => {
-    assert.equal((await buyViaPay(url, 0)).status, 200); // fresh: baseline 0
-    assert.equal((await buyViaPay(url, 1)).status, 200); // renewal: baseline = counter below
-  }, LIVE_ENV, {
-    store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [],
-    readTransfers: async () => new Map([[VALID_WG_KEY, { rx: 700, tx: 300 }]]), lockBook,
-  });
-  const leases = await store.list();
-  assert.equal(leases.find((l) => l.status === 'active')!.capBaseline, 1000, 'renewal baselined to rx+tx');
-  assert.equal(leases.find((l) => l.status === 'expired')!.capBaseline ?? 0, 0, 'first lease was fresh (no baseline)');
-});
-
-test('a same-key renewal fails (not insta-caps) when the counter read fails', async () => {
-  // A transient `wg show transfer` failure on a renewal must abort the commit, not
-  // baseline to 0 — else the paid replacement inherits the prior usage and is
-  // insta-capped. The order stays pending (no lease committed), so a retry resumes.
-  const store = createMemoryStateStore();
-  const lockBook = await createLockBook(TEST_XPUB);
-  await withServer(async (url) => {
-    assert.equal((await buyViaPay(url, 0)).status, 200); // fresh provision succeeds
-    assert.equal((await buyViaPay(url, 1)).status, 500); // renewal: counter read throws → no commit
-    const active = (await store.list()).filter((l) => l.status === 'active' && l.clientPublicKey === VALID_WG_KEY);
-    assert.equal(active.length, 1, 'the original lease stays active; the renewal did not record');
-  }, LIVE_ENV, {
-    store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [],
-    readTransfers: async () => { throw new Error('wg show failed'); }, lockBook,
-  });
+    assert.notEqual(b.tunnelIp, a.tunnelIp, 'new IP');
+    assert.equal(new Date(b.lease.expiresAt).getTime() - new Date(a.lease.expiresAt).getTime(), 86_400_000, 'starts where the first ends');
+    const psk = (conf: string) => /PresharedKey = (\S+)/.exec(conf)?.[1];
+    assert.ok(psk(a.clientConfig) && psk(b.clientConfig) && psk(a.clientConfig) !== psk(b.clientConfig), 'a fresh PSK per lease');
+    // Each peer went to wg with its own PSK.
+    assert.deepEqual(applied.map((s) => [s.argv[4], s.secret]), [[VALID_WG_KEY, psk(a.clientConfig)], [NEW_KEY, psk(b.clientConfig)]]);
+    const active = (await store.list()).filter((l) => l.status === 'active');
+    assert.deepEqual(active.map((l) => l.clientPublicKey).sort(), [NEW_KEY, VALID_WG_KEY].sort());
+  }, LIVE_ENV, { store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: execPlan as never, lockBook });
 });
 
 test('a fresh provision whose wg apply fails still commits; reconcile adds the peer', async () => {
@@ -1986,37 +2187,96 @@ test('a fresh provision whose wg apply fails still commits; reconcile adds the p
   }, LIVE_ENV, { store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: execPlan as never, lockBook });
 });
 
-// --- Real P2PK secret parsing through verifyPayment (offline, no mint) ---
+// --- Real CTS request checks (offline, no mint) ---
 //
-// The witness-pubkey extraction is the half of verification that breaks silently
-// on a cashu-ts upgrade. Other verify tests fake witnessPubkeys; these drive the
-// REAL getP2PKExpectedWitnessPubkeys (and the real escape-clause parse) end-to-end
-// through verifyPayment, with only DLEQ + mint context faked. DLEQ itself needs a
-// mint-signed proof — covered by the live deploy check, not here.
+// The lock and net-amount half of verification is CTS's isPaymentRequestSatisfied. These run it
+// for real on wallets loaded from captured keysets (testnut v1 and a local v3 BLS mint, both
+// 100 ppk), with proofs built the way a payer builds them. Only the mint signature is faked.
 
-const REAL_P2PK_PUB = deriveChildPubkey(
-  HDKey.fromMasterSeed(new Uint8Array(64).fill(9)).derive("m/1597'/0'").publicExtendedKey, 3,
-);
-const REAL_P2PK_OPTS = { acceptedMints: ['https://good.mint'], requiredSats: 1000, unit: 'sat', proofCountMargin: 0 };
-const realP2PKDeps = (secret: string): VerifyDeps => ({
-  getMetadata: () => ({ mint: 'https://good.mint', amount: 1000, unit: 'sat' }) as never,
-  loadMintContext: async () => ({ keysetIds: ['k1'], getKeyset: () => ({ id: 'k1', keys: {} as never }) }),
-  decode: () => [{ id: 'k1', secret, amount: 1000 }] as never,
-  checkDleq: () => true,
-  // witnessPubkeys left to the real getP2PKExpectedWitnessPubkeys default.
+const MINT_CACHES = JSON.parse(await readFile(new URL('../../test/fixtures/mint-caches.json', import.meta.url), 'utf8'));
+const REAL_XPUB = HDKey.fromMasterSeed(new Uint8Array(64).fill(9)).derive("m/1597'/0'").publicExtendedKey;
+const ORDER_LOCK = deriveChildPubkey(REAL_XPUB, 3);
+const OTHER_LOCK = deriveChildPubkey(REAL_XPUB, 4);
+
+function cachedWallet(kind: 'v1' | 'v3'): Wallet {
+  const { info, cache } = MINT_CACHES[kind];
+  const wallet = new Wallet(cache.mintUrl, { unit: 'sat' });
+  wallet.loadMintFromCache(info, cache);
+  return wallet;
+}
+
+// Proofs as a payer mints them for `pr` on this wallet's keyset, with a placeholder C.
+function payerProofs(wallet: Wallet, pr: PaymentRequest, amount: number): Proof[] {
+  const ks = wallet.getKeyset();
+  const outputs = isBlsKeyset(ks.id)
+    ? OutputData.createNutrootData(pr.toNutrootOptions()!, amount, ks)
+    : OutputData.createP2PKData(pr.toP2PKOptions()!, amount, ks);
+  return outputs.map((o) => ({
+    id: ks.id,
+    amount: o.blindedMessage.amount,
+    secret: typeof o.secret === 'string' ? o.secret : new TextDecoder().decode(o.secret),
+    C: ORDER_LOCK,
+    ...(o.spendInfo && { spend_info: o.spendInfo }),
+  })) as Proof[];
+}
+
+async function verifyReal(wallet: Wallet, proofs: Proof[]) {
+  const mint = wallet.mint.mintUrl;
+  return verifyPayment('tok', { acceptedMints: [mint], requiredSats: 500, lockPubkey: ORDER_LOCK, unit: 'sat', proofCountMargin: 4 }, {
+    getMetadata: () => ({ mint, unit: 'sat' }) as never,
+    loadMintContext: async () => ({ keysetIds: [wallet.getKeyset().id], getKeyset: () => wallet.getKeyset() }),
+    decode: () => proofs,
+    checkMintSignature: async () => true,
+    checkRequest: async (request, ps) => wallet.isPaymentRequestSatisfied(request, ps),
+  });
+}
+
+const orderRequest = (wallet: Wallet, lockPubkey: string) =>
+  lockedRequest({ amountSats: 500, mints: [wallet.mint.mintUrl], lockPubkey }).build();
+
+for (const kind of ['v1', 'v3'] as const) {
+  test(`${kind}: a payer's proofs for the order's request verify, netting the price after fees`, async () => {
+    const wallet = cachedWallet(kind);
+    const r = await verifyReal(wallet, payerProofs(wallet, orderRequest(wallet, ORDER_LOCK), 501));
+    assert.equal(r.valid, true, r.error);
+    assert.equal(r.lockPubkey, normalizePubkey(ORDER_LOCK));
+  });
+
+  test(`${kind}: exactly the price is underpaid once the input fee is due`, async () => {
+    const wallet = cachedWallet(kind);
+    const r = await verifyReal(wallet, payerProofs(wallet, orderRequest(wallet, ORDER_LOCK), 500));
+    assert.equal(r.error, 'amount_too_low');
+  });
+
+  test(`${kind}: proofs locked to another order's key are refused`, async () => {
+    const wallet = cachedWallet(kind);
+    const r = await verifyReal(wallet, payerProofs(wallet, orderRequest(wallet, OTHER_LOCK), 501));
+    assert.equal(r.error, 'lock_mismatch');
+  });
+}
+
+test('v1: a lock with a refund escape is refused', async () => {
+  const wallet = cachedWallet('v1');
+  const escape = new PaymentRequestBuilder().amount(500, 'sat').addMint([wallet.mint.mintUrl])
+    .lock({ kind: 'P2PK', data: ORDER_LOCK, locktime: 9_999_999_999, refundKeys: [OTHER_LOCK] }).build();
+  const r = await verifyReal(wallet, payerProofs(wallet, escape, 501));
+  assert.equal(r.error, 'lock_mismatch');
 });
 
-test('verifyPayment accepts a REAL P2PK secret and recovers the lock pubkey', async () => {
-  const secret = createP2PKsecret(REAL_P2PK_PUB);
-  const r = await verifyPayment('tok', REAL_P2PK_OPTS, realP2PKDeps(secret));
-  assert.equal(r.valid, true);
-  assert.equal(r.lockPubkey, normalizePubkey(REAL_P2PK_PUB));
+test('v1: unlocked ecash is refused', async () => {
+  const wallet = cachedWallet('v1');
+  const ks = wallet.getKeyset();
+  const proofs = OutputData.createRandomData(501, ks).map((o) => ({
+    id: ks.id, amount: o.blindedMessage.amount, secret: new TextDecoder().decode(o.secret as Uint8Array), C: ORDER_LOCK,
+  })) as Proof[];
+  const r = await verifyReal(wallet, proofs);
+  assert.equal(r.error, 'lock_mismatch');
 });
 
-test('verifyPayment rejects a REAL P2PK secret carrying a locktime escape', async () => {
-  // Real secret, real witness extraction (passes), real escape-clause parse (trips).
-  const secret = createP2PKsecret(REAL_P2PK_PUB, [['locktime', '9999999999']]);
-  const r = await verifyPayment('tok', REAL_P2PK_OPTS, realP2PKDeps(secret));
-  assert.equal(r.valid, false);
-  assert.equal(r.error, 'refundable_lock');
+test('v3: a tree with an extra refund leaf is refused', async () => {
+  const wallet = cachedWallet('v3');
+  const escape = new PaymentRequestBuilder().amount(500, 'sat').addMint([wallet.mint.mintUrl])
+    .lock({ leaves: [{ type: 'threshold', n: 1, keys: [ORDER_LOCK] }, { type: 'after', n: 1, time: 9_999_999_999, keys: [OTHER_LOCK] }] }).build();
+  const r = await verifyReal(wallet, payerProofs(wallet, escape, 501));
+  assert.equal(r.error, 'lock_mismatch');
 });

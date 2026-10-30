@@ -1,4 +1,5 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -8,13 +9,27 @@ import type { ProofStore } from './wallet.js';
 import type { LockBook } from './locks.js';
 import { newOrderId, newPurchaseId, type Order, type StateStore } from './state.js';
 import { createRateLimiter, type RateLimiter } from './ratelimit.js';
-import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, enforceDataCaps, readPeerTransfers, reconcileActivePeers, validatePublicKey, type WgLock } from './wireguard.js';
+import { generateClientConfig, planAddPeer, executePlan, cleanupExpiredPeers, enforceDataCaps, reconcileActivePeers, validatePublicKey, type WgLock } from './wireguard.js';
 import { serialize } from './serialize.js';
 import { buildPaymentRequest, verifyPayment, normalizePubkey, type VerifyResult, type VerifyDeps } from './cashu.js';
 import { createNotifier, type Notifier, type WebhookPost } from './notify.js';
 import { getEncodedToken, type Proof } from '@cashu/cashu-ts';
 
 const MAX_BODY_BYTES = 16 * 1024;
+/** A renewal may leave at most this many of its plan's periods prepaid. */
+const RENEW_MAX_PERIODS = 2;
+// A buyer-chosen order secret: base64url, at least 128 bits. Never in the creq or any URL.
+const SECRET_RE = /^[A-Za-z0-9_-]{22,128}$/;
+
+function hashSecret(secret: string): string {
+  return createHash('sha256').update(secret).digest('hex');
+}
+
+/** True if `secret` is the one whose hash the order stored. */
+function secretMatches(hash: string | undefined, secret: unknown): boolean {
+  if (!hash || !/^[0-9a-f]{64}$/.test(hash) || typeof secret !== 'string') return false;
+  return timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(hashSecret(secret), 'hex'));
+}
 const ORDER_ID_RE = /^[A-Za-z0-9_-]{16,}$/;
 
 // Version + source URL, read from package.json (repo root, two levels up from
@@ -46,8 +61,6 @@ export interface ServerDeps {
   verifyDeps?: VerifyDeps;
   /** Test seam: override the WireGuard executor so a provision can run without a live interface. */
   execPlan?: typeof executePlan;
-  /** Test seam: override the per-peer transfer reader (defaults to `wg show transfer`). */
-  readTransfers?: typeof readPeerTransfers;
   /** Test seam: override the notification POST (defaults to the real fetch path). */
   notifyPost?: WebhookPost;
 }
@@ -181,7 +194,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
           leaseDuration: `${t.durationMs / 1000}s`,
           dataCapGb: t.capBytes > 0 ? t.capBytes / 1024 ** 3 : null,
         })),
-        renewal: 'POST /purchase with the same clientPublicKey while its lease is live: keeps the tunnel IP, extends from the current expiry, resets the data cap',
+        renewal: 'POST /purchase with a NEW clientPublicKey, "renew": <orderId of a live lease> and "renewSecret": <the secret sent with that order>: the new lease starts where that one ends, with a new key, IP and preshared key; the old one stops 15 minutes after payment',
         acceptedMints: config.acceptedMints,
         notice: config.notice,
         termsUrl: config.termsUrl,
@@ -227,7 +240,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
     // Per-order poll: the browser fetches ONLY its own order by capability id.
     const orderId = matchPath(path, '/order/');
     if (orderId !== undefined && req.method === 'GET') {
-      return await handleOrderStatus(res, ctx, orderId);
+      return await handleOrderStatus(req, res, ctx, orderId);
     }
 
     if (req.method === 'GET' && (path === '/' || path === '/marketplace')) {
@@ -278,16 +291,66 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     return json(res, 400, { error: 'unknown_tier', tiers: config.tiers.map((t) => t.name) });
   }
 
+  const secret = body.secret;
+  if (secret !== undefined && (typeof secret !== 'string' || !SECRET_RE.test(secret))) {
+    return json(res, 400, { error: 'invalid_secret', message: 'secret must be 22-128 base64url characters' });
+  }
+
+  // A renewal names the order it extends and proves it is that order's buyer with its
+  // secret (the order id alone is no proof: it travels in the payment request). It
+  // brings a NEW key, so leases rotate keys instead of building one long-lived identity.
+  const now0 = new Date();
+  const live = (await ctx.store.list(now0)).filter((l) => l.status === 'active');
+  const renewOf = body.renew;
+  if (renewOf !== undefined) {
+    const prior = typeof renewOf === 'string' ? await ctx.store.getOrder(renewOf, now0) : undefined;
+    if (!prior || !secretMatches(prior.secretHash, body.renewSecret)) {
+      return json(res, 403, { error: 'renew_unauthorized', message: 'renewSecret must be the secret sent when that order was placed' });
+    }
+    if (!prior.lease || prior.lease.renewed || !live.some((l) => l.purchaseId === prior.lease!.purchaseId)) {
+      return json(res, 400, { error: 'renew_not_live', message: 'renew must name an order whose lease is still active' });
+    }
+    // Prepaid time is capped at RENEW_MAX_PERIODS of the plan: it bounds the operator's
+    // liability and how long one key lives, since keys only rotate on renewal.
+    const opensAt = new Date(prior.lease.expiresAt).getTime() + tier.durationMs - RENEW_MAX_PERIODS * tier.durationMs;
+    if (opensAt > now0.getTime()) {
+      return json(res, 400, {
+        error: 'renew_too_early',
+        opensAt: new Date(opensAt).toISOString(),
+        message: `Renewal would prepay more than ${RENEW_MAX_PERIODS} periods; it opens at ${new Date(opensAt).toISOString()}`,
+      });
+    }
+  }
+  // A retried /purchase for a key with an open order gets that order back, not a second
+  // one (paying two orders for one key would strand the second payment, key_in_use). Only
+  // with the order's secret: the public key alone doesn't prove who is asking.
+  const pending = await ctx.store.findPending(clientPublicKey, now0);
+  if (pending && config.mode === 'live') {
+    const sameAsk = pending.tier?.name === tier.name && pending.renewOf === (typeof renewOf === 'string' ? renewOf : undefined);
+    if (!sameAsk || !secretMatches(pending.secretHash, secret)) {
+      return json(res, 409, { error: 'order_pending', message: 'This key already has an unpaid order: repeat that request, with its secret, to get it back, or use a new key.' });
+    }
+    return sendChallenge(req, res, config, pending);
+  }
+  if (live.some((l) => l.clientPublicKey === clientPublicKey)) {
+    return json(res, 409, {
+      error: 'key_in_use',
+      message: 'This WireGuard key has a live lease. To extend it, renew with a NEW key: {"clientPublicKey": <new>, "renew": <orderId>, "renewSecret": <its secret>}',
+    });
+  }
+
   // Dry-run skips payment entirely: create an order and provision it immediately.
   if (config.mode !== 'live') {
     const orderId = newOrderId();
     const now = new Date();
     await ctx.store.createOrder({
       id: orderId, status: 'pending', clientPublicKey, lockPubkey: '', tier,
+      ...(typeof renewOf === 'string' && { renewOf }),
+      ...(typeof secret === 'string' && { secretHash: hashSecret(secret) }),
       createdAt: now.toISOString(), expiresAt: new Date(now.getTime() + config.orderTtlMs).toISOString(),
     });
     const result = await runProvision(ctx, orderId, clientPublicKey, undefined, undefined, tier);
-    return json(res, 200, { ...readyBundleOf(result!.order), mode: config.mode });
+    return json(res, 200, { ...readyBundleOf(result!.order), orderId, mode: config.mode });
   }
 
   if (!ctx.lockBook) {
@@ -310,13 +373,9 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
   // Don't quote a payment we can't fulfil: if every tunnel IP is already on a
   // live lease, refuse before issuing the request. Best-effort (capacity can
   // still vanish between this quote and /pay) — the /pay 503 no_capacity stays
-  // the hard backstop — but it stops us selling into a full subnet. A same-key
-  // renewal reuses its own slot (state.provision), so it's capacity-neutral and
-  // must be let through even when full.
-  const now0 = new Date();
-  const live = (await ctx.store.list(now0)).filter((l) => l.status === 'active');
-  const ownsSlot = live.some((l) => l.clientPublicKey === clientPublicKey);
-  if (!ownsSlot && live.length >= ctx.allocator.capacity) {
+  // the hard backstop — but it stops us selling into a full subnet. A renewal
+  // needs a slot too: its new key runs beside the old one for the switch-over grace.
+  if ((await ctx.store.countOccupied()) >= ctx.allocator.capacity) {
     return json(res, 503, { error: 'sold_out', message: 'All tunnel slots are in use; try again later.' });
   }
 
@@ -334,25 +393,32 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
     lockPubkey,
     lockIndex: lock.index,
     tier,
+    ...(typeof renewOf === 'string' && { renewOf }),
+    ...(typeof secret === 'string' && { secretHash: hashSecret(secret) }),
     createdAt: now.toISOString(),
     expiresAt: new Date(now.getTime() + config.orderTtlMs).toISOString(),
   };
   await ctx.store.createOrder(order);
+  sendChallenge(req, res, config, order);
+}
 
+/** Answer 402 with the order's payment request (rebuilt the same way each time). */
+function sendChallenge(req: IncomingMessage, res: ServerResponse, config: Config, order: Order): void {
+  const tier = order.tier ?? config.tiers[0]!;
   const creq = buildPaymentRequest({
-    paymentId: orderId,
+    paymentId: order.id,
     amountSats: tier.priceSats,
     mints: config.acceptedMints,
-    lockPubkey,
+    lockPubkey: order.lockPubkey,
     unit: config.unit,
     description: 'cashu-vpn access',
-    transportTarget: `${baseUrl(req, config)}/pay/${orderId}`,
+    transportTarget: `${baseUrl(req, config)}/pay/${order.id}`,
   });
 
   res.writeHead(402, { 'content-type': 'application/json; charset=utf-8', 'x-cashu': creq });
   res.end(JSON.stringify({
     error: 'payment_required',
-    orderId,
+    orderId: order.id,
     creq,
     tier: tier.name,
     quotedSats: tier.priceSats,
@@ -380,7 +446,7 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
   // Idempotent: already provisioned. Return the config too, so an agent that POSTs
   // here itself gets the .conf in one shot (a wallet just ignores the extra fields).
   if (order.status === 'ready') {
-    return json(res, 200, { ok: true, status: 'ready', ...readyBundleOf(order), mode: ctx.config.mode });
+    return json(res, 200, { ok: true, status: 'ready', ...bundleFor(req, order), mode: ctx.config.mode });
   }
 
   const body = await readBody(req);
@@ -393,7 +459,7 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
     return json(res, 400, { error: 'invalid_payload', message: 'Expected a NUT-18 payload {mint,unit,proofs} or {token}' });
   }
 
-  const verified = await verifyAndAuthorize(ctx, encodedToken, order.tier?.priceSats ?? ctx.config.priceSats);
+  const verified = await verifyAndAuthorize(ctx, encodedToken, order);
   if ('error' in verified) {
     console.log(`[pay] order=${tag} rejected: ${verified.error}`);
     ctx.payErrors.set(orderId, verified.error);
@@ -403,30 +469,41 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
   const r = await provisionOrder(ctx, orderId, verified);
   if (r.kind === 'error') {
     if (r.status === 402) console.log(`[pay] order=${tag} rejected: ${r.error}`);
-    if (r.status === 402 || r.status === 503) ctx.payErrors.set(orderId, r.error);
+    if (r.status === 402 || r.status === 409 || r.status === 503) ctx.payErrors.set(orderId, r.error);
     return json(res, r.status, r.status === 402 ? { error: 'payment_failed', detail: r.error } : { error: r.error });
   }
   ctx.payErrors.delete(orderId);
   if (r.kind === 'provisioned') console.log(`[pay] order=${tag} ready: ${r.payment.amountSats} sat`);
   // Return the config bundle: an agent POSTing here gets the .conf synchronously,
   // no /order poll needed. Browser/NUT-18 wallet ignores the extra fields.
-  return json(res, 200, { ok: true, status: 'ready', ...readyBundleOf(r.order), mode: ctx.config.mode });
+  return json(res, 200, { ok: true, status: 'ready', ...bundleFor(req, r.order), mode: ctx.config.mode });
 }
 
 /** The buyer-facing config bundle for a ready order. */
 function readyBundleOf(order: Order): ProvisionBundle {
+  const lease = { ...order.lease! };
+  delete lease.presharedKey; // already in clientConfig
   return {
     purchaseId: order.purchaseId!,
     tunnelIp: order.tunnelIp!,
     amountSats: order.amountSats,
     clientConfig: order.clientConfig!,
-    lease: order.lease!,
+    lease,
   };
+}
+
+/**
+ * The config bundle, only for whoever holds the order secret (X-Order-Secret): the order
+ * id travels in the payment request, so it can't be what unlocks the PSK and tunnel IP.
+ */
+function bundleFor(req: IncomingMessage, order: Order): ProvisionBundle | Record<string, never> {
+  const holder = !order.secretHash || secretMatches(order.secretHash, firstHeader(req.headers['x-order-secret']));
+  return holder ? readyBundleOf(order) : {};
 }
 
 // --- GET /order/:orderId (browser poll) ---
 
-async function handleOrderStatus(res: ServerResponse, ctx: Ctx, orderId: string): Promise<void> {
+async function handleOrderStatus(req: IncomingMessage, res: ServerResponse, ctx: Ctx, orderId: string): Promise<void> {
   if (!ORDER_ID_RE.test(orderId)) {
     return json(res, 404, { error: 'order_not_found' });
   }
@@ -435,15 +512,7 @@ async function handleOrderStatus(res: ServerResponse, ctx: Ctx, orderId: string)
     return json(res, 404, { error: 'order_not_found' });
   }
   if (order.status === 'ready') {
-    return json(res, 200, {
-      status: 'ready',
-      mode: ctx.config.mode,
-      purchaseId: order.purchaseId,
-      tunnelIp: order.tunnelIp,
-      amountSats: order.amountSats,
-      clientConfig: order.clientConfig,
-      lease: order.lease,
-    });
+    return json(res, 200, { status: 'ready', mode: ctx.config.mode, ...bundleFor(req, order) });
   }
   // Surface the last /pay rejection so the page can explain what the paying
   // wallet reported only as a generic failure.
@@ -456,18 +525,18 @@ async function handleOrderStatus(res: ServerResponse, ctx: Ctx, orderId: string)
 interface Authorized { payment: VerifyResult; lockIndex: number; }
 
 /**
- * Verify a delivered token offline (DLEQ + P2PK + amount + proof cap) and confirm
- * its lock is an xpub child we issued. `requiredSats` is the ORDER's quoted
- * price (tiers price per order, not globally). Returns the verified payment plus
- * that child index (for sweeping), or `{error}`. Replay protection is NOT here —
- * it's the order binding: a token's lock maps to exactly one order, which
- * provisions at most once (see provisionOrder).
+ * Verify a delivered token offline against THIS order's request (its lock key and
+ * quoted price), and confirm that lock is an xpub child we issued. Returns the
+ * verified payment plus that child index (for sweeping), or `{error}`. The order
+ * binding is the replay defense: each lock belongs to one order, which provisions
+ * at most once (see provisionOrder).
  */
-async function verifyAndAuthorize(ctx: Ctx, encodedToken: string, requiredSats: number): Promise<Authorized | { error: string }> {
+async function verifyAndAuthorize(ctx: Ctx, encodedToken: string, order: Order): Promise<Authorized | { error: string }> {
   const { config } = ctx;
   const payment = await verifyPayment(encodedToken, {
     acceptedMints: config.acceptedMints,
-    requiredSats,
+    requiredSats: order.tier?.priceSats ?? config.priceSats,
+    lockPubkey: order.lockPubkey,
     unit: config.unit,
     proofCountMargin: config.proofCountMargin,
   }, ctx.verifyDeps);
@@ -523,6 +592,11 @@ async function provisionOrder(ctx: Ctx, orderId: string, verified: Authorized): 
         console.error(`[pay] order=${orderId.slice(0, 8)} no_capacity: ${(e as Error).message} (receipt stored, sweepable)`);
         return { kind: 'error', status: 503, error: 'no_capacity' };
       }
+      // The key got a live lease after this order was quoted (the /purchase gate is best-effort).
+      if ((e as { code?: string })?.code === 'KEY_IN_USE') {
+        console.error(`[pay] order=${orderId.slice(0, 8)} key_in_use (receipt stored, sweepable)`);
+        return { kind: 'error', status: 409, error: 'key_in_use' };
+      }
       throw e;
     }
     if (!result) return { kind: 'error', status: 404, error: 'order_not_found' };
@@ -540,7 +614,7 @@ interface ProvisionBundle {
   purchaseId: string;
   tunnelIp: string;
   amountSats?: number;
-  lease: PeerLease;
+  lease: Omit<PeerLease, 'presharedKey'>;
   clientConfig: string;
 }
 
@@ -582,6 +656,9 @@ async function runProvision(
     });
   }
 
+  // A fresh PSK per lease, as `wg genpsk` makes: rotates with the lease and adds a
+  // symmetric layer to the handshake (it protects traffic, not the client's identity).
+  const presharedKey = randomBytes(32).toString('base64');
   const result = await store.provision(orderId, {
     purchaseId,
     clientPublicKey,
@@ -590,15 +667,7 @@ async function runProvision(
     capBytes: tier?.capBytes,
     now,
     allocate: (taken) => allocator.allocateTunnelIp(purchaseId, clientPublicKey, taken),
-    // Called by provision() only on a same-key renewal of a still-live lease (peer
-    // present, so cleanup can't be removing it). A read failure aborts the commit —
-    // the buyer retries — rather than baselining to 0 and insta-capping the renewal.
-    readPeerCounter: async () => {
-      if (config.mode !== 'live' || !config.tiers.some((t) => t.capBytes > 0)) return 0;
-      const readTransfers = ctx.readTransfers ?? readPeerTransfers;
-      const t = (await readTransfers(config.wgInterface)).get(clientPublicKey);
-      return t ? t.rx + t.tx : 0;
-    },
+    presharedKey,
     renderConfig: (tunnelIp, pid) => generateClientConfig({
       tunnelIp,
       serverPublicKey: config.serverPublicKey,
@@ -606,19 +675,19 @@ async function runProvision(
       purchaseId: pid,
       dryRun: config.mode === 'dry-run',
       dns: config.dns,
+      presharedKey,
     }),
   });
   if (!result) return undefined;
 
   // Make WireGuard match the just-committed lease. Best-effort, under the shared wg
   // lock (so it can't interleave with cleanup's remove on the same key). A failure is
-  // logged, not rolled back — housekeep's reconcile re-adds the peer. A renewal reuses
-  // the live peer's key+IP, so this `wg set` is a harmless no-op there.
+  // logged, not rolled back — housekeep's reconcile re-adds the peer.
   if (config.mode === 'live' && !result.alreadyReady && result.order.lease) {
     const exec = ctx.execPlan ?? executePlan;
-    const { clientPublicKey: key, tunnelIp } = result.order.lease;
+    const { clientPublicKey: key, tunnelIp, presharedKey: psk } = result.order.lease;
     try {
-      await ctx.wgLock(() => exec(planAddPeer(config.wgInterface, key, tunnelIp)));
+      await ctx.wgLock(() => exec(planAddPeer(config.wgInterface, key, tunnelIp, psk)));
     } catch (e) {
       console.error(`wg apply failed for ${result.order.purchaseId} (${tunnelIp}); reconcile will retry:`, e instanceof Error ? e.message : e);
     }
@@ -626,7 +695,7 @@ async function runProvision(
 
   // Tell the operator about a genuinely new sale. alreadyReady filters out the
   // idempotent re-deliveries (a wallet re-POSTing to a ready order), so a sale is
-  // announced exactly once; a same-key renewal mints a new lease and counts as one.
+  // announced exactly once; a renewal mints a new lease and counts as one.
   if (!result.alreadyReady && result.order.lease) {
     ctx.notifier.saleProvisioned({
       orderId: result.order.id,
@@ -712,7 +781,7 @@ function clientIp(req: IncomingMessage): string {
 function cors(res: ServerResponse): void {
   res.setHeader('access-control-allow-origin', '*');
   res.setHeader('access-control-allow-methods', 'POST, OPTIONS');
-  res.setHeader('access-control-allow-headers', 'content-type');
+  res.setHeader('access-control-allow-headers', 'content-type, x-order-secret');
 }
 
 function preflight(res: ServerResponse): void {
@@ -792,32 +861,41 @@ Prices, plans, accepted mints and the operator notice: GET /info
 ## Buy a lease
 
 1. Generate an x25519 WireGuard key pair. Only the public key is ever sent.
-2. POST /purchase {"clientPublicKey": "<base64 public key>", "tier": "<plan name from /info; default: defaultTier>"}
+2. POST /purchase {"clientPublicKey": "<base64 public key>", "secret": "<random base64url, 22-128 chars>", "tier": "<plan name from /info; default: defaultTier>"}
+   Keep the secret: it is never sent anywhere else, and you need it to retry this request or to renew.
    -> 402 {orderId, creq}. The same creq is in the X-Cashu header.
-3. Decode creq (a NUT-18 payment request). Get proofs for its amount from one of its mints,
-   P2PK-locked (NUT-11) to the pubkey in its nut10 field: single signer, no refund or locktime.
-   Keep the DLEQ proofs (NUT-12); proofs without them are refused.
+3. Decode creq (a NUT-18 payment request) and pay it from one of its mints with exactly its lock:
+   on a v3 keyset the nutroot option (a NUMS tree with one leaf), otherwise the nut10 P2PK option.
+   The amount is net of input fees, so cover them (cashu-ts: wallet.ops.sendToRequest does this).
+   Keep the DLEQ proofs (NUT-12) on pre-v3 keysets; proofs without them are refused.
 4. POST /pay/<orderId> {"id": "<orderId>", "mint": "<mint url>", "unit": "${config.unit}", "proofs": [...]}
-   (or {"token": "<encoded token>"}) -> 200 {status: "ready", clientConfig, tunnelIp, lease}
-5. In clientConfig, replace "# PrivateKey = <generate locally>" with "PrivateKey = <your private key>",
+   (or {"token": "<encoded token>"}) with header X-Order-Secret: <secret>
+   -> 200 {status: "ready", clientConfig, tunnelIp, lease}. Without the header the config is left out.
+5. In clientConfig (it carries a per-lease PresharedKey), replace "# PrivateKey = <generate locally>" with "PrivateKey = <your private key>",
    then bring the tunnel up (wg-quick, or the WireGuard app).
 
-A NUT-18 wallet can pay the creq itself instead; then poll GET /order/<orderId> until status is "ready".
+A NUT-18 wallet can pay the creq itself instead; then poll GET /order/<orderId> (same header) until status is "ready".
 Unpaid orders expire after ${Math.round(config.orderTtlMs / 60000)} minutes. A payment only works for the order it was requested for.
 
 ## Renew
 
-POST /purchase with the same clientPublicKey while the lease is live, then pay as above.
-Keeps the tunnel IP, extends from the current expiry and resets the data cap.
+Generate a NEW key pair, then POST /purchase {"clientPublicKey": "<new public key>", "secret": "<a new secret>",
+"renew": "<orderId>", "renewSecret": "<that order's secret>"}
+while that order's lease is live, and pay as above. The new lease starts where the old one ends, with
+its own key, tunnel IP and preshared key; the old config stops 15 minutes after the renewal is paid. A key with a
+live lease can't be bought again (409 key_in_use), so keys rotate rather than renew. A renewal may
+leave at most two of the plan's periods prepaid; earlier, it is refused with 400 renew_too_early and opensAt.
 
 ## Errors
 
 /pay returns 402 {error: "payment_failed", detail}, where detail is eg:
-- not_locked, lock_mismatch: proofs are not locked to this order's nut10 pubkey
-- invalid_dleq: DLEQ proofs missing or invalid
-- amount_too_low, mint_not_accepted, wrong_unit
+- lock_mismatch: proofs do not carry exactly this order's requested lock
+- invalid_signature: mint signature missing or invalid (DLEQ proofs, or BLS on v3 keysets)
+- amount_too_low (after input fees), mint_not_accepted, wrong_unit
 - too_many_proofs: use a normal split (about one proof per set bit of the amount)
-/purchase returns 400 unknown_tier, 429 rate_limited or 503 sold_out.
+/purchase returns 400 unknown_tier, invalid_secret, renew_not_live or renew_too_early, 403 renew_unauthorized,
+409 key_in_use or order_pending, 429 rate_limited or 503 sold_out.
+Retrying /purchase with the same body (secret included) for a key with an unpaid order returns that same order.
 ${REPO_URL ? `\nSource: ${REPO_URL}\n` : ''}`;
 }
 

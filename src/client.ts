@@ -17,7 +17,7 @@
 
 import { Wallet } from '@cashu/cashu-ts';
 import qrcode from 'qrcode-generator';
-import { decodeChallenge, waitForPaid, mintLockedPayload, type MintWallet, type MintQuote, type PaymentPayload, type Challenge } from './buyer.js';
+import { confFileName, decodeChallenge, waitForPaid, mintLockedPayload, mintAmount, RENEWAL_GRACE_MS, type MintWallet, type MintQuote, type PaymentPayload, type Challenge } from './buyer.js';
 // Inlined as data-URIs by esbuild (--loader:.svg=dataurl). Centre-overlay marks for
 // the Cashu / Lightning QR tabs; the unified (BIP-321) tab shows none.
 import cashuIcon from './icons/cashu.svg';
@@ -34,12 +34,16 @@ interface OrderRec {
   priv: string;
   pub: string;
   status: 'pending' | 'ready';
+  renewOf?: string; // the order this one renews, so its record can be cut to the server's grace
+  secret?: string; // proves to the server that this browser placed the order (needed to renew it)
+  renewed?: boolean; // a renewal took this lease over; it only runs out its switch-over now
   creq?: string; // the payment request, kept so a pending order can be resumed after a reload
   // The in-browser Lightning mint quote, persisted so a reload reuses it instead of
   // minting a fresh invoice — which would orphan a paid-but-unminted quote (lost
   // sats) and leave any already-shown invoice unwatched.
   mintQuote?: string;
-  mintInvoice?: string;
+  // Private key the mint quote is locked to; without it a paid quote can't be minted.
+  mintQuoteKey?: string;
   // The minted NUT-18 proofs, persisted between mint and a confirmed delivery so a
   // reload re-delivers them rather than stranding paid ecash (minting isn't
   // idempotent). Cleared once the order is ready.
@@ -89,17 +93,19 @@ function pruneOrders(): void {
   if (kept.length !== list.length) saveOrders(kept);
 }
 
-let priv = '', pubKey = '';
+let priv = '', pubKey = '', secret = '';
 let challenge: Challenge | null = null;
 let currentOrderId = '';
 const polling = new Set<string>();
 
 async function genKeys(): Promise<void> {
-  const kp = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
+  const kp = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']) as CryptoKeyPair;
   const pub = await crypto.subtle.exportKey('jwk', kp.publicKey);
   const prv = await crypto.subtle.exportKey('jwk', kp.privateKey);
   pubKey = b64(pub.x as string);
   priv = b64(prv.d as string);
+  const raw = crypto.getRandomValues(new Uint8Array(24));
+  secret = btoa(String.fromCharCode(...raw)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 function setMsg(text: string, cls = ''): void {
@@ -166,14 +172,14 @@ function showConfig(conf: string, name: string, tunnelIp?: string, expiresAt?: s
   setMsg('Config ready.', 'ok');
   const dl = btn('dl');
   dl.disabled = false;
-  dl.onclick = () => download(conf, name);
+  dl.onclick = () => download(conf, tunnelIp);
   $('pay').style.display = 'none';
 }
 
-function download(conf: string, name: string): void {
+function download(conf: string, tunnelIp?: string): void {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([conf + '\n'], { type: 'text/plain' }));
-  a.download = (name || 'vpn') + '.conf';
+  a.download = confFileName(tunnelIp) + '.conf';
   a.click();
 }
 
@@ -229,9 +235,15 @@ function openPayPanel(orderId: string, creq: string): void {
 // POST minted proofs to the order's NUT-18 sink. Idempotent server-side, so a
 // reload safely re-delivers persisted proofs. On success the config is applied
 // (or polled for); on failure the proofs stay persisted for a later retry.
+// The order secret unlocks the config in /pay and /order responses.
+function secretHeader(orderId: string): Record<string, string> {
+  const s = loadOrders().find((o) => o.id === orderId)?.secret;
+  return s ? { 'x-order-secret': s } : {};
+}
+
 async function deliver(orderId: string, payload: PaymentPayload): Promise<void> {
   const r = await fetch('/pay/' + encodeURIComponent(orderId), {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json', ...secretHeader(orderId) },
     body: JSON.stringify({ id: orderId, ...payload }),
   });
   const d = await r.json().catch(() => ({}));
@@ -247,7 +259,7 @@ async function armLightning(orderId: string, creq: string): Promise<void> {
   try {
     const wallet = new Wallet(challenge.mintUrl, { unit: challenge.unit });
     await wallet.loadMint();
-    const w = wallet as unknown as MintWallet;
+    const w: MintWallet = wallet;
     const rec = loadOrders().find((o) => o.id === orderId);
 
     // Already minted in a prior session: the proofs were persisted BEFORE delivery
@@ -263,12 +275,14 @@ async function armLightning(orderId: string, creq: string): Promise<void> {
     // Reuse a persisted quote across reloads; only mint a fresh one for a new order,
     // so a reload never strands a paid quote behind a brand-new invoice.
     let quote: MintQuote;
+    let quoteKey = rec?.mintQuoteKey;
     if (rec?.mintQuote) {
-      const { state } = await w.checkMintQuoteBolt11(rec.mintQuote);
-      quote = { quote: rec.mintQuote, request: rec.mintInvoice, state };
+      quote = await w.checkMintQuoteBolt11(rec.mintQuote);
     } else {
-      quote = await w.createMintQuoteBolt11(challenge.amount);
-      upsertOrder({ id: orderId, mintQuote: quote.quote, mintInvoice: quote.request });
+      const { pubkey, privkey } = await w.createQuoteLockKey();
+      quote = await w.createMintQuoteBolt11(mintAmount(w, challenge), pubkey);
+      quoteKey = privkey;
+      upsertOrder({ id: orderId, mintQuote: quote.quote, mintQuoteKey: privkey });
     }
     const bolt11 = quote.request ?? '';
     if (currentOrderId !== orderId) return; // a newer order took over while we waited
@@ -296,7 +310,7 @@ async function armLightning(orderId: string, creq: string): Promise<void> {
       : await waitForPaid(w, quote.quote, { intervalMs: 2000, tries: 150 });
     if (!paid || currentOrderId !== orderId) return;
     setMsg('Minting & delivering…');
-    const payload = await mintLockedPayload(w, challenge, quote);
+    const payload = await mintLockedPayload(w, challenge, quote, quoteKey);
     // Persist the proofs BEFORE delivery so a crash/close between here and the POST
     // can re-deliver them on reload (above) instead of stranding paid ecash.
     upsertOrder({ id: orderId, payload });
@@ -322,11 +336,14 @@ function resumeOrder(id: string): void {
   void poll(id);
 }
 
-async function purchase(tier?: string): Promise<Response> {
+async function purchase(tier?: string, renew?: { id: string; secret?: string }): Promise<Response> {
   return fetch('/purchase', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(tier ? { clientPublicKey: pubKey, tier } : { clientPublicKey: pubKey }),
+    body: JSON.stringify({
+      clientPublicKey: pubKey, secret, ...(tier && { tier }),
+      ...(renew && { renew: renew.id, renewSecret: renew.secret }),
+    }),
   });
 }
 
@@ -342,37 +359,42 @@ function errText(e: unknown): string {
 
 // Buyer-facing text for a /pay rejection reported via the /order poll.
 function payErrorText(code: string): string {
-  if (code === 'not_locked' || code === 'lock_mismatch') {
-    return 'Your wallet paid without the required P2PK lock, so the payment was refused and your funds stayed in your wallet. Please use the Auto or Lightning tab instead.';
+  if (code === 'lock_mismatch') {
+    return 'Your wallet’s payment didn’t match the payment request, so it was refused and your funds stayed in your wallet. Please use the Auto or Lightning tab instead.';
   }
+  if (code === 'key_in_use') return 'Payment received, but this key already has active access, so no new access was created. Contact the operator for a refund.';
   if (code === 'no_capacity') return 'Payment received but no tunnel slots are free — contact the operator for a refund.';
   return 'Payment was refused (' + code + '). Your funds stayed in your wallet — try the Auto or Lightning tab.';
 }
 
-// One purchase flow for both paths: a fresh buy generates a keypair; a renewal
-// reuses the lease's stored keys, so the server extends the same slot/IP and the
-// already-imported config keeps working.
-async function startPurchase(keys?: { priv: string; pub: string; tier?: string }): Promise<void> {
+// Buyer-facing text for a refused /purchase.
+function purchaseErrorText(d: { error?: string; message?: string; opensAt?: string }): string {
+  if (d.error === 'renew_unauthorized') return 'This access can’t be renewed from this browser. Buy new access instead.';
+  if (d.error === 'renew_not_live') return 'That access has ended or was already renewed, so it can’t be renewed. Buy new access instead.';
+  if (d.error === 'sold_out') return 'All slots are in use right now. Please try again later.';
+  if (d.error === 'renew_too_early' && d.opensAt) return 'You already have plenty of time left. Renewal opens ' + new Date(d.opensAt).toLocaleString() + '.';
+  return d.message ?? d.error ?? 'Failed';
+}
+
+// One purchase flow for both paths, each with a fresh keypair: a renewal names the
+// live order it extends, and its new lease starts where that one ends.
+async function startPurchase(renew?: { id: string; tier?: string; secret?: string }): Promise<void> {
   btn('buy').disabled = true;
   // A renewal re-buys its own plan; a fresh buy uses the page's picker.
-  const tier = keys ? keys.tier : selectedTier();
+  const tier = renew ? renew.tier : selectedTier();
   try {
-    if (keys) {
-      priv = keys.priv; pubKey = keys.pub;
-    } else {
-      setMsg('Generating keys…');
-      await genKeys();
-      setMsg('Requesting access…');
-    }
-    const r = await purchase(tier);
+    setMsg('Generating keys…');
+    await genKeys();
+    setMsg('Requesting access…');
+    const r = await purchase(tier, renew);
     if (r.status === 402) {
       const d = await r.json();
       const creq = r.headers.get('x-cashu') ?? d.creq ?? '';
       const orderId = String(d.orderId ?? '');
-      upsertOrder({ id: orderId, priv, pub: pubKey, status: 'pending', creq, tier: String(d.tier ?? tier ?? '') || undefined });
+      upsertOrder({ id: orderId, priv, pub: pubKey, secret, status: 'pending', creq, tier: String(d.tier ?? tier ?? '') || undefined, renewOf: renew?.id });
       openPayPanel(orderId, creq);
-      setMsg(keys
-        ? 'Renewal — pay below. It extends your time and restarts your data allowance from today.'
+      setMsg(renew
+        ? 'Renewal: pay below. Your remaining time moves to a new config (new keys); import it, as the current one stops 15 minutes after payment.'
         : 'Payment required — pay below.');
       renderAccess();
       void poll(orderId);
@@ -380,13 +402,13 @@ async function startPurchase(keys?: { priv: string; pub: string; tier?: string }
       // Dry-run: provisioned immediately, no payment.
       const d = await r.json();
       const conf = injectPriv(String(d.clientConfig ?? ''), priv);
-      const id = String(d.purchaseId ?? 'dry-run');
-      upsertOrder({ id, priv, pub: pubKey, status: 'ready', conf, tunnelIp: d.tunnelIp, expiresAt: d.lease?.expiresAt, tier });
+      const id = String(d.orderId ?? d.purchaseId ?? 'dry-run');
+      upsertOrder({ id, priv, pub: pubKey, secret, status: 'ready', conf, tunnelIp: d.tunnelIp, expiresAt: d.lease?.expiresAt, tier });
       showConfig(conf, id, d.tunnelIp, d.lease?.expiresAt);
       renderAccess();
     } else {
       const d = await r.json();
-      setMsg(d.error ?? 'Failed', 'err');
+      setMsg(purchaseErrorText(d), 'err');
     }
   } catch (e) {
     setMsg(errText(e), 'err');
@@ -404,13 +426,18 @@ btn('copypay').onclick = async () => { if (await copyToClipboard(payCopy[payMode
 
 // Apply a ready order's config: store it and, if it's the active order, show it.
 // Shared by the in-browser Lightning delivery and the /order poll (cashu-wallet path).
-function applyReady(id: string, d: { clientConfig?: string; tunnelIp?: string; lease?: { expiresAt?: string } }): void {
+function applyReady(id: string, d: { clientConfig?: string; tunnelIp?: string; lease?: { expiresAt?: string; createdAt?: string } }): void {
   const rec = loadOrders().find((o) => o.id === id);
   const conf = injectPriv(String(d.clientConfig ?? ''), rec?.priv ?? '');
   // Delivery confirmed — drop the persisted proofs; they've been redeemed.
   upsertOrder({ id, status: 'ready', conf, tunnelIp: d.tunnelIp, expiresAt: d.lease?.expiresAt, payload: undefined });
-  // A renewal supersedes the prior lease for the same key — keep only the newest.
-  if (rec?.pub) saveOrders(loadOrders().filter((o) => !(o.id !== id && o.pub === rec.pub && o.status === 'ready')));
+  // A renewal cuts the renewed lease to a short switch-over on the server; mirror that here.
+  const prior = rec?.renewOf ? loadOrders().find((o) => o.id === rec.renewOf) : undefined;
+  if (prior?.expiresAt) {
+    const paidAt = d.lease?.createdAt ? new Date(d.lease.createdAt).getTime() : Date.now();
+    const cut = Math.min(new Date(prior.expiresAt).getTime(), paidAt + RENEWAL_GRACE_MS);
+    upsertOrder({ id: prior.id, expiresAt: new Date(cut).toISOString(), renewed: true });
+  }
   if (id === currentOrderId) showConfig(conf, id, d.tunnelIp, d.lease?.expiresAt);
   renderAccess();
 }
@@ -423,11 +450,16 @@ async function poll(id: string): Promise<void> {
   try {
     for (let i = 0; i < 300; i++) {
       let r: Response;
-      try { r = await fetch('/order/' + encodeURIComponent(id)); } catch { await sleep(2000); continue; }
+      try { r = await fetch('/order/' + encodeURIComponent(id), { headers: secretHeader(id) }); } catch { await sleep(2000); continue; }
       if (r.status === 404) { dropOrder(id); renderAccess(); return; }
       if (r.ok) {
         const d = await r.json();
-        if (d.status === 'ready') { applyReady(id, d); return; }
+        if (d.status === 'ready' && d.clientConfig) { applyReady(id, d); return; }
+        if (d.status === 'ready') {
+          // Paid, but the server only hands the config to the order secret, which this browser no longer has.
+          if (id === currentOrderId) setMsg('This order is paid, but its config can only be opened from the browser that placed it.', 'err');
+          return;
+        }
         // A wallet's delivery was refused; the wallet itself only shows a generic
         // error, so explain here. Keep polling — the buyer can just pay again.
         if (d.payError && id === currentOrderId) setMsg(payErrorText(String(d.payError)), 'err');
@@ -467,6 +499,10 @@ function renderAccess(): void {
       // fresh purchase rather than a download that can't connect.
       status = '<small class="expired">expired ' + esc(when.toLocaleString()) + '</small>';
       action = '<button class="buyagain" type="button">Buy again</button>';
+    } else if (o.renewed) {
+      // Renewed: its time moved to the new config, so only the switch-over is left.
+      status = '<small>renewed, stops ' + (when ? esc(when.toLocaleString()) : 'soon') + '</small>';
+      action = '<button class="ghost dlacc" data-id="' + esc(o.id) + '" type="button">Download</button>';
     } else {
       status = '<small>active' + (when ? ' until ' + esc(when.toLocaleString()) : '') + '</small>';
       action = '<span style="display:flex;gap:8px"><button class="renewacc" data-id="' + esc(o.id) + '" type="button">Renew</button>'
@@ -478,21 +514,20 @@ function renderAccess(): void {
     b.addEventListener('click', () => {
       const id = (b as HTMLElement).dataset.id ?? '';
       const rec = loadOrders().find((o) => o.id === id);
-      if (rec?.conf) { showConfig(rec.conf, id, rec.tunnelIp, rec.expiresAt); download(rec.conf, id); }
+      if (rec?.conf) { showConfig(rec.conf, id, rec.tunnelIp, rec.expiresAt); download(rec.conf, rec.tunnelIp); }
     });
   });
   // "Pay" reopens a still-pending order so it can be paid after a reload.
   el.querySelectorAll('.payacc').forEach((b) => {
     b.addEventListener('click', () => resumeOrder((b as HTMLElement).dataset.id ?? ''));
   });
-  // "Renew" re-purchases with the lease's own key: the server extends the same
-  // slot/IP, so the config already on the buyer's device keeps working.
+  // "Renew" moves the remaining time onto NEW keys; the current config gets a 15-minute switch-over.
   el.querySelectorAll('.renewacc').forEach((b) => {
     b.addEventListener('click', () => {
       const rec = loadOrders().find((o) => o.id === (b as HTMLElement).dataset.id);
-      if (!rec?.priv || !rec.pub) return;
+      if (!rec) return;
       window.scrollTo({ top: 0, behavior: 'smooth' });
-      void startPurchase({ priv: rec.priv, pub: rec.pub, tier: rec.tier });
+      void startPurchase({ id: rec.id, tier: rec.tier, secret: rec.secret });
     });
   });
   // "Buy again" starts a brand-new purchase (fresh key + lease), not a renewal.

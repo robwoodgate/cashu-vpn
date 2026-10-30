@@ -12,6 +12,6 @@
     "types": ["node"]
   },
   "include": ["src/**/*.ts", "test/**/*.ts"],
-  "comment": "client.ts is browser-only; esbuild bundles it (build:client), so it is not type-checked here.",
+  "comment": "client.ts is browser-only: tsconfig.client.json type-checks it with DOM types.",
   "exclude": ["src/client.ts"]
 }

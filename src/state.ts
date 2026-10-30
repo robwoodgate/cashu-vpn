@@ -26,6 +26,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { Tier } from './config.js';
 import type { PeerLease, PeerLedger } from './peers.js';
+import { RENEWAL_GRACE_MS } from './buyer.js';
 
 export type OrderStatus = 'pending' | 'ready';
 
@@ -48,6 +49,10 @@ export interface Order {
    * an open order. Absent on pre-tier orders (fall back to config).
    */
   tier?: Tier;
+  /** Pending renewal: the order whose live lease this one extends. Dropped once provisioned. */
+  renewOf?: string;
+  /** SHA-256 of the buyer's order secret: proves a retry or a renewal comes from whoever placed it. */
+  secretHash?: string;
   // --- populated when status === 'ready' ---
   purchaseId?: string;
   tunnelIp?: string;
@@ -70,19 +75,16 @@ export interface ProvisionArgs {
   now: Date;
   /** Allocate a fresh tunnel IP avoiding `taken` (fresh provision only). */
   allocate: (taken: Set<string>) => string;
-  /**
-   * Live `wg` counter (rx+tx) for a renewed peer, to rebase its data-cap baseline.
-   * Called ONLY on a same-key renewal of a still-live lease (peer present), so it
-   * can't race cleanup's remove. A throw aborts the commit (caller retries) rather
-   * than baselining to 0 and insta-capping the paid renewal.
-   */
-  readPeerCounter: () => Promise<number>;
+  /** Fresh WireGuard preshared key for this lease's peer. */
+  presharedKey: string;
   /** Render the buyer .conf once the tunnel IP is fixed (pure, sync). */
   renderConfig: (tunnelIp: string, purchaseId: string) => string;
 }
 
 export interface StateStore extends PeerLedger {
   createOrder(order: Order): Promise<void>;
+  /** A still-payable pending order for this WireGuard key, if any. */
+  findPending(clientPublicKey: string, now?: Date): Promise<Order | undefined>;
   /**
    * The order, or undefined if unknown or an expired pending order. `includeExpired`
    * returns an expired pending order within a short delivery grace (see below) so a
@@ -91,10 +93,10 @@ export interface StateStore extends PeerLedger {
   getOrder(id: string, now?: Date, opts?: { includeExpired?: boolean }): Promise<Order | undefined>;
   /**
    * Atomic commit: transition a pending order -> ready AND create its lease in one
-   * write. On a same-key renewal of a still-live lease, expires that prior lease and
-   * REUSES its tunnel IP (no route churn, no `wg` counter reset), rebasing the data
-   * cap to the peer's current counter. Returns the ready order (alreadyReady=true if
-   * it was already provisioned — idempotent), or undefined if the id is unknown.
+   * write. A renewal (`renewOf` a still-live lease) gets a new key and IP and starts
+   * its time where the prior lease ends; the prior is cut to RENEWAL_GRACE_MS. Throws
+   * KEY_IN_USE if another live lease holds this key. Returns the ready order
+   * (alreadyReady=true if already provisioned), or undefined if the id is unknown.
    */
   provision(orderId: string, args: ProvisionArgs): Promise<{ order: Order; alreadyReady: boolean } | undefined>;
 }
@@ -103,6 +105,8 @@ export interface StateStore extends PeerLedger {
 // latency, so a payment landing just after expiry still provisions — without leaving
 // the order payable until retention prunes it (forever when RETAIN_EXPIRED_MS=0).
 const DELIVERY_GRACE_MS = 5 * 60 * 1000;
+
+export { RENEWAL_GRACE_MS };
 
 /** A fresh, URL-safe capability id with ~192 bits of entropy. */
 export function newOrderId(): string {
@@ -152,6 +156,13 @@ function makeStore(records: Map<string, Order>, persist: (recs: Order[]) => Prom
       });
     },
 
+    async findPending(clientPublicKey, now = new Date()) {
+      const order = [...records.values()].find(
+        (o) => o.status === 'pending' && o.clientPublicKey === clientPublicKey && !isExpiredPending(o, now)
+      );
+      return order && { ...order };
+    },
+
     async getOrder(id, now = new Date(), opts) {
       const order = records.get(id);
       if (!order) return undefined;
@@ -170,33 +181,27 @@ function makeStore(records: Map<string, Order>, persist: (recs: Order[]) => Prom
         if (!order) return undefined;
         if (order.status === 'ready') return { order: { ...order }, alreadyReady: true };
 
-        const { purchaseId, clientPublicKey, amountSats, leaseDurationMs, capBytes, now, allocate, readPeerCounter, renderConfig } = args;
-
-        // Renewal = a still-live lease for the same WireGuard key (necessarily on
-        // another order). Reuse its IP and rebase the data cap; expire it here. A
-        // prior lease that's already expired-by-time is NOT a renewal — it falls to
-        // fresh allocation, so we never read a counter for a peer cleanup may remove.
-        const priors = [...records.values()].filter(
-          (o) => o.id !== orderId && o.lease && o.lease.clientPublicKey === clientPublicKey && isLive(o.lease, now)
-        );
-
-        let tunnelIp: string;
-        let capBaseline: number;
-        // A renewal's clock starts where the prior lease ends: paying early tops
-        // up remaining time instead of forfeiting it.
-        let expiryBase = now.getTime();
-        if (priors.length > 0) {
-          tunnelIp = priors[0]!.lease!.tunnelIp;
-          capBaseline = await readPeerCounter();
-          expiryBase = Math.max(expiryBase, ...priors.map((p) => new Date(p.lease!.expiresAt).getTime()));
-          for (const p of priors) records.set(p.id, { ...p, lease: { ...p.lease!, status: 'expired' } });
-        } else {
-          const taken = new Set(
-            [...records.values()].flatMap((o) => (o.lease && isLive(o.lease, now) ? [o.lease.tunnelIp] : []))
-          );
-          tunnelIp = allocate(taken);
-          capBaseline = 0;
+        const { purchaseId, clientPublicKey, amountSats, leaseDurationMs, capBytes, now, allocate, presharedKey, renderConfig } = args;
+        const live = [...records.values()].flatMap((o) => (o.lease && isLive(o.lease, now) ? [o.lease] : []));
+        // One live lease per key: a second would fight the first for the same wg peer.
+        if (live.some((l) => l.clientPublicKey === clientPublicKey)) {
+          throw Object.assign(new Error('another live lease holds this WireGuard key'), { code: 'KEY_IN_USE' });
         }
+        // A renewal's clock starts where the prior lease ends, so paying early tops up time.
+        // The prior then gets RENEWAL_GRACE_MS to switch configs, not its remaining time,
+        // so a renewal can't double as a second device for free.
+        const priorOrder = order.renewOf ? records.get(order.renewOf) : undefined;
+        // A lease already renewed has handed its time on; a second renewal of it starts fresh.
+        const prior = priorOrder?.lease && isLive(priorOrder.lease, now) && !priorOrder.lease.renewed ? priorOrder.lease : undefined;
+        const expiryBase = prior ? new Date(prior.expiresAt).getTime() : now.getTime();
+        if (prior) {
+          const cut = Math.min(expiryBase, now.getTime() + RENEWAL_GRACE_MS);
+          records.set(priorOrder!.id, { ...priorOrder!, lease: { ...prior, expiresAt: new Date(cut).toISOString(), renewed: true } });
+        }
+        // An expired lease's IP stays taken until cleanup has removed its peer, or that
+        // removal's `ip route del` would cut whoever got the IP in between.
+        const taken = [...records.values()].flatMap((o) => (o.lease?.status === 'active' ? [o.lease.tunnelIp] : []));
+        const tunnelIp = allocate(new Set(taken));
 
         const lease: PeerLease = {
           purchaseId,
@@ -205,11 +210,12 @@ function makeStore(records: Map<string, Order>, persist: (recs: Order[]) => Prom
           createdAt: now.toISOString(),
           expiresAt: new Date(expiryBase + leaseDurationMs).toISOString(),
           status: 'active',
-          capBaseline,
+          presharedKey,
           ...(capBytes !== undefined ? { capBytes } : {}),
         };
         const ready: Order = {
           ...order,
+          renewOf: undefined, // the link between the two keys isn't kept once provisioned
           status: 'ready',
           purchaseId,
           tunnelIp,
@@ -230,6 +236,10 @@ function makeStore(records: Map<string, Order>, persist: (recs: Order[]) => Prom
         const v = leaseView(o, now);
         return v ? [v] : [];
       });
+    },
+
+    async countOccupied() {
+      return [...records.values()].filter((o) => o.lease?.status === 'active').length;
     },
 
     async listExpiredActive(now) {

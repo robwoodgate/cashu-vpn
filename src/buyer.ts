@@ -2,22 +2,42 @@
  * Buyer-side helpers (shared by the browser client and node tests).
  *
  * Mirrors the proven testclient flow: decode the daemon's 402 PaymentRequest,
- * create a Lightning mint quote, wait for payment, then mint proofs P2PK-locked
- * to the daemon's per-tx pubkey (with DLEQ). The result is a NUT-18 payment
- * payload the browser POSTs to /pay/:orderId — the same shape a Cashu wallet
+ * create a Lightning mint quote, wait for payment, then mint proofs carrying the
+ * request's lock (nutroot on a v3 keyset, NUT-11 before). The result is a NUT-18
+ * payment payload the browser POSTs to /pay/:orderId, the same shape a Cashu wallet
  * delivers over the request's HTTP transport. So the human just pays a Lightning
- * invoice — no Cashu wallet needed.
- *
- * cashu-ts calls here are identical to what was validated live against testnut.
+ * invoice; no Cashu wallet needed.
  */
 
-import { OutputData, decodePaymentRequest, type Proof } from '@cashu/cashu-ts';
+import {
+  decodePaymentRequest,
+  isBlsKeyset,
+  nutrootToLockOptions,
+  p2pkToLockOptions,
+  type LockOptions,
+  type MintQuoteBolt11Response,
+  type PaymentRequest,
+  type Proof,
+} from '@cashu/cashu-ts';
+import { popcount } from './cashu.js';
+
+/** How long a renewed lease keeps working after the renewal, so the buyer can import the new config. */
+export const RENEWAL_GRACE_MS = 15 * 60 * 1000;
+
+/**
+ * Config file name, eg cashu-65-27 for 10.77.65.27. Apps use it as the tunnel name, and
+ * wg-quick as the Linux interface name, which is capped at 15 characters.
+ */
+export function confFileName(tunnelIp?: string): string {
+  const m = /^\d+\.\d+\.(\d+)\.(\d+)$/.exec(tunnelIp ?? '');
+  return m ? `cashu-${m[1]}-${m[2]}` : 'cashu-vpn';
+}
 
 export interface Challenge {
   amount: number;
   mintUrl: string;
   unit: string;
-  lockPubkey: string;
+  request: PaymentRequest;
 }
 
 /** Decode the daemon's creqA (402 x-cashu) into the fields the buyer needs. */
@@ -25,25 +45,28 @@ export function decodeChallenge(creq: string): Challenge {
   const pr = decodePaymentRequest(creq);
   const amount = pr.amount ? Number(pr.amount.toNumber()) : 0;
   const mintUrl = pr.mints?.[0] ?? '';
-  const lockPubkey = pr.nut10?.data ?? '';
-  if (!amount || !mintUrl || !lockPubkey) throw new Error('invalid or unsupported payment request');
-  return { amount, mintUrl, unit: pr.unit ?? 'sat', lockPubkey };
+  if (!amount || !mintUrl || !(pr.nut10 || pr.toNutrootOptions())) {
+    throw new Error('invalid or unsupported payment request');
+  }
+  return { amount, mintUrl, unit: pr.unit ?? 'sat', request: pr };
 }
 
 // The slice of cashu-ts Wallet the buyer flow uses (so tests can fake it).
-export interface MintQuote {
-  quote: string;
-  request?: string;
-  state: string;
+export type MintQuote = MintQuoteBolt11Response;
+interface MintRun {
+  privkey(k: string): MintRun;
+  run(): Promise<Proof[]>;
 }
 export interface MintWallet {
-  createMintQuoteBolt11(amount: number): Promise<MintQuote>;
-  checkMintQuoteBolt11(quote: string): Promise<{ state: string }>;
-  getKeyset(): unknown;
+  createQuoteLockKey(): Promise<{ pubkey: string; privkey: string }>;
+  createMintQuoteBolt11(amount: number, pubkey: string): Promise<MintQuote>;
+  checkMintQuoteBolt11(quote: string): Promise<MintQuote>;
+  getKeyset(): { id: string };
+  getFeesForKeyset(nInputs: number, keysetId: string): { toNumber(): number };
   /** NUT-17 WebSocket events (present on a real cashu-ts Wallet); used by waitForPaid. */
   on?: { onceMintPaid(id: string, opts?: { signal?: AbortSignal; timeoutMs?: number }): Promise<unknown> };
   ops: {
-    mintBolt11(amount: number, quote: MintQuote): { asCustom(outputs: unknown): { run(): Promise<Proof[]> } };
+    mintBolt11(amount: number, quote: MintQuote): { asLocked(lock: LockOptions): MintRun };
   };
 }
 
@@ -105,17 +128,31 @@ export interface PaymentPayload {
   proofs: Proof[];
 }
 
-/** Mint proofs P2PK-locked to lockPubkey and return them as a NUT-18 payload. */
+/** Amount to mint so the payee still nets the price after spending the proofs (NUT-02 input fees). */
+export function mintAmount(wallet: MintWallet, challenge: Challenge): number {
+  const keysetId = wallet.getKeyset().id;
+  let gross = challenge.amount;
+  while (gross - wallet.getFeesForKeyset(popcount(gross), keysetId).toNumber() < challenge.amount) gross++;
+  return gross;
+}
+
+/**
+ * Mint proofs carrying the request's lock and return them as a NUT-18 payload.
+ * `quoteKey` signs a locked mint quote; omit it only for a legacy unlocked one.
+ */
 export async function mintLockedPayload(
   wallet: MintWallet,
   challenge: Challenge,
   quote: MintQuote,
+  quoteKey?: string,
 ): Promise<PaymentPayload> {
-  const outputs = OutputData.createP2PKData(
-    { kind: 'P2PK', data: challenge.lockPubkey },
-    challenge.amount,
-    wallet.getKeyset() as Parameters<typeof OutputData.createP2PKData>[2],
-  );
-  const proofs = await wallet.ops.mintBolt11(challenge.amount, quote).asCustom(outputs).run();
+  // The request states one lock in two encodings: follow the one this keyset takes (as sendToRequest does).
+  const pr = challenge.request;
+  const nutroot = pr.toNutrootOptions();
+  const nut10 = pr.toP2PKOptions();
+  const lock = isBlsKeyset(wallet.getKeyset().id) ? nutroot && nutrootToLockOptions(nutroot) : nut10 && p2pkToLockOptions(nut10);
+  if (!lock) throw new Error('the payment request has no lock this mint’s keyset can carry');
+  const mint = wallet.ops.mintBolt11(mintAmount(wallet, challenge), quote).asLocked(lock);
+  const proofs = await (quoteKey ? mint.privkey(quoteKey) : mint).run();
   return { mint: challenge.mintUrl, unit: challenge.unit, proofs };
 }
