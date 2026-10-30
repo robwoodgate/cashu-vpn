@@ -189,7 +189,7 @@ const seedStore = (leases: PeerLease[]) => createMemoryStateStore(leases.map((l)
 function provisionStore(store: StateStore, orderId: string, clientPublicKey: string, over: Partial<ProvisionArgs> = {}) {
   return store.provision(orderId, {
     purchaseId: newPurchaseId(), clientPublicKey, amountSats: 250, leaseDurationMs: 60_000,
-    now: new Date(), allocate: lowestFree, presharedKey: 'PSK', renderConfig: () => 'CONF',
+    now: new Date(), allocate: lowestFree, presharedKey: 'PSK',
     ...over,
   });
 }
@@ -1388,7 +1388,7 @@ test('state store: create, poll, provision once (idempotent), and delivery-grace
   const r = await provisionStore(store, id, 'k');
   assert.equal(r?.order.status, 'ready');
   assert.equal(r?.alreadyReady, false);
-  assert.equal((await store.getOrder(id))?.clientConfig, 'CONF');
+  assert.equal((await store.getOrder(id))?.lease?.presharedKey, 'PSK');
 
   // Second provision is idempotent: already ready, no second lease.
   const again = await provisionStore(store, id, 'k');
@@ -1817,6 +1817,27 @@ test('a paid order hands its config only to the holder of its secret', async () 
     const again = await (await payOrder(url, orderId, 0, SECRET_A)).json();
     assert.equal(again.clientConfig, mine.clientConfig, 'a repeat /pay with the secret gets it too');
   }, LIVE_ENV, { store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook });
+});
+
+test('a re-download after a server key rotation carries the new key', async () => {
+  // Configs are rendered on read, so rotating the server key needs no re-issue: buyers download again.
+  const ROTATED = Buffer.alloc(32, 99).toString('base64');
+  const store = createMemoryStateStore();
+  const lockBook = await createLockBook(TEST_XPUB);
+  const deps = { store, verifyDeps: xpubVerifyDeps(TEST_XPUB), execPlan: async () => [], lockBook };
+  let orderId = '';
+  let before = '';
+  await withServer(async (url) => {
+    orderId = (await (await newOrder(url, { secret: SECRET_A })).json()).orderId;
+    before = (await (await payOrder(url, orderId, 0, SECRET_A)).json()).clientConfig;
+  }, LIVE_ENV, deps);
+  assert.match(before, new RegExp(`PublicKey = ${LIVE_ENV.SERVER_PUBLIC_KEY.replace(/[+/]/g, '\\$&')}`));
+  await withServer(async (url) => {
+    assert.equal((await (await fetch(`${url}/info`)).json()).serverPublicKey, ROTATED);
+    const after = (await (await fetch(`${url}/order/${orderId}`, { headers: { 'x-order-secret': SECRET_A } })).json()).clientConfig;
+    assert.ok(after.includes(`PublicKey = ${ROTATED}`), 'the new server key');
+    assert.equal(after.replace(/PublicKey = \S+/, ''), before.replace(/PublicKey = \S+/, ''), 'nothing else changed');
+  }, { ...LIVE_ENV, SERVER_PUBLIC_KEY: ROTATED }, deps);
 });
 
 test('cleanup expires a lease whose route is already gone, rather than retrying it forever', async () => {

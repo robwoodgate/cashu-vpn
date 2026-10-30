@@ -57,8 +57,6 @@ export interface Order {
   purchaseId?: string;
   tunnelIp?: string;
   amountSats?: number;
-  /** Rendered .conf with a `# PrivateKey` placeholder the browser fills locally. */
-  clientConfig?: string;
   /** The provisioned half of this order. Its expiresAt drives lease expiry. */
   lease?: PeerLease;
 }
@@ -77,8 +75,6 @@ export interface ProvisionArgs {
   allocate: (taken: Set<string>) => string;
   /** Fresh WireGuard preshared key for this lease's peer. */
   presharedKey: string;
-  /** Render the buyer .conf once the tunnel IP is fixed (pure, sync). */
-  renderConfig: (tunnelIp: string, purchaseId: string) => string;
 }
 
 export interface StateStore extends PeerLedger {
@@ -181,7 +177,7 @@ function makeStore(records: Map<string, Order>, persist: (recs: Order[]) => Prom
         if (!order) return undefined;
         if (order.status === 'ready') return { order: { ...order }, alreadyReady: true };
 
-        const { purchaseId, clientPublicKey, amountSats, leaseDurationMs, capBytes, now, allocate, presharedKey, renderConfig } = args;
+        const { purchaseId, clientPublicKey, amountSats, leaseDurationMs, capBytes, now, allocate, presharedKey } = args;
         const live = [...records.values()].flatMap((o) => (o.lease && isLive(o.lease, now) ? [o.lease] : []));
         // One live lease per key: a second would fight the first for the same wg peer.
         if (live.some((l) => l.clientPublicKey === clientPublicKey)) {
@@ -220,7 +216,6 @@ function makeStore(records: Map<string, Order>, persist: (recs: Order[]) => Prom
           purchaseId,
           tunnelIp,
           amountSats,
-          clientConfig: renderConfig(tunnelIp, purchaseId),
           lease,
         };
         records.set(orderId, ready);
