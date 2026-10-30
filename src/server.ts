@@ -186,6 +186,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Ctx
         version: VERSION,
         mode: config.mode,
         unit: config.unit,
+        // Configs are rendered from these on every read: after a rotation, download again.
+        serverPublicKey: config.mode === 'live' ? config.serverPublicKey : undefined,
+        endpoint: config.mode === 'live' ? config.endpoint : undefined,
         // The plan POST /purchase uses when it names no tier.
         defaultTier: config.tiers[0]!.name,
         tiers: config.tiers.map((t) => ({
@@ -350,7 +353,7 @@ async function handlePurchase(req: IncomingMessage, res: ServerResponse, ctx: Ct
       createdAt: now.toISOString(), expiresAt: new Date(now.getTime() + config.orderTtlMs).toISOString(),
     });
     const result = await runProvision(ctx, orderId, clientPublicKey, undefined, undefined, tier);
-    return json(res, 200, { ...readyBundleOf(result!.order), orderId, mode: config.mode });
+    return json(res, 200, { ...readyBundleOf(result!.order, config), orderId, mode: config.mode });
   }
 
   if (!ctx.lockBook) {
@@ -446,7 +449,7 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
   // Idempotent: already provisioned. Return the config too, so an agent that POSTs
   // here itself gets the .conf in one shot (a wallet just ignores the extra fields).
   if (order.status === 'ready') {
-    return json(res, 200, { ok: true, status: 'ready', ...bundleFor(req, order), mode: ctx.config.mode });
+    return json(res, 200, { ok: true, status: 'ready', ...bundleFor(req, ctx.config, order), mode: ctx.config.mode });
   }
 
   const body = await readBody(req);
@@ -476,18 +479,30 @@ async function handlePay(req: IncomingMessage, res: ServerResponse, ctx: Ctx, or
   if (r.kind === 'provisioned') console.log(`[pay] order=${tag} ready: ${r.payment.amountSats} sat`);
   // Return the config bundle: an agent POSTing here gets the .conf synchronously,
   // no /order poll needed. Browser/NUT-18 wallet ignores the extra fields.
-  return json(res, 200, { ok: true, status: 'ready', ...bundleFor(req, r.order), mode: ctx.config.mode });
+  return json(res, 200, { ok: true, status: 'ready', ...bundleFor(req, ctx.config, r.order), mode: ctx.config.mode });
 }
 
-/** The buyer-facing config bundle for a ready order. */
-function readyBundleOf(order: Order): ProvisionBundle {
+/**
+ * The buyer-facing config bundle for a ready order. The config is rendered on each read
+ * from the lease and the server's current key, endpoint and DNS, so after the operator
+ * rotates the server key a buyer just downloads again.
+ */
+function readyBundleOf(order: Order, config: Config): ProvisionBundle {
   const lease = { ...order.lease! };
   delete lease.presharedKey; // already in clientConfig
   return {
     purchaseId: order.purchaseId!,
     tunnelIp: order.tunnelIp!,
     amountSats: order.amountSats,
-    clientConfig: order.clientConfig!,
+    clientConfig: generateClientConfig({
+      tunnelIp: order.tunnelIp!,
+      serverPublicKey: config.serverPublicKey,
+      endpoint: config.endpoint,
+      purchaseId: order.purchaseId!,
+      dryRun: config.mode === 'dry-run',
+      dns: config.dns,
+      presharedKey: order.lease?.presharedKey,
+    }),
     lease,
   };
 }
@@ -496,9 +511,9 @@ function readyBundleOf(order: Order): ProvisionBundle {
  * The config bundle, only for whoever holds the order secret (X-Order-Secret): the order
  * id travels in the payment request, so it can't be what unlocks the PSK and tunnel IP.
  */
-function bundleFor(req: IncomingMessage, order: Order): ProvisionBundle | Record<string, never> {
+function bundleFor(req: IncomingMessage, config: Config, order: Order): ProvisionBundle | Record<string, never> {
   const holder = !order.secretHash || secretMatches(order.secretHash, firstHeader(req.headers['x-order-secret']));
-  return holder ? readyBundleOf(order) : {};
+  return holder ? readyBundleOf(order, config) : {};
 }
 
 // --- GET /order/:orderId (browser poll) ---
@@ -512,7 +527,7 @@ async function handleOrderStatus(req: IncomingMessage, res: ServerResponse, ctx:
     return json(res, 404, { error: 'order_not_found' });
   }
   if (order.status === 'ready') {
-    return json(res, 200, { status: 'ready', mode: ctx.config.mode, ...bundleFor(req, order) });
+    return json(res, 200, { status: 'ready', mode: ctx.config.mode, ...bundleFor(req, ctx.config, order) });
   }
   // Surface the last /pay rejection so the page can explain what the paying
   // wallet reported only as a generic failure.
@@ -668,15 +683,6 @@ async function runProvision(
     now,
     allocate: (taken) => allocator.allocateTunnelIp(purchaseId, clientPublicKey, taken),
     presharedKey,
-    renderConfig: (tunnelIp, pid) => generateClientConfig({
-      tunnelIp,
-      serverPublicKey: config.serverPublicKey,
-      endpoint: config.endpoint,
-      purchaseId: pid,
-      dryRun: config.mode === 'dry-run',
-      dns: config.dns,
-      presharedKey,
-    }),
   });
   if (!result) return undefined;
 
@@ -870,11 +876,13 @@ Prices, plans, accepted mints and the operator notice: GET /info
    Keep the DLEQ proofs (NUT-12) on pre-v3 keysets; proofs without them are refused.
 4. POST /pay/<orderId> {"id": "<orderId>", "mint": "<mint url>", "unit": "${config.unit}", "proofs": [...]}
    (or {"token": "<encoded token>"}) with header X-Order-Secret: <secret>
-   -> 200 {status: "ready", clientConfig, tunnelIp, lease}. Without the header the config is left out.
+   -> 200 {status: "ready", clientConfig, tunnelIp, lease}. For an order placed with a secret, the config is left out without the header.
 5. In clientConfig (it carries a per-lease PresharedKey), replace "# PrivateKey = <generate locally>" with "PrivateKey = <your private key>",
    then bring the tunnel up (wg-quick, or the WireGuard app).
 
 A NUT-18 wallet can pay the creq itself instead; then poll GET /order/<orderId> (same header) until status is "ready".
+GET /order/<orderId> (same header) always renders the config with the server's current key: if /info's serverPublicKey
+no longer matches yours, fetch it again.
 Unpaid orders expire after ${Math.round(config.orderTtlMs / 60000)} minutes. A payment only works for the order it was requested for.
 
 ## Renew

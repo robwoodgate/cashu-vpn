@@ -254,6 +254,8 @@ And the obvious thing: when you run an exit, the traffic leaving your server is 
 
 **Bounding egress volume.** Hosts meter outbound traffic — Hetzner Cloud, for example, includes ~20 TB/month and bills beyond it. At ~140 Mbit/s a single buyer can move over a terabyte a day, so a few heavy leases can run up a surprise bill. `LEASE_DATA_CAP_GB` (default 50) caps each lease's combined up + download; the cleanup tick disconnects a buyer once they reach it, the same way it removes an expired one. Set it to `0` to sell uncapped. This is a per-lease cap, not an account-wide budget — for the latter, also watch your host's traffic dashboard (or `vnstat`).
 
+**Rotating the server key.** If the box may have been compromised, give WireGuard a new server key: generate one, apply it with `wg set wg0 private-key <file>` (and put it in `wg0.conf`), set `SERVER_PUBLIC_KEY` in `.env` to what `npm run discover wg0` now reports (the daemon doesn't check it against the interface), and `systemctl restart cashu-vpn`. Existing tunnels stop handshaking until their owners press **Download** under **Your access**, which fetches the config again with the new key; nothing else about their lease changes. Say so in `NOTICE`, since buyers get no other hint; `/info` shows the current `serverPublicKey`. The preshared keys were on the box too, so treat them as exposed.
+
 ## Troubleshooting
 
 **Buyer connects but has no internet.** The tunnel hands shakes, but pages won't load. Almost always one of two things, in this order:

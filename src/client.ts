@@ -510,11 +510,25 @@ function renderAccess(): void {
     }
     return '<div class="acc"><span><strong>' + label + '</strong> &middot; ' + status + '</span>' + action + '</div>';
   }).join('');
+  // "Download" fetches the config fresh, so it picks up a rotated server key; the stored copy is the offline fallback.
   el.querySelectorAll('.dlacc').forEach((b) => {
-    b.addEventListener('click', () => {
-      const id = (b as HTMLElement).dataset.id ?? '';
+    b.addEventListener('click', async () => {
+      const button = b as HTMLButtonElement;
+      const id = button.dataset.id ?? '';
       const rec = loadOrders().find((o) => o.id === id);
-      if (rec?.conf) { showConfig(rec.conf, id, rec.tunnelIp, rec.expiresAt); download(rec.conf, rec.tunnelIp); }
+      if (!rec || button.disabled) return;
+      button.disabled = true;
+      let conf = rec.conf ?? '';
+      try {
+        const r = await fetch('/order/' + encodeURIComponent(id), { headers: secretHeader(id) });
+        const d = r.ok ? await r.json() : {};
+        if (d.clientConfig) {
+          conf = injectPriv(String(d.clientConfig), rec.priv);
+          upsertOrder({ id, conf });
+        }
+      } catch { /* offline: the stored config */ }
+      button.disabled = false;
+      if (conf) { showConfig(conf, id, rec.tunnelIp, rec.expiresAt); download(conf, rec.tunnelIp); }
     });
   });
   // "Pay" reopens a still-pending order so it can be paid after a reload.
