@@ -1840,6 +1840,26 @@ test('a re-download after a server key rotation carries the new key', async () =
   }, { ...LIVE_ENV, SERVER_PUBLIC_KEY: ROTATED }, deps);
 });
 
+test('old state: a ready order without a lease reads cleanly, and stored configs are dropped on load', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cvpn-old-'));
+  const path = join(dir, 'orders.json');
+  try {
+    const future = new Date(Date.now() + 60_000).toISOString();
+    await writeFile(path, JSON.stringify([
+      { id: 'o-no-lease-0123456789', status: 'ready', clientPublicKey: VALID_WG_KEY, lockPubkey: '', createdAt: future, expiresAt: future, purchaseId: 'p-old', tunnelIp: '10.77.0.9' },
+      { ...orderWithLease({ purchaseId: 'p-cfg', clientPublicKey: wgKey(4), tunnelIp: '10.77.0.8', createdAt: future, expiresAt: future, status: 'active' }), clientConfig: 'OLD STORED CONFIG' },
+    ]));
+    const store = await createFileStateStore(path);
+    assert.ok(!('clientConfig' in (await store.getOrder('o-p-cfg'))!), 'stale config dropped');
+    await withServer(async (url) => {
+      const res = await fetch(`${url}/order/o-no-lease-0123456789`);
+      assert.equal(res.status, 200, 'no 500 for an order with no lease');
+    }, LIVE_ENV, { store });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('cleanup expires a lease whose route is already gone, rather than retrying it forever', async () => {
   // After a host restart the route of a lease that expired meanwhile no longer exists.
   const past = new Date(Date.now() - 1000).toISOString();

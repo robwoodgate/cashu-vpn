@@ -288,7 +288,8 @@ async function readStateFile(path: string): Promise<Order[]> {
   try {
     const parsed = JSON.parse(await readFile(path, 'utf8'));
     if (!Array.isArray(parsed)) throw new Error('state store must be a JSON array');
-    return parsed as Order[];
+    // Drop the config 0.4.0 stored per order: configs are rendered on read now, and a stale one keeps an old server key on disk.
+    return (parsed as (Order & { clientConfig?: unknown })[]).map(({ clientConfig: _stale, ...order }) => order);
   } catch (e: unknown) {
     if (e instanceof Error && 'code' in e && (e as NodeJS.ErrnoException).code === 'ENOENT') {
       return [];

@@ -501,7 +501,7 @@ function readyBundleOf(order: Order, config: Config): ProvisionBundle {
       purchaseId: order.purchaseId!,
       dryRun: config.mode === 'dry-run',
       dns: config.dns,
-      presharedKey: order.lease!.presharedKey,
+      presharedKey: order.lease?.presharedKey,
     }),
     lease,
   };
@@ -876,7 +876,7 @@ Prices, plans, accepted mints and the operator notice: GET /info
    Keep the DLEQ proofs (NUT-12) on pre-v3 keysets; proofs without them are refused.
 4. POST /pay/<orderId> {"id": "<orderId>", "mint": "<mint url>", "unit": "${config.unit}", "proofs": [...]}
    (or {"token": "<encoded token>"}) with header X-Order-Secret: <secret>
-   -> 200 {status: "ready", clientConfig, tunnelIp, lease}. Without the header the config is left out.
+   -> 200 {status: "ready", clientConfig, tunnelIp, lease}. For an order placed with a secret, the config is left out without the header.
 5. In clientConfig (it carries a per-lease PresharedKey), replace "# PrivateKey = <generate locally>" with "PrivateKey = <your private key>",
    then bring the tunnel up (wg-quick, or the WireGuard app).
 

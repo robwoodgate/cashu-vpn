@@ -513,9 +513,11 @@ function renderAccess(): void {
   // "Download" fetches the config fresh, so it picks up a rotated server key; the stored copy is the offline fallback.
   el.querySelectorAll('.dlacc').forEach((b) => {
     b.addEventListener('click', async () => {
-      const id = (b as HTMLElement).dataset.id ?? '';
+      const button = b as HTMLButtonElement;
+      const id = button.dataset.id ?? '';
       const rec = loadOrders().find((o) => o.id === id);
-      if (!rec) return;
+      if (!rec || button.disabled) return;
+      button.disabled = true;
       let conf = rec.conf ?? '';
       try {
         const r = await fetch('/order/' + encodeURIComponent(id), { headers: secretHeader(id) });
@@ -525,6 +527,7 @@ function renderAccess(): void {
           upsertOrder({ id, conf });
         }
       } catch { /* offline: the stored config */ }
+      button.disabled = false;
       if (conf) { showConfig(conf, id, rec.tunnelIp, rec.expiresAt); download(conf, rec.tunnelIp); }
     });
   });
